@@ -600,6 +600,7 @@ impl fmt::Display for Escaped<'_> {
 mod tests {
     use alloc::string::String;
     use alloc::vec::Vec;
+    use core::ops::Range;
     use core::ptr;
     use core::sync::atomic::AtomicU64;
 
@@ -633,12 +634,21 @@ mod tests {
         program: UserProgram,
         setup: impl FnOnce(u64, &Arc<Process>) -> (Vec<u8>, u64),
     ) -> (End, u64) {
+        run_at(program, |user| (user.start, user.start + 4096), setup)
+    }
+
+    /// Runs `program` as [`run_with_stack`] does, with its code and stack
+    /// pages where `place` puts them in user space.
+    fn run_at(
+        program: UserProgram,
+        place: impl FnOnce(Range<u64>) -> (u64, u64),
+        setup: impl FnOnce(u64, &Arc<Process>) -> (Vec<u8>, u64),
+    ) -> (End, u64) {
         let before = frames::free_frames();
         let Some(space) = paging::new_space() else {
             panic!("no free frame for a space");
         };
-        let code = space.user_space().start;
-        let stack = code + 4096;
+        let (code, stack) = place(space.user_space());
         let process = Process::new();
         let (bytes, arg) = setup(stack, &process);
         let mut code_object = page_object();
@@ -835,6 +845,26 @@ mod tests {
         assert_eq!(
             run_write(|at| at, MAX_WRITE + 1, b""),
             failed(Error::TooLong)
+        );
+    }
+
+    #[test_case]
+    fn a_syscall_returning_to_user_spaces_end_kills_the_thread() {
+        let (end, code) = run_at(
+            UserProgram::LastSyscall,
+            |user| (user.end - 4096, user.end - 8192),
+            |_, _| (Vec::new(), 0),
+        );
+        let trap = Trap::PageFault {
+            address: code + 4096,
+            access: Access::Execute,
+        };
+        assert_eq!(
+            end,
+            End::Killed {
+                trap,
+                ip: code + 4096
+            }
         );
     }
 

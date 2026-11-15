@@ -60,6 +60,11 @@ pub fn enter_user(ip: u64, sp: u64, arg: u64) -> ! {
 /// The bytes each program has, from the start of its slot.
 const SLOT: usize = 512;
 
+/// Where in its frame `UserProgram::LastSyscall` has its syscall: the last
+/// two bytes.
+const LAST_SYSCALL: usize = 4096 - SYSCALL.len();
+const SYSCALL: [u8; 2] = [0x0f, 0x05];
+
 // One program per slot, in UserProgram's order, as write_program numbers
 // them. The .org fails to assemble if a program outgrows its slot, and
 // pads it with int3. Every jump is relative, so a program runs wherever it
@@ -514,6 +519,11 @@ global_asm!(
     "syscall",
     "ret",
     ".org thisos_user_programs + 11 * {slot}, 0xcc",
+    // LastSyscall. write_program puts the syscall in the frame's last two
+    // bytes, past the slot.
+    "mov rax, -1",
+    "jmp thisos_user_programs + 11 * {slot} + {last_syscall}",
+    ".org thisos_user_programs + 12 * {slot}, 0xcc",
     ".popsection",
     exit = const Syscall::Exit.number(),
     write = const Syscall::Write.number(),
@@ -554,11 +564,12 @@ global_asm!(
     b = const 0x41_0000,
     c = const 0x42_0000,
     slot = const SLOT,
+    last_syscall = const LAST_SYSCALL,
     cycles = const 1 << 28,
 );
 
 unsafe extern "C" {
-    static thisos_user_programs: [u8; 11 * SLOT];
+    static thisos_user_programs: [u8; 12 * SLOT];
 }
 
 /// Writes `program` at the start of `frame`, through the physical-memory
@@ -576,6 +587,7 @@ pub fn write_program(phys_offset: VirtAddr, frame: &mut Frame, program: UserProg
         UserProgram::Memory => 8,
         UserProgram::Channel => 9,
         UserProgram::Wait => 10,
+        UserProgram::LastSyscall => 11,
     };
     let source = (&raw const thisos_user_programs)
         .cast::<u8>()
@@ -588,4 +600,10 @@ pub fn write_program(phys_offset: VirtAddr, frame: &mut Frame, program: UserProg
     // and no Rust reference to its memory exists. A slot is smaller than a
     // frame.
     unsafe { ptr::copy_nonoverlapping(source, target, SLOT) };
+    if program == UserProgram::LastSyscall {
+        let last = target.wrapping_add(LAST_SYSCALL).cast::<[u8; 2]>();
+        // SAFETY: The frame's last two bytes, in the frame the caller
+        // holds mutably, as above. A byte array needs no alignment.
+        unsafe { last.write(SYSCALL) };
+    }
 }

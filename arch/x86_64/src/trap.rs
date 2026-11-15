@@ -106,7 +106,8 @@ global_asm!(
 // clac. The handler may turn interrupts on, so the stub turns them off
 // before the pops: from pop rsp to sysretq the stack is the user's, and an
 // interrupt there would push its frame onto it in ring 0. trap_entry checks
-// that RIP is in user space, which SYSRET needs canonical.
+// that RIP is no higher than user space's end, since SYSRET needs it
+// canonical.
 global_asm!(
     ".pushsection .text.thisos_syscall, \"ax\", @progbits",
     ".globl thisos_syscall",
@@ -375,12 +376,14 @@ extern "C" fn trap_entry(frame: &mut TrapFrame) {
         _ => {}
     }
     // SYSRET to a non-canonical RIP faults in ring 0 on the user's stack.
-    // User space ends a page below the canonical boundary, so no user
-    // instruction ends past it, and only a kernel bug sets RIP outside.
-    if frame.cs & 3 == 3 {
+    // User space ends a page below the canonical boundary, so a syscall
+    // in its last bytes returns to its end at most, and only a kernel bug
+    // sets RIP past that. A frame that returns through iretq needs no
+    // check: its RIP is one the CPU saved, wherever user code jumped.
+    if frame.vector == SYSCALL_VECTOR {
         assert!(
-            USER_SPACE.contains(&frame.rip),
-            "returning to user code at {:#x}, outside user space",
+            frame.rip <= USER_SPACE.end,
+            "returning from a syscall to {:#x}, past user space",
             frame.rip
         );
     }

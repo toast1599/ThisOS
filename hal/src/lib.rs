@@ -264,6 +264,11 @@ pub enum UserProgram {
     /// with `TimedOut`. It exits with status 0, or with the number of the
     /// first check that failed.
     Wait,
+    /// Makes a syscall with the number `u64::MAX` from the last
+    /// instruction of its page, so the syscall returns to the address after
+    /// the page. Mapped on the last page of user space, that address is
+    /// user space's end, where nothing is mapped.
+    LastSyscall,
 }
 
 /// The most frames [`Cpu::backtrace`] reports.
