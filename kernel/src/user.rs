@@ -6,7 +6,10 @@ use alloc::vec::Vec;
 use core::{fmt, str};
 
 use spin::Mutex;
-use thisos_abi::{Error, MAX_MESSAGE_BYTES, MAX_MESSAGE_HANDLES, MAX_WRITE, Rights, Syscall};
+use thisos_abi::{
+    Error, MAX_MESSAGE_BYTES, MAX_MESSAGE_HANDLES, MAX_WAIT_ITEMS, MAX_WRITE, Rights, Signals,
+    Syscall, WAIT_ITEM_SIZE,
+};
 use thisos_channels::Message;
 use thisos_elf::Elf;
 use thisos_hal::{
@@ -16,7 +19,7 @@ use thisos_hal::{
 use crate::channel::{self, ENDPOINT_RIGHTS, Endpoint};
 use crate::memory::{Mapping, MemoryObject};
 use crate::process::{End, Object, Process};
-use crate::{Arch, frames, paging, thread};
+use crate::{Arch, frames, paging, thread, wait};
 
 /// The size of a program's stack, which ends where user space does.
 const STACK_SIZE: u64 = 64 << 10;
@@ -248,6 +251,7 @@ fn syscall(number: u64, args: [u64; 6]) -> Result<u64, Error> {
         Syscall::ChannelCreate => channel_create(),
         Syscall::Send => send(args[0], args[1], args[2], args[3], args[4]),
         Syscall::Receive => receive(args[0], args[1], args[2], args[3], args[4]),
+        Syscall::Wait => wait(args[0], args[1], args[2]),
     }
 }
 
@@ -458,6 +462,44 @@ fn receive(handle_arg: u64, buf: u64, len: u64, handles: u64, count: u64) -> Res
             })
             .map_err(|(e, handles)| (e, Message { bytes, handles }))
     })
+}
+
+/// Waits on the `count` items at `items` for at most `timeout`
+/// nanoseconds, as the wait syscall does.
+fn wait(items: u64, count_arg: u64, timeout: u64) -> Result<u64, Error> {
+    let count = count(count_arg, MAX_WAIT_ITEMS)?;
+    let mut raw = [0; WAIT_ITEM_SIZE * MAX_WAIT_ITEMS];
+    let raw = &mut raw[..WAIT_ITEM_SIZE * count];
+    if !copy_from_user(items, raw) {
+        return Err(Error::BadAddress);
+    }
+    let mut waits = Vec::new();
+    waits
+        .try_reserve_exact(count)
+        .map_err(|_| Error::NoMemory)?;
+    for item in raw.as_chunks::<WAIT_ITEM_SIZE>().0 {
+        let [handle, wanted] = [0, 4]
+            .map(|at| u32::from_le_bytes([item[at], item[at + 1], item[at + 2], item[at + 3]]));
+        let endpoint = endpoint(u64::from(handle), Rights::READ)?;
+        let wanted = Signals::from_bits(wanted).ok_or(Error::BadSignals)?;
+        waits.push((endpoint, wanted));
+    }
+    let mut observed = [Signals::NONE; MAX_WAIT_ITEMS];
+    let observed = &mut observed[..count];
+    let ready = wait::wait(&waits, observed, wait::deadline(timeout))?;
+    for (item, signals) in raw
+        .as_chunks_mut::<WAIT_ITEM_SIZE>()
+        .0
+        .iter_mut()
+        .zip(observed)
+    {
+        item[8..].copy_from_slice(&signals.bits().to_le_bytes());
+    }
+    if !copy_to_user(items, raw) {
+        return Err(Error::BadAddress);
+    }
+    // At most MAX_WAIT_ITEMS.
+    Ok(u64::try_from(ready).unwrap_or(0))
 }
 
 /// Logs the `len` bytes of text at `buf` in user space as the write
@@ -686,7 +728,7 @@ mod tests {
         );
         assert_eq!(
             take_written(),
-            "hello from init, holding handle 0x10000; sent itself \"ping\" and 1 handle over a channel"
+            "hello from init, holding handle 0x10000; sent itself \"ping\" and 1 handle over a channel and waited for it"
         );
     }
 
@@ -715,6 +757,17 @@ mod tests {
     #[test_case]
     fn channel_syscalls_move_bytes_and_handles() {
         let (end, _) = run(UserProgram::Channel, |_, process| {
+            let Ok(handle) = process.insert_self(INIT_RIGHTS) else {
+                panic!("a new handle table is full");
+            };
+            u64::from(handle)
+        });
+        assert_eq!(end, End::Exited(0));
+    }
+
+    #[test_case]
+    fn wait_syscall_checks_its_items_and_observes_signals() {
+        let (end, _) = run(UserProgram::Wait, |_, process| {
             let Ok(handle) = process.insert_self(INIT_RIGHTS) else {
                 panic!("a new handle table is full");
             };

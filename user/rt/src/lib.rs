@@ -1,6 +1,7 @@
 //! The runtime every ThisOS program links: its entry point, its syscalls,
-//! [`Handle`], [`print!`] and [`println!`], its panic handler, and a heap
-//! behind `alloc`. A program names its main function with [`entry!`].
+//! [`Handle`], [`wait`], [`print!`] and [`println!`], its panic handler,
+//! and a heap behind `alloc`. A program names its main function with
+//! [`entry!`].
 
 #![no_std]
 
@@ -21,9 +22,10 @@ use core::mem;
 use core::panic::PanicInfo;
 #[cfg(not(test))]
 use core::sync::atomic::{AtomicBool, Ordering};
+use core::time::Duration;
 
-pub use thisos_abi::{Error, Rights};
-pub use thisos_abi::{MAX_MESSAGE_BYTES, MAX_MESSAGE_HANDLES};
+pub use thisos_abi::{Error, Rights, Signals};
+pub use thisos_abi::{MAX_MESSAGE_BYTES, MAX_MESSAGE_HANDLES, MAX_WAIT_ITEMS};
 use thisos_abi::{MAX_WRITE, Syscall};
 
 /// Makes `main`, a `fn(Handle<Process>) -> u64`, the program's main
@@ -325,6 +327,17 @@ impl Handle<Channel> {
     }
 }
 
+impl Handle<Channel> {
+    /// Waits until this endpoint has one of `signals`, for at most
+    /// `timeout`, or for good if it is `None`, and returns its signals;
+    /// see [`wait`].
+    pub fn wait(&self, signals: Signals, timeout: Option<Duration>) -> Result<Signals, Error> {
+        let mut items = [WaitItem::new(self, signals)];
+        crate::wait(&mut items, timeout)?;
+        Ok(items[0].observed())
+    }
+}
+
 impl<T> Drop for Handle<T> {
     fn drop(&mut self) {
         if self.value == 0 {
@@ -334,6 +347,88 @@ impl<T> Drop for Handle<T> {
             panic!("closing handle {:#x} failed: {e:?}", self.value);
         }
     }
+}
+
+/// One object [`wait`] waits on, by a handle it borrows, and the signals
+/// it waits for.
+#[derive(Debug)]
+pub struct WaitItem<'a> {
+    handle: u32,
+    wanted: Signals,
+    observed: Signals,
+    borrowed: PhantomData<&'a ()>,
+}
+
+impl<'a> WaitItem<'a> {
+    /// An item that waits for any of `wanted` on `handle`'s object.
+    pub fn new<T>(handle: &'a Handle<T>, wanted: Signals) -> Self {
+        WaitItem {
+            handle: handle.value,
+            wanted,
+            observed: Signals::NONE,
+            borrowed: PhantomData,
+        }
+    }
+
+    /// The object's signals when the last [`wait`] on this item returned
+    /// successfully, or none before that.
+    pub fn observed(&self) -> Signals {
+        self.observed
+    }
+}
+
+/// Waits until one of `items`' objects has one of the item's wanted
+/// signals, for at most `timeout`, rounded up to the scheduler's ticks, or
+/// for good if it is `None`. Records each object's signals in its item,
+/// and returns how many items have a wanted one. A zero timeout only
+/// checks, and no items waits out the timeout. Fails with
+/// [`Error::TimedOut`] when the timeout passes, and with
+/// [`Error::TooLong`] for more than [`MAX_WAIT_ITEMS`] items. Each handle
+/// needs [`Rights::READ`]; only channel endpoints have signals.
+pub fn wait(items: &mut [WaitItem<'_>], timeout: Option<Duration>) -> Result<usize, Error> {
+    if items.len() > MAX_WAIT_ITEMS {
+        return Err(Error::TooLong);
+    }
+    // Three u32s an item, as the kernel reads them.
+    let mut raw = [[0u32; 3]; MAX_WAIT_ITEMS];
+    for (raw, item) in raw.iter_mut().zip(items.iter()) {
+        *raw = [item.handle, item.wanted.bits(), 0];
+    }
+    // u64::MAX is for good, which a timeout of 584 years is as well.
+    let timeout = timeout.map_or(u64::MAX, |timeout| {
+        u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX)
+    });
+    let code;
+    let value;
+    // SAFETY: By ADR 0007, wait reads and writes at most items.len() items
+    // of three u32s at raw, which raw holds, and changes only RAX, RDX, RCX
+    // and R11.
+    unsafe {
+        asm!(
+            "syscall",
+            inlateout("rax") Syscall::Wait.number() => code,
+            in("rdi") raw.as_mut_ptr(),
+            in("rsi") items.len(),
+            inlateout("rdx") timeout => value,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+    }
+    let ready = result(code, value)?;
+    for (item, raw) in items.iter_mut().zip(&raw) {
+        let Some(observed) = Signals::from_bits(raw[2]) else {
+            panic!(
+                "the kernel observed signals {:#x}, which no signal has",
+                raw[2]
+            );
+        };
+        item.observed = observed;
+    }
+    let Ok(ready) = usize::try_from(ready) else {
+        unreachable!("x86_64 addresses are 64 bits");
+    };
+    Ok(ready)
 }
 
 /// Makes `number`, a syscall that takes at most five arguments, `args`,

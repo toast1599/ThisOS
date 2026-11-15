@@ -26,6 +26,7 @@ mod thread;
 mod timer;
 mod trap;
 mod user;
+mod wait;
 
 use thisos_hal::BootInfo;
 #[cfg(test)]

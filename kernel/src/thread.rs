@@ -256,13 +256,6 @@ fn grow(need: usize) {
 }
 
 /// The running thread's id.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "nothing outside the tests blocks or waits for another thread yet"
-    )
-)]
 pub fn id() -> u64 {
     with(|scheduler| running(scheduler).id)
 }
@@ -287,25 +280,11 @@ fn running(scheduler: &mut Scheduler) -> &mut Thread {
 /// Blocks the running thread until [`unpark`] names it, or returns at once
 /// if an unpark named it since its last park. May return without either,
 /// so callers check what they wait for again.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "nothing outside the tests blocks or waits for another thread yet"
-    )
-)]
 pub fn park() -> Wake {
     park_with(None)
 }
 
 /// [`park`], but also returns once [`timer::ticks`] reaches `deadline`.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "nothing outside the tests blocks or waits for another thread yet"
-    )
-)]
 pub fn park_until(deadline: u64) -> Wake {
     park_with(Some(deadline))
 }
@@ -336,10 +315,7 @@ fn park_with(deadline: Option<u64>) -> Wake {
 /// Blocks the running thread for at least `ticks` ticks.
 #[cfg_attr(
     not(test),
-    expect(
-        dead_code,
-        reason = "nothing outside the tests blocks or waits for another thread yet"
-    )
+    expect(dead_code, reason = "nothing outside the tests sleeps or yields")
 )]
 pub fn sleep(ticks: u64) {
     let deadline = timer::ticks() + ticks;
@@ -350,13 +326,6 @@ pub fn sleep(ticks: u64) {
 
 /// Readies the thread `id` names if it is parked, or makes its next park
 /// return at once if it isn't. Does nothing if no live thread has that id.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "nothing outside the tests blocks or waits for another thread yet"
-    )
-)]
 pub fn unpark(id: u64) {
     with(|scheduler| {
         if let Ok(i) = scheduler
@@ -382,10 +351,7 @@ pub fn unpark(id: u64) {
 /// Lets the next ready thread run, if there is one.
 #[cfg_attr(
     not(test),
-    expect(
-        dead_code,
-        reason = "nothing outside the tests blocks or waits for another thread yet"
-    )
+    expect(dead_code, reason = "nothing outside the tests sleeps or yields")
 )]
 pub fn yield_now() {
     Arch::without_interrupts(|| switch(Place::Ready));

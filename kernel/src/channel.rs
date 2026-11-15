@@ -1,14 +1,17 @@
 //! Channels: two endpoints sharing one [`Channel`] under one lock, so a
 //! send and its peer's close never race. An endpoint closes when the last
-//! hold on it goes: its one handle, or the message carrying it.
+//! hold on it goes: its one handle, or the message carrying it. A change
+//! that gives an endpoint a signal unparks the threads waiting on it, once
+//! the lock is released.
 
 use alloc::sync::Arc;
 
 use spin::Mutex;
-use thisos_abi::{Error, Rights};
-use thisos_channels::{Channel, Message, Side};
+use thisos_abi::{Error, Rights, Signals};
+use thisos_channels::{Channel, Message, Side, Woken};
 
 use crate::process::Object;
+use crate::thread;
 
 /// The rights a new endpoint's handle has.
 pub const ENDPOINT_RIGHTS: Rights = Rights::READ.union(Rights::WRITE).union(Rights::TRANSFER);
@@ -50,7 +53,9 @@ impl Endpoint {
         &self,
         make: impl FnOnce() -> Result<Message<Carried>, Error>,
     ) -> Result<(), Error> {
-        self.channel.lock().send(self.side, make)
+        let woken = self.channel.lock().send(self.side, make)?;
+        wake(&woken);
+        Ok(())
     }
 
     /// Hands the oldest message waiting here to `take`; see
@@ -60,7 +65,29 @@ impl Endpoint {
         &self,
         take: impl FnOnce(Message<Carried>) -> Result<R, (Error, Message<Carried>)>,
     ) -> Result<R, Error> {
-        self.channel.lock().receive(self.side, take)
+        let (taken, woken) = self.channel.lock().receive(self.side, take)?;
+        wake(&woken);
+        Ok(taken)
+    }
+
+    /// Adds the thread `id` to this endpoint's waiters, and returns its
+    /// signals; see [`Channel::add_waiter`].
+    pub fn add_waiter(&self, id: u64) -> Result<Signals, Error> {
+        self.channel.lock().add_waiter(self.side, id)
+    }
+
+    /// Takes the thread `id` off this endpoint's waiters, and returns its
+    /// signals; see [`Channel::remove_waiter`].
+    pub fn remove_waiter(&self, id: u64) -> Signals {
+        self.channel.lock().remove_waiter(self.side, id)
+    }
+}
+
+/// Unparks the threads in `woken`. Their lists drop with it, after the
+/// channel's lock.
+fn wake(woken: &Woken) {
+    for id in woken.ids() {
+        thread::unpark(id);
     }
 }
 
@@ -70,13 +97,15 @@ impl Drop for Endpoint {
     /// joins the same queue, so a chain of endpoints each queued at the
     /// last drops in a loop, not by recursing once per link.
     fn drop(&mut self) {
-        let mut queued = self.channel.lock().close(self.side);
+        let (mut queued, woken) = self.channel.lock().close(self.side);
+        wake(&woken);
         while let Some(message) = queued.pop_front() {
             for (object, _) in message.handles {
                 if let Object::Channel(endpoint) = object
                     && let Some(endpoint) = Arc::into_inner(endpoint)
                 {
-                    let mut more = endpoint.channel.lock().close(endpoint.side);
+                    let (mut more, woken) = endpoint.channel.lock().close(endpoint.side);
+                    wake(&woken);
                     queued.append(&mut more);
                     // Its own drop now finds nothing queued.
                 }

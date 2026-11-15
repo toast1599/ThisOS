@@ -250,6 +250,20 @@ pub enum UserProgram {
     /// receiving there. It exits with status 0, or with the number of the
     /// first check that failed.
     Channel,
+    /// Gets a process handle as its argument, then checks, in order: (1)
+    /// creating a channel succeeds; (2) waiting for its second endpoint to
+    /// be readable, with a timeout of 0, fails with `TimedOut`; (3)
+    /// waiting for a signal bit that no signal has fails with
+    /// `BadSignals`; (4) waiting on the process handle fails with
+    /// `WrongType`; (5) sending a byte on the first endpoint succeeds; (6)
+    /// waiting for either endpoint to be readable, for good, then returns
+    /// 1 and observes the second readable and writable and the first only
+    /// writable; (7) closing the first endpoint succeeds; (8) waiting 10 ms
+    /// for the second's peer to close returns at once, observing it
+    /// readable with its peer closed; (9) waiting 10 ms on no items fails
+    /// with `TimedOut`. It exits with status 0, or with the number of the
+    /// first check that failed.
+    Wait,
 }
 
 /// The most frames [`Cpu::backtrace`] reports.

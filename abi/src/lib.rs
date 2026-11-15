@@ -1,5 +1,5 @@
-//! What ThisOS's kernel and user code agree on: syscall numbers, errors
-//! and rights. How they pass through the registers is ADR 0007's.
+//! What ThisOS's kernel and user code agree on: syscall numbers, errors,
+//! rights and signals. How they pass through the registers is ADR 0007's.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -17,6 +17,13 @@ pub const MAX_MESSAGE_HANDLES: usize = 64;
 
 /// The most messages a channel queues toward one endpoint.
 pub const MAX_QUEUED: usize = 64;
+
+/// The most items one [`Syscall::Wait`] takes.
+pub const MAX_WAIT_ITEMS: usize = 64;
+
+/// The bytes of one [`Syscall::Wait`] item: three little-endian `u32`s,
+/// the handle, the wanted [`Signals`] and the observed ones.
+pub const WAIT_ITEM_SIZE: usize = 12;
 
 /// A syscall, by its number in RAX.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -107,6 +114,22 @@ pub enum Syscall {
     /// [`Error::BadAddress`] or [`Error::NoHandles`], and then leaves the
     /// message waiting.
     Receive,
+    /// Waits until an object of one of the items at the address in its
+    /// first argument, as many as its second, at most [`MAX_WAIT_ITEMS`],
+    /// has one of the item's wanted [`Signals`], or until as many
+    /// nanoseconds as its third have passed, rounded up to the scheduler's
+    /// ticks: 0 only checks, and `u64::MAX` waits for good. Each item is
+    /// [`WAIT_ITEM_SIZE`] bytes: a handle, which needs [`Rights::READ`],
+    /// the signals it waits for, and a field the call writes the object's
+    /// signals into when it succeeds, for every item. Its value is the
+    /// number of items with a wanted signal. A handle may be in more than
+    /// one item. With no items it waits out the time. Fails with
+    /// [`Error::TooLong`], [`Error::BadAddress`], [`Error::BadHandle`],
+    /// [`Error::WrongType`] for an object that has no signals,
+    /// [`Error::AccessDenied`], [`Error::BadSignals`], [`Error::NoMemory`],
+    /// or with [`Error::TimedOut`] once the time has passed with no wanted
+    /// signal.
+    Wait,
 }
 
 impl Syscall {
@@ -124,6 +147,7 @@ impl Syscall {
             Syscall::ChannelCreate => 8,
             Syscall::Send => 9,
             Syscall::Receive => 10,
+            Syscall::Wait => 11,
         }
     }
 }
@@ -144,6 +168,7 @@ impl TryFrom<u64> for Syscall {
             8 => Ok(Syscall::ChannelCreate),
             9 => Ok(Syscall::Send),
             10 => Ok(Syscall::Receive),
+            11 => Ok(Syscall::Wait),
             _ => Err(Error::UnknownSyscall),
         }
     }
@@ -192,6 +217,10 @@ pub enum Error {
     BufferTooSmall,
     /// A message carries an endpoint of the channel it is sent on.
     Cycle,
+    /// A wait's time passed with no wanted signal.
+    TimedOut,
+    /// Signals have bits that no signal has.
+    BadSignals,
 }
 
 impl Error {
@@ -215,6 +244,8 @@ impl Error {
             Error::PeerClosed => 15,
             Error::BufferTooSmall => 16,
             Error::Cycle => 17,
+            Error::TimedOut => 18,
+            Error::BadSignals => 19,
         }
     }
 
@@ -238,6 +269,8 @@ impl Error {
             15 => Some(Error::PeerClosed),
             16 => Some(Error::BufferTooSmall),
             17 => Some(Error::Cycle),
+            18 => Some(Error::TimedOut),
+            19 => Some(Error::BadSignals),
             _ => None,
         }
     }
@@ -294,6 +327,62 @@ impl BitOr for Rights {
     type Output = Rights;
 
     fn bitor(self, other: Rights) -> Rights {
+        self.union(other)
+    }
+}
+
+/// What [`Syscall::Wait`] waits for: states of an object that can come and
+/// go. Only channel endpoints have signals.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Signals(u32);
+
+impl Signals {
+    /// No signals.
+    pub const NONE: Signals = Signals(0);
+    /// A message waits at the endpoint.
+    pub const READABLE: Signals = Signals(1 << 0);
+    /// The other endpoint is open and has room for a message.
+    pub const WRITABLE: Signals = Signals(1 << 1);
+    /// The other endpoint is closed.
+    pub const PEER_CLOSED: Signals = Signals(1 << 2);
+    /// Every signal.
+    pub const ALL: Signals = Signals((1 << 3) - 1);
+
+    /// The signals with these bits, or `None` if a bit has no signal.
+    pub const fn from_bits(bits: u32) -> Option<Signals> {
+        if bits & !Signals::ALL.0 == 0 {
+            Some(Signals(bits))
+        } else {
+            None
+        }
+    }
+
+    /// The signals' bits.
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+
+    /// These signals and `other`'s, for constants, where `|` can't run.
+    #[must_use]
+    pub const fn union(self, other: Signals) -> Signals {
+        Signals(self.0 | other.0)
+    }
+
+    /// Whether these signals include every one of `other`.
+    pub const fn contains(self, other: Signals) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    /// Whether these signals and `other` share one.
+    pub const fn intersects(self, other: Signals) -> bool {
+        self.0 & other.0 != 0
+    }
+}
+
+impl BitOr for Signals {
+    type Output = Signals;
+
+    fn bitor(self, other: Signals) -> Signals {
         self.union(other)
     }
 }

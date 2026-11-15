@@ -3,7 +3,7 @@
 use core::arch::{asm, global_asm};
 use core::ptr;
 
-use thisos_abi::{Error, Rights, Syscall};
+use thisos_abi::{Error, Rights, Signals, Syscall};
 use thisos_frames::Frame;
 use thisos_hal::UserProgram;
 use x86_64::VirtAddr;
@@ -416,6 +416,104 @@ global_asm!(
     "syscall",
     "ret",
     ".org thisos_user_programs + 10 * {slot}, 0xcc",
+    // Wait. RBX holds the process handle in RDI, R12 and R13 the
+    // endpoints; EDI is set to each check's number before it's tested, as
+    // in Handles. Below the stack's top: two wait items at RSP, of handle,
+    // wanted and observed signals, and the byte to send at RSP + 32.
+    "mov rbx, rdi",
+    "sub rsp, 64",
+    "mov eax, {channel_create}",
+    "syscall",
+    "mov edi, 1",
+    "test rax, rax",
+    "jnz 2f",
+    "mov r12d, edx",
+    "shr rdx, 32",
+    "mov r13, rdx",
+    "mov dword ptr [rsp], r13d",
+    "mov dword ptr [rsp + 4], {readable}",
+    "mov esi, 1",
+    "xor edx, edx",
+    "call 4f",
+    "mov edi, 2",
+    "cmp rax, {timed_out}",
+    "jne 2f",
+    "mov dword ptr [rsp + 4], 0x80000000",
+    "mov esi, 1",
+    "xor edx, edx",
+    "call 4f",
+    "mov edi, 3",
+    "cmp rax, {bad_signals}",
+    "jne 2f",
+    "mov dword ptr [rsp], ebx",
+    "mov dword ptr [rsp + 4], {readable}",
+    "mov esi, 1",
+    "xor edx, edx",
+    "call 4f",
+    "mov edi, 4",
+    "cmp rax, {wrong_type}",
+    "jne 2f",
+    "mov rdi, r12",
+    "lea rsi, [rsp + 32]",
+    "mov edx, 1",
+    "xor r10d, r10d",
+    "xor r8d, r8d",
+    "mov eax, {send}",
+    "syscall",
+    "mov edi, 5",
+    "test rax, rax",
+    "jnz 2f",
+    "mov dword ptr [rsp], r13d",
+    "mov dword ptr [rsp + 8], 0",
+    "mov dword ptr [rsp + 12], r12d",
+    "mov dword ptr [rsp + 16], {readable}",
+    "mov dword ptr [rsp + 20], 0",
+    "mov esi, 2",
+    "mov rdx, -1",
+    "call 4f",
+    "mov edi, 6",
+    "test rax, rax",
+    "jnz 2f",
+    "cmp rdx, 1",
+    "jne 2f",
+    "cmp dword ptr [rsp + 8], {readable_writable}",
+    "jne 2f",
+    "cmp dword ptr [rsp + 20], {writable}",
+    "jne 2f",
+    "mov rdi, r12",
+    "mov eax, {close}",
+    "syscall",
+    "mov edi, 7",
+    "test rax, rax",
+    "jnz 2f",
+    "mov dword ptr [rsp + 4], {peer_closed_signal}",
+    "mov esi, 1",
+    "mov edx, 10000000",
+    "call 4f",
+    "mov edi, 8",
+    "test rax, rax",
+    "jnz 2f",
+    "cmp dword ptr [rsp + 8], {readable_peer_closed}",
+    "jne 2f",
+    "xor esi, esi",
+    "mov edx, 10000000",
+    "call 4f",
+    "mov edi, 9",
+    "cmp rax, {timed_out}",
+    "jne 2f",
+    "xor edi, edi",
+    "2:",
+    "mov eax, {exit}",
+    "syscall",
+    "ud2",
+    // Waits on ESI items with a timeout of RDX; the call's return address
+    // moves them 8 bytes up.
+    "4:",
+    "lea rdi, [rsp + 8]",
+    "mov eax, {wait}",
+    "syscall",
+    "ret",
+    ".org thisos_user_programs + 11 * {slot}, 0xcc",
     ".popsection",
     exit = const Syscall::Exit.number(),
     write = const Syscall::Write.number(),
@@ -428,6 +526,7 @@ global_asm!(
     channel_create = const Syscall::ChannelCreate.number(),
     send = const Syscall::Send.number(),
     receive = const Syscall::Receive.number(),
+    wait = const Syscall::Wait.number(),
     read = const Rights::READ.bits(),
     write_right = const Rights::WRITE.bits(),
     read_duplicate = const Rights::READ.union(Rights::DUPLICATE).bits(),
@@ -442,6 +541,13 @@ global_asm!(
     peer_closed = const Error::PeerClosed.code(),
     buffer_too_small = const Error::BufferTooSmall.code(),
     cycle = const Error::Cycle.code(),
+    timed_out = const Error::TimedOut.code(),
+    bad_signals = const Error::BadSignals.code(),
+    readable = const Signals::READABLE.bits(),
+    writable = const Signals::WRITABLE.bits(),
+    readable_writable = const Signals::READABLE.union(Signals::WRITABLE).bits(),
+    peer_closed_signal = const Signals::PEER_CLOSED.bits(),
+    readable_peer_closed = const Signals::READABLE.union(Signals::PEER_CLOSED).bits(),
     read_write = const Rights::READ.union(Rights::WRITE).bits(),
     read_execute = const Rights::READ.union(Rights::EXECUTE).bits(),
     a = const 0x40_0000,
@@ -452,7 +558,7 @@ global_asm!(
 );
 
 unsafe extern "C" {
-    static thisos_user_programs: [u8; 10 * SLOT];
+    static thisos_user_programs: [u8; 11 * SLOT];
 }
 
 /// Writes `program` at the start of `frame`, through the physical-memory
@@ -469,6 +575,7 @@ pub fn write_program(phys_offset: VirtAddr, frame: &mut Frame, program: UserProg
         UserProgram::Handles => 7,
         UserProgram::Memory => 8,
         UserProgram::Channel => 9,
+        UserProgram::Wait => 10,
     };
     let source = (&raw const thisos_user_programs)
         .cast::<u8>()

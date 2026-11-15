@@ -9,7 +9,7 @@ extern crate alloc;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use thisos_rt::{Channel, Handle, Memory, Process, println};
+use thisos_rt::{Channel, Handle, Memory, Process, Signals, println};
 
 thisos_rt::entry!(main);
 
@@ -29,6 +29,13 @@ fn main(process: Handle<Process>) -> u64 {
     if let Err((e, _)) = first.send(b"ping", vec![memory.into_unknown()]) {
         panic!("sending failed: {e:?}");
     }
+    // The message is already there, so this returns at once; it checks
+    // that waiting works from Rust.
+    match second.wait(Signals::READABLE, None) {
+        Ok(signals) if signals.contains(Signals::READABLE) => {}
+        Ok(signals) => panic!("woke without a message: {signals:?}"),
+        Err(e) => panic!("waiting failed: {e:?}"),
+    }
     let mut bytes = Vec::new();
     let handles = match second.receive(&mut bytes) {
         Ok(handles) => handles,
@@ -37,7 +44,7 @@ fn main(process: Handle<Process>) -> u64 {
     let memory: Vec<Handle<Memory>> = handles.into_iter().map(Handle::cast).collect();
     // Formatted on the heap, so that loading init checks it works.
     let greeting = alloc::format!(
-        "hello from init, holding handle {value:#x}; sent itself {:?} and {} handle over a channel",
+        "hello from init, holding handle {value:#x}; sent itself {:?} and {} handle over a channel and waited for it",
         core::str::from_utf8(&bytes).unwrap_or("bytes that aren't UTF-8"),
         memory.len(),
     );
