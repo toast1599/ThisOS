@@ -610,6 +610,8 @@ pub enum MapErrorKind {
     OutOfRange,
     /// `alloc` had no frame for a table.
     NoFrames,
+    /// The space had no heap memory to record the mapping.
+    NoMemory,
 }
 
 /// Where an address is mapped, as [`PageTables::translate`] finds it.

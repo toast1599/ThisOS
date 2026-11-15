@@ -417,6 +417,32 @@ mod tests {
     }
 
     #[test_case]
+    fn a_map_with_a_full_heap_fails_and_hands_the_object_back() {
+        let space = space();
+        let object = Arc::new(object(1));
+        let addr = space.user_space().start;
+        let mapping = mapping(&object, Protection::ReadOnly);
+        let filler = testing::fill_heap();
+        // The space has no mappings, so recording its first needs memory.
+        let Err(e) = space.map(
+            addr,
+            mapping,
+            0,
+            1,
+            Protection::ReadOnly,
+            &mut frames::alloc,
+        ) else {
+            panic!("{addr:#x} was mapped with no memory to record it");
+        };
+        drop(filler);
+        assert_eq!(e.kind, MapErrorKind::NoMemory);
+        assert_eq!(space.translate(addr), None);
+        drop(e);
+        assert_eq!(Arc::strong_count(&object), 1);
+        assert_eq!(destroy(space), []);
+    }
+
+    #[test_case]
     fn a_failed_map_maps_nothing_and_hands_the_object_back() {
         let space = space();
         let object = Arc::new(object(2));

@@ -11,7 +11,7 @@ use core::{mem, ptr, slice};
 use spin::Mutex;
 use thisos_frames::Frame;
 use thisos_hal::{MapError, MapErrorKind, Protection, Translation};
-use thisos_regions::Regions;
+use thisos_regions::{InsertError, Regions};
 use x86_64::VirtAddr;
 use x86_64::registers::control::{Cr4, Cr4Flags};
 use x86_64::structures::paging::{Page, PageTableIndex, Size4KiB};
@@ -727,7 +727,8 @@ impl<O: Deref<Target = [Frame]> + Send + Sync> thisos_hal::AddressSpace<O> for U
         let mut mappings = self.mappings.lock();
         let object = match mappings.insert(addr..end, object) {
             Ok(object) => object,
-            Err(object) => return fail(MapErrorKind::Mapped, object),
+            Err((InsertError::Overlap, object)) => return fail(MapErrorKind::Mapped, object),
+            Err((InsertError::NoMemory, object)) => return fail(MapErrorKind::NoMemory, object),
         };
         let mut done = addr;
         let mapped = object[first..first + pages].iter().try_for_each(|frame| {

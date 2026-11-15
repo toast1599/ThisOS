@@ -16,7 +16,7 @@ use aarch64_cpu::registers::{ID_AA64MMFR1_EL1, MAIR_EL1, Readable, TCR_EL1, TTBR
 use spin::Mutex;
 use thisos_frames::Frame;
 use thisos_hal::{MapError, MapErrorKind, Protection, Translation};
-use thisos_regions::Regions;
+use thisos_regions::{InsertError, Regions};
 
 use crate::heap::{self, Heap};
 use crate::ptr_at;
@@ -892,7 +892,8 @@ impl<O: Deref<Target = [Frame]> + Send + Sync> thisos_hal::AddressSpace<O> for U
         let mut mappings = self.mappings.lock();
         let object = match mappings.insert(addr..end, object) {
             Ok(object) => object,
-            Err(object) => return fail(MapErrorKind::Mapped, object),
+            Err((InsertError::Overlap, object)) => return fail(MapErrorKind::Mapped, object),
+            Err((InsertError::NoMemory, object)) => return fail(MapErrorKind::NoMemory, object),
         };
         let mut done = addr;
         let mapped = object[first..first + pages].iter().try_for_each(|frame| {

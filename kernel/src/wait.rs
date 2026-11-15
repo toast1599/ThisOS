@@ -102,9 +102,9 @@ mod tests {
         static DONE: AtomicBool = AtomicBool::new(false);
         type Outcome = (Result<usize, Error>, [Signals; 2]);
         static RESULT: Mutex<Option<Outcome>> = Mutex::new(None);
-        let (a, b) = channel::create();
+        let (a, b) = channel::pair();
         let (a, b) = (Arc::new(a), Arc::new(b));
-        let (c, _d) = channel::create();
+        let (c, _d) = channel::pair();
         let items = [
             (Arc::clone(&b), Signals::READABLE),
             (Arc::new(c), Signals::READABLE | Signals::PEER_CLOSED),
@@ -137,7 +137,7 @@ mod tests {
 
     #[test_case]
     fn a_wait_times_out_and_a_zero_timeout_only_checks() {
-        let (_a, b) = channel::create();
+        let (_a, b) = channel::pair();
         let items = [(Arc::new(b), Signals::READABLE)];
         let mut observed = [Signals::NONE];
         let start = timer::ticks();
@@ -158,7 +158,7 @@ mod tests {
 
     #[test_case]
     fn a_wait_returns_at_once_for_a_signal_already_set() {
-        let (a, b) = channel::create();
+        let (a, b) = channel::pair();
         ping(&a);
         let items = [
             (Arc::new(b), Signals::READABLE),

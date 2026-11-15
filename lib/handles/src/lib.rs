@@ -49,8 +49,10 @@ impl<T> Table<T> {
     }
 
     /// Puts `object` in the table with `rights`, and returns its handle.
-    /// Fails with [`Error::NoHandles`] if every slot is used or retired.
-    pub fn insert(&mut self, object: T, rights: Rights) -> Result<u32, Error> {
+    /// Fails, handing `object` back, with [`Error::NoHandles`] if every
+    /// slot is used or retired, and with [`Error::NoMemory`] if the table
+    /// can't grow.
+    pub fn insert(&mut self, object: T, rights: Rights) -> Result<u32, (Error, T)> {
         let index = if let Some(index) = self.free {
             let slot = &mut self.slots[usize::from(index)];
             let Entry::Free { next } = slot.entry else {
@@ -61,7 +63,12 @@ impl<T> Table<T> {
             slot.entry = Entry::Used { object, rights };
             index
         } else {
-            let index = u16::try_from(self.slots.len()).map_err(|_| Error::NoHandles)?;
+            let Ok(index) = u16::try_from(self.slots.len()) else {
+                return Err((Error::NoHandles, object));
+            };
+            if self.slots.try_reserve(1).is_err() {
+                return Err((Error::NoMemory, object));
+            }
             self.slots.push(Slot {
                 generation: 1,
                 entry: Entry::Used { object, rights },
@@ -69,6 +76,15 @@ impl<T> Table<T> {
             index
         };
         Ok(handle(index, self.slots[usize::from(index)].generation))
+    }
+
+    /// Takes the memory `additional` more handles need, so that as many
+    /// calls to [`insert`](Self::insert) don't fail with
+    /// [`Error::NoMemory`]. Fails with it otherwise.
+    pub fn try_reserve(&mut self, additional: usize) -> Result<(), Error> {
+        self.slots
+            .try_reserve(additional.saturating_sub(self.free_len))
+            .map_err(|_| Error::NoMemory)
     }
 
     /// The object `handle` names and its rights.
@@ -161,7 +177,7 @@ impl<T: Clone> Table<T> {
     /// Makes a new handle to `handle`'s object with `rights`, and returns
     /// it. Fails with [`Error::AccessDenied`] if `handle` lacks
     /// [`Rights::DUPLICATE`], and with [`Error::BadRights`] if it lacks any
-    /// of `rights`.
+    /// of `rights`, or as [`insert`](Self::insert) does.
     pub fn duplicate(&mut self, handle: u32, rights: Rights) -> Result<u32, Error> {
         let (object, held) = self.get(handle)?;
         if !held.contains(Rights::DUPLICATE) {
@@ -171,7 +187,8 @@ impl<T: Clone> Table<T> {
             return Err(Error::BadRights);
         }
         let object = object.clone();
-        self.insert(object, rights)
+        // The copy that comes back isn't the object's last holder.
+        self.insert(object, rights).map_err(|(e, _)| e)
     }
 }
 
@@ -254,13 +271,17 @@ mod tests {
     fn a_full_table_fails_and_a_closed_slot_makes_room() {
         let mut table = Table::new();
         let handles: Vec<u32> = (0..MAX_SLOTS)
-            .map(|_| table.insert((), Rights::NONE).unwrap())
+            .map(|_| table.insert('a', Rights::NONE).unwrap())
             .collect();
-        assert_eq!(table.insert((), Rights::NONE), Err(Error::NoHandles));
+        assert_eq!(
+            table.insert('x', Rights::NONE),
+            Err((Error::NoHandles, 'x'))
+        );
+        assert_eq!(table.try_reserve(1), Ok(()));
         assert_eq!(table.room(), 0);
         table.remove(handles[7]).unwrap();
         assert_eq!(table.room(), 1);
-        assert_eq!(table.insert((), Rights::NONE).map(|h| h & 0xffff), Ok(7));
+        assert_eq!(table.insert('b', Rights::NONE).map(|h| h & 0xffff), Ok(7));
     }
 
     #[test]

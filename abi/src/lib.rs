@@ -46,8 +46,8 @@ pub enum Syscall {
     /// argument, with the [`Rights`] in its second, which must be ones the
     /// handle has. Its value is the new handle. Fails with
     /// [`Error::BadHandle`], with [`Error::AccessDenied`] if the handle
-    /// lacks [`Rights::DUPLICATE`], with [`Error::BadRights`], or with
-    /// [`Error::NoHandles`].
+    /// lacks [`Rights::DUPLICATE`], with [`Error::BadRights`],
+    /// [`Error::NoHandles`] or [`Error::NoMemory`].
     Duplicate,
     /// Leaves the handle in its first argument with only the [`Rights`] in
     /// its second, which must be ones it has. Fails with
@@ -111,8 +111,8 @@ pub enum Syscall {
     /// [`Error::AccessDenied`], with [`Error::ShouldWait`] if no message
     /// waits, with [`Error::PeerClosed`] if none waits and the other
     /// endpoint is closed, with [`Error::BufferTooSmall`],
-    /// [`Error::BadAddress`] or [`Error::NoHandles`], and then leaves the
-    /// message waiting.
+    /// [`Error::BadAddress`], [`Error::NoHandles`] or [`Error::NoMemory`],
+    /// and then leaves the message waiting.
     Receive,
     /// Waits until an object of one of the items at the address in its
     /// first argument, as many as its second, at most [`MAX_WAIT_ITEMS`],

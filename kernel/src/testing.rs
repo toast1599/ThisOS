@@ -2,6 +2,7 @@
 //! summary of the results with a large PASS or FAIL, which is all the
 //! laptop shows, then exits QEMU.
 
+use alloc::vec::Vec;
 use core::fmt::{self, Write};
 use core::hint::spin_loop;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -202,6 +203,29 @@ pub fn spin_until(what: &str, done: impl Fn() -> bool) {
         spin_loop();
     }
     panic!("{what} didn't happen within {MAX_SPINS} spins");
+}
+
+/// Takes every free byte of the kernel heap, in buffers that halve from
+/// 1 MiB down to one byte, and returns them; dropping them gives the heap
+/// back. The largest goes first, so each size after it fits at most a few
+/// times, and the list of buffers stays short.
+pub fn fill_heap() -> Vec<Vec<u8>> {
+    let mut filler = Vec::new();
+    assert!(
+        filler.try_reserve_exact(256).is_ok(),
+        "no room for the list"
+    );
+    let mut size = 1 << 20;
+    while size > 0 {
+        let mut buffer = Vec::new();
+        if buffer.try_reserve_exact(size).is_err() {
+            size /= 2;
+            continue;
+        }
+        assert!(filler.len() < filler.capacity(), "the heap is in pieces");
+        filler.push(buffer);
+    }
+    filler
 }
 
 /// Runs `probe`, and returns once it traps with a trap `expected` accepts.

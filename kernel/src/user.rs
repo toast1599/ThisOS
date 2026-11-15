@@ -305,8 +305,9 @@ fn pages(len: u64) -> Result<usize, Error> {
 /// does, and returns a handle to it.
 fn memory_create(size: u64) -> Result<u64, Error> {
     let object = MemoryObject::new(pages(size)?)?;
+    let object = Arc::try_new(object).map_err(|_| Error::NoMemory)?;
     process()
-        .insert(Object::Memory(Arc::new(object)), Rights::ALL)
+        .insert(Object::Memory(object), Rights::ALL)
         .map(u64::from)
 }
 
@@ -346,7 +347,7 @@ fn map(handle_arg: u64, offset: u64, len: u64, addr: u64, rights_arg: u64) -> Re
         .map(addr, mapping, first, pages, protection, &mut frames::alloc)
         .map_err(|e| match e.kind {
             MapErrorKind::Mapped => Error::AddressInUse,
-            MapErrorKind::NoFrames => Error::NoMemory,
+            MapErrorKind::NoFrames | MapErrorKind::NoMemory => Error::NoMemory,
             MapErrorKind::Unaligned
             | MapErrorKind::OutsideUserSpace
             | MapErrorKind::OutsideKernelSpace
@@ -358,11 +359,15 @@ fn map(handle_arg: u64, offset: u64, len: u64, addr: u64, rights_arg: u64) -> Re
 /// Makes a channel, as the channel-create syscall does, and returns its
 /// endpoints' handles, the first in the low 32 bits.
 fn channel_create() -> Result<u64, Error> {
-    let (first, second) = channel::create();
-    let endpoints = alloc::vec![
-        (Object::Channel(Arc::new(first)), ENDPOINT_RIGHTS),
-        (Object::Channel(Arc::new(second)), ENDPOINT_RIGHTS),
-    ];
+    let (first, second) = channel::create()?;
+    let mut endpoints = Vec::new();
+    endpoints
+        .try_reserve_exact(2)
+        .map_err(|_| Error::NoMemory)?;
+    for endpoint in [first, second] {
+        let endpoint = Arc::try_new(endpoint).map_err(|_| Error::NoMemory)?;
+        endpoints.push((Object::Channel(endpoint), ENDPOINT_RIGHTS));
+    }
     // On failure the endpoints drop here, after the table's lock is gone.
     process()
         .insert_all(endpoints, |handles| {

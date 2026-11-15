@@ -27,9 +27,9 @@ pub struct Endpoint {
     channel: Arc<Mutex<Channel<Carried>>>,
 }
 
-/// A new channel's two endpoints.
-pub fn create() -> (Endpoint, Endpoint) {
-    let channel = Arc::new(Mutex::new(Channel::new()));
+/// A new channel's two endpoints. Fails with [`Error::NoMemory`].
+pub fn create() -> Result<(Endpoint, Endpoint), Error> {
+    let channel = Arc::try_new(Mutex::new(Channel::new())).map_err(|_| Error::NoMemory)?;
     let first = Endpoint {
         side: Side::First,
         channel: Arc::clone(&channel),
@@ -38,7 +38,16 @@ pub fn create() -> (Endpoint, Endpoint) {
         side: Side::Second,
         channel,
     };
-    (first, second)
+    Ok((first, second))
+}
+
+/// A new channel's endpoints, for tests, which leave the heap room.
+#[cfg(test)]
+pub fn pair() -> (Endpoint, Endpoint) {
+    let Ok(pair) = create() else {
+        panic!("no memory for a channel");
+    };
+    pair
 }
 
 impl Endpoint {
@@ -123,6 +132,7 @@ mod tests {
 
     use super::*;
     use crate::Arch;
+    use crate::testing::fill_heap;
 
     fn carry(endpoint: Endpoint) -> Message<Carried> {
         Message {
@@ -134,8 +144,8 @@ mod tests {
     #[test_case]
     fn closing_an_endpoint_drops_what_it_held() {
         let allocated = Arch::heap_stats().allocated;
-        let (a, b) = create();
-        let (c, d) = create();
+        let (a, b) = pair();
+        let (c, d) = pair();
         assert!(a.send(|| Ok(carry(c))).is_ok());
         drop(a);
         // b still receives what a sent.
@@ -145,7 +155,7 @@ mod tests {
         let [(Object::Channel(c), _)] = &message.handles[..] else {
             panic!("the message lost its endpoint");
         };
-        assert!(c.send(|| Ok(carry(create().0))).is_ok());
+        assert!(c.send(|| Ok(carry(pair().0))).is_ok());
         drop(message);
         // d drains what c sent before it closed.
         assert!(d.receive(Ok).is_ok());
@@ -156,14 +166,23 @@ mod tests {
     }
 
     #[test_case]
+    fn a_full_heap_makes_no_channel() {
+        let allocated = Arch::heap_stats().allocated;
+        let filler = fill_heap();
+        assert!(matches!(create(), Err(Error::NoMemory)));
+        drop(filler);
+        assert_eq!(Arch::heap_stats().allocated, allocated);
+    }
+
+    #[test_case]
     fn a_long_chain_of_queued_endpoints_drops_without_recursing() {
         let allocated = Arch::heap_stats().allocated;
         // Each new channel's first endpoint holds the chain so far at its
         // second, which is all that holds the second.
-        let (mut head, tail) = create();
+        let (mut head, tail) = pair();
         drop(tail);
         for _ in 0..2000 {
-            let (first, second) = create();
+            let (first, second) = pair();
             assert!(first.send(|| Ok(carry(head))).is_ok());
             drop(first);
             head = second;

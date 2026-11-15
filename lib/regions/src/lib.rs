@@ -14,6 +14,15 @@ use core::ops::Range;
 use thisos_abi::Error;
 use thisos_hal::Protection;
 
+/// Why [`Regions::insert`] added nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InsertError {
+    /// The range is empty or overlaps a region.
+    Overlap,
+    /// The list had no memory to grow.
+    NoMemory,
+}
+
 /// Address ranges that don't overlap, each with a value of type `T`.
 pub struct Regions<T> {
     /// In order of start.
@@ -29,18 +38,22 @@ impl<T> Regions<T> {
     }
 
     /// Adds `range` with `value`, and returns the value where it now is.
-    /// Fails, handing `value` back, if `range` is empty or overlaps a
-    /// region.
-    pub fn insert(&mut self, range: Range<u64>, value: T) -> Result<&mut T, T> {
+    /// Fails, handing `value` back, with [`InsertError::Overlap`] if
+    /// `range` is empty or overlaps a region, and with
+    /// [`InsertError::NoMemory`] if the list can't grow.
+    pub fn insert(&mut self, range: Range<u64>, value: T) -> Result<&mut T, (InsertError, T)> {
         if range.is_empty() {
-            return Err(value);
+            return Err((InsertError::Overlap, value));
         }
         let i = self.regions.partition_point(|(r, _)| r.start < range.start);
         let before = i.checked_sub(1).map(|j| &self.regions[j].0);
         let after = self.regions.get(i).map(|(r, _)| r);
         if before.is_some_and(|r| r.end > range.start) || after.is_some_and(|r| r.start < range.end)
         {
-            return Err(value);
+            return Err((InsertError::Overlap, value));
+        }
+        if self.regions.try_reserve(1).is_err() {
+            return Err((InsertError::NoMemory, value));
         }
         self.regions.insert(i, (range, value));
         Ok(&mut self.regions[i].1)
@@ -137,9 +150,17 @@ mod tests {
             0x0..0x7000,
             0x5fff..0x7000,
         ] {
-            assert_eq!(regions.insert(range.clone(), 'x'), Err('x'), "{range:x?}");
+            assert_eq!(
+                regions.insert(range.clone(), 'x'),
+                Err((InsertError::Overlap, 'x')),
+                "{range:x?}"
+            );
         }
-        assert_eq!(regions.insert(0x4000..0x4000, 'x'), Err('x'), "empty");
+        assert_eq!(
+            regions.insert(0x4000..0x4000, 'x'),
+            Err((InsertError::Overlap, 'x')),
+            "empty"
+        );
         assert_eq!(regions.insert(0x6000..0x7000, 'e'), Ok(&mut 'e'));
         assert_eq!(regions.iter().count(), 5);
     }

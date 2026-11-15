@@ -6,6 +6,7 @@
 #![cfg_attr(test, no_main)]
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used)]
+#![feature(allocator_ext)]
 #![feature(custom_test_frameworks)]
 #![test_runner(crate::testing::run)]
 #![reexport_test_harness_main = "test_main"]

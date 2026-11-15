@@ -59,13 +59,15 @@ impl Process {
     /// Puts a handle to this process with `rights` in its own table, and
     /// returns it.
     pub fn insert_self(self: &Arc<Self>, rights: Rights) -> Result<u32, Error> {
-        let object = Object::Process(Arc::clone(self));
-        self.handles.lock().insert(object, rights)
+        self.insert(Object::Process(Arc::clone(self)), rights)
     }
 
     /// Puts `object` in the table with `rights`, and returns its handle.
     pub fn insert(&self, object: Object, rights: Rights) -> Result<u32, Error> {
-        self.handles.lock().insert(object, rights)
+        let inserted = self.handles.lock().insert(object, rights);
+        // An object the table handed back drops here, after the lock is
+        // released: a memory object's drop frees its frames.
+        inserted.map_err(|(e, _)| e)
     }
 
     /// The object `handle` names, and the handle's rights.
@@ -94,8 +96,8 @@ impl Process {
 
     /// Puts every one of `objects` in the table, then calls `then` with
     /// their handles, in order, all under the table's lock. If there isn't
-    /// room for them all, or `then` fails, it fails with that error and
-    /// hands `objects` back, leaving the table as it was.
+    /// room or memory for them all, or `then` fails, it fails with that
+    /// error and hands `objects` back, leaving the table as it was.
     pub fn insert_all<R>(
         &self,
         objects: Vec<(Object, Rights)>,
@@ -105,16 +107,18 @@ impl Process {
         if table.room() < objects.len() {
             return Err((Error::NoHandles, objects));
         }
-        // Both reserved first, so that undoing allocates nothing.
+        // All reserved first, so that no insert fails and undoing
+        // allocates nothing.
         let (mut handles, mut undone) = (Vec::new(), Vec::new());
-        if handles.try_reserve_exact(objects.len()).is_err()
+        if table.try_reserve(objects.len()).is_err()
+            || handles.try_reserve_exact(objects.len()).is_err()
             || undone.try_reserve_exact(objects.len()).is_err()
         {
             return Err((Error::NoMemory, objects));
         }
         for (object, rights) in objects {
             let Ok(handle) = table.insert(object, rights) else {
-                unreachable!("the table had room");
+                unreachable!("the table had room and memory");
             };
             handles.push(handle);
         }
@@ -153,5 +157,46 @@ impl Process {
     /// frees the process's last thread, with interrupts on.
     pub fn close_handles(&self) {
         let _closed = mem::take(&mut *self.handles.lock());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::vec;
+
+    use thisos_hal::Platform;
+
+    use super::*;
+    use crate::frames;
+    use crate::testing::fill_heap;
+
+    fn memory() -> Object {
+        let Ok(object) = MemoryObject::new(1) else {
+            panic!("no memory for a page");
+        };
+        Object::Memory(Arc::new(object))
+    }
+
+    #[test_case]
+    fn a_full_heap_makes_no_handle_and_frees_the_object() {
+        let allocated = Arch::heap_stats().allocated;
+        let free = frames::free_frames();
+        let process = Process::new();
+        let (one, all) = (memory(), vec![(memory(), Rights::ALL)]);
+        let filler = fill_heap();
+        // The table is empty, so its first handle needs memory.
+        assert_eq!(process.insert(one, Rights::ALL), Err(Error::NoMemory));
+        assert_eq!(frames::free_frames(), free - 1, "insert's object is gone");
+        let Err((e, all)) = process.insert_all(all, |_| Ok(())) else {
+            panic!("the handles had no memory");
+        };
+        assert_eq!(e, Error::NoMemory);
+        assert_eq!(all.len(), 1);
+        drop(filler);
+        assert_eq!(process.insert_self(Rights::READ), Ok(1 << 16));
+        process.close_handles();
+        drop((all, process));
+        assert_eq!(frames::free_frames(), free);
+        assert_eq!(Arch::heap_stats().allocated, allocated);
     }
 }
