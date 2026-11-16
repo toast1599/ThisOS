@@ -1,6 +1,7 @@
 //! Kernel threads and the round-robin scheduler. Every timer tick hands the
 //! CPU to the next ready thread, and the idle thread runs only when no
-//! thread is ready. The boot thread runs on the loader's stack; every other
+//! thread is ready. The reaper, a thread like any other, frees the threads
+//! that exit. The boot thread runs on the loader's stack; every other
 //! thread has a stack from `paging::map_stack`. A user thread is a kernel
 //! thread that shares an address space and belongs to a process, and has
 //! left for user code in it; every switch loads the next thread's space, or
@@ -110,7 +111,7 @@ struct Scheduler {
     blocked: Vec<Box<Thread>>,
     /// The idle thread, or `None` while it runs.
     idle: Option<Box<Thread>>,
-    /// Threads that exited, until `reap` frees them.
+    /// Threads that exited, until the reaper frees them.
     #[expect(
         clippy::vec_box,
         reason = "unboxing a thread under the scheduler's lock would free the box there"
@@ -119,9 +120,12 @@ struct Scheduler {
     /// The thread that just switched away, without its context, until the
     /// thread it switched to puts it in its place with that context.
     leaving: Option<(Box<Thread>, Place)>,
-    /// Threads that aren't freed yet, the boot thread included and the idle
-    /// thread not: the room `ready`, `blocked` and `dead` each need.
+    /// Threads that aren't freed yet, the boot thread and the reaper
+    /// included and the idle thread not: the room `ready`, `blocked` and
+    /// `dead` each need.
     threads: usize,
+    /// The reaper's id, which a thread's death unparks.
+    reaper: u64,
 }
 
 static SCHEDULER: Mutex<Option<Scheduler>> = Mutex::new(None);
@@ -138,9 +142,9 @@ fn with<T>(f: impl FnOnce(&mut Scheduler) -> T) -> T {
     })
 }
 
-/// Makes the running code the boot thread, and makes the idle thread.
-/// `kernel::init` calls this once, after `heap::init` and before the timer
-/// starts.
+/// Makes the running code the boot thread, and makes the idle thread and
+/// the reaper. `kernel::init` calls this once, after `heap::init` and
+/// before the timer starts.
 pub fn init() {
     let stack = paging::map_stack(STACK_SIZE);
     let idle = Box::new(Thread::new(
@@ -150,19 +154,29 @@ pub fn init() {
         None,
         None,
     ));
+    let stack = paging::map_stack(STACK_SIZE);
+    let reaper = Box::new(Thread::new(
+        Some(Arch::new_context(stack.clone(), start)),
+        Some(stack),
+        Some(Box::new(reaper)),
+        None,
+        None,
+    ));
     let boot = Box::new(Thread::new(None, None, None, None, None));
-    let scheduler = Scheduler {
+    let mut scheduler = Scheduler {
         running: Some(boot),
-        ready: VecDeque::with_capacity(1),
-        blocked: Vec::with_capacity(1),
+        ready: VecDeque::with_capacity(2),
+        blocked: Vec::with_capacity(2),
         idle: Some(idle),
-        dead: Vec::with_capacity(1),
+        dead: Vec::with_capacity(2),
         leaving: None,
-        threads: 1,
+        threads: 2,
+        reaper: reaper.id,
     };
+    scheduler.ready.push_back(reaper);
     Arch::without_interrupts(|| *SCHEDULER.lock() = Some(scheduler));
     log::info!(
-        "threads: boot and idle, {} KiB stacks with guard pages",
+        "threads: boot, idle and reaper, {} KiB stacks with guard pages",
         STACK_SIZE >> 10
     );
 }
@@ -327,25 +341,26 @@ pub fn sleep(ticks: u64) {
 /// Readies the thread `id` names if it is parked, or makes its next park
 /// return at once if it isn't. Does nothing if no live thread has that id.
 pub fn unpark(id: u64) {
-    with(|scheduler| {
-        if let Ok(i) = scheduler
-            .blocked
-            .binary_search_by_key(&id, |thread| thread.id)
-        {
-            let mut thread = scheduler.blocked.remove(i);
+    with(|scheduler| scheduler.unpark(id));
+}
+
+impl Scheduler {
+    fn unpark(&mut self, id: u64) {
+        if let Ok(i) = self.blocked.binary_search_by_key(&id, |thread| thread.id) {
+            let mut thread = self.blocked.remove(i);
             thread.wake = Some(Wake::Unparked);
-            scheduler.ready.push_back(thread);
+            self.ready.push_back(thread);
             return;
         }
-        let thread = scheduler
+        let thread = self
             .running
             .iter_mut()
-            .chain(scheduler.ready.iter_mut())
+            .chain(self.ready.iter_mut())
             .find(|thread| thread.id == id);
         if let Some(thread) = thread {
             thread.wake = Some(Wake::Unparked);
         }
-    });
+    }
 }
 
 /// Lets the next ready thread run, if there is one.
@@ -383,19 +398,16 @@ pub fn tick() {
     switch(Place::Ready);
 }
 
-/// Ends the running thread. First frees every thread that exited before
-/// it, since nothing can free a thread's stack while the thread runs on
-/// it.
+/// Ends the running thread. The reaper frees it, since nothing can free a
+/// thread's stack while the thread runs on it.
 pub fn exit() -> ! {
-    reap();
     Arch::without_interrupts(|| switch(Place::Dead));
     panic!("a thread ran after it exited");
 }
 
-/// Ends the running thread from a trap handler, with interrupts still off,
-/// and frees no other thread: the trap may have come in on a stack the CPU
-/// starts the next such trap on, so nothing may preempt the thread there.
-/// The idle thread, or the next thread to `exit`, frees it.
+/// Ends the running thread from a trap handler, with interrupts still off:
+/// the trap may have come in on a stack the CPU starts the next such trap
+/// on, so nothing may preempt the thread there. The reaper frees it.
 pub fn exit_from_trap() -> ! {
     switch(Place::Dead);
     panic!("a thread ran after it exited");
@@ -458,7 +470,10 @@ fn arrived(from: Context) {
                     .binary_search_by_key(&thread.id, |blocked| blocked.id);
                 scheduler.blocked.insert(i, thread);
             }
-            Place::Dead => scheduler.dead.push(thread),
+            Place::Dead => {
+                scheduler.dead.push(thread);
+                scheduler.unpark(scheduler.reaper);
+            }
             Place::Idle => scheduler.idle = Some(thread),
         }
     });
@@ -469,7 +484,9 @@ fn arrived(from: Context) {
 /// thread holds it, then drops it. A process has one thread, so that
 /// thread's end is the process's. Interrupts are on, since the page
 /// tables', the frames' and the heap's locks may be held by a thread a
-/// tick preempted.
+/// tick preempted. Only the reaper calls this: a tick that preempts it
+/// while it holds one of those locks puts it back in the ready queue,
+/// where the idle thread would wait for every other thread to block.
 fn reap() {
     while let Some(mut thread) = with(|scheduler| {
         let thread = scheduler.dead.pop()?;
@@ -506,20 +523,28 @@ fn start(from: Context) -> ! {
     exit()
 }
 
-/// The idle thread's entry. It frees the threads that exited, then sleeps
-/// until the next interrupt, whose tick switches to a ready thread if
-/// there is one.
+/// What the reaper runs. A death that comes after its last look at the
+/// dead threads leaves it a wake, so its park returns at once.
+fn reaper() {
+    loop {
+        reap();
+        park();
+    }
+}
+
+/// The idle thread's entry. It sleeps until the next interrupt, whose tick
+/// switches to a ready thread if there is one. It takes no lock, since no
+/// tick puts it back in the ready queue to release one.
 fn idle(from: Context) -> ! {
     arrived(from);
     Arch::enable_interrupts();
     loop {
-        reap();
         Arch::wait_for_interrupt();
     }
 }
 
-/// The threads not freed yet, the boot thread included, and how many of
-/// them are dead.
+/// The threads not freed yet, the boot thread and the reaper included, and
+/// how many of them are dead.
 #[cfg(test)]
 fn counts() -> (usize, usize) {
     with(|scheduler| (scheduler.threads, scheduler.dead.len()))
@@ -536,16 +561,15 @@ fn is_blocked(id: u64) -> bool {
     })
 }
 
-/// Waits until every thread but the boot thread is dead, then frees them,
-/// so that the next test starts with the boot thread alone.
+/// Waits until the reaper has freed every thread but the boot thread and
+/// itself and parked again, so that the next test starts with those two
+/// alone. The reaper takes a thread off the dead ones before it frees it,
+/// so only its park says that it is done.
 #[cfg(test)]
 pub fn wait_for_exits() {
-    crate::testing::spin_until("the threads to exit", || {
-        let (threads, dead) = counts();
-        threads - 1 == dead
+    crate::testing::spin_until("the reaper to free every thread", || {
+        counts() == (2, 0) && is_blocked(with(|scheduler| scheduler.reaper))
     });
-    reap();
-    assert_eq!(counts(), (1, 0));
 }
 
 #[cfg(test)]
@@ -553,6 +577,7 @@ mod tests {
     use core::hint::spin_loop;
     use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
+    use thisos_abi::Rights;
     use thisos_hal::{BacktraceEnd, Probe, Trap};
 
     use super::*;
@@ -579,32 +604,38 @@ mod tests {
         wait_for_exits();
     }
 
-    // The first thread is dead before the second starts, so the second's
-    // exit has to free it.
+    // This thread and the spinner are always ready, so the idle thread
+    // never runs, and nothing else exits after the thread that dies.
     #[test_case]
-    fn exit_frees_the_threads_that_died_before_it() {
-        static STACKS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+    fn a_dead_thread_is_freed_while_others_stay_ready() {
+        static STOP: AtomicBool = AtomicBool::new(false);
+        static STACK: AtomicU64 = AtomicU64::new(0);
         let run = || {
-            for stack in &STACKS {
-                spawn(|| stack.store(Arch::guard_page() + 4096, Ordering::Relaxed));
-                spin_until("the thread to exit", || counts() == (2, 1));
-            }
-            let first = STACKS[0].load(Ordering::Relaxed);
-            assert_eq!(paging::translate(first), None, "first stack at {first:#x}");
-            let second = STACKS[1].load(Ordering::Relaxed);
-            assert!(
-                paging::translate(second).is_some(),
-                "second stack at {second:#x}"
-            );
+            STOP.store(false, Ordering::Relaxed);
             let free = frames::free_frames();
-            reap();
-            assert_eq!(counts(), (1, 0));
-            assert_eq!(frames::free_frames() - free, STACK_SIZE / 4096);
-            assert_eq!(
-                paging::translate(second),
-                None,
-                "second stack at {second:#x}"
-            );
+            let tables = paging::stack_table_frames();
+            let process = Process::new();
+            assert!(process.insert_self(Rights::READ).is_ok());
+            spawn(|| {
+                while !STOP.load(Ordering::Relaxed) {
+                    spin_loop();
+                }
+            });
+            spawn_in(None, Some(Arc::clone(&process)), || {
+                STACK.store(Arch::guard_page() + 4096, Ordering::Relaxed);
+            });
+            // The thread holds the process, and so does the process's
+            // handle to itself, until the thread is freed and its handles
+            // close.
+            spin_until("the dead thread's handles to close", || {
+                Arc::strong_count(&process) == 1
+            });
+            STOP.store(true, Ordering::Relaxed);
+            wait_for_exits();
+            let stack = STACK.load(Ordering::Relaxed);
+            assert_eq!(paging::translate(stack), None, "its stack at {stack:#x}");
+            let tables = paging::stack_table_frames() - tables;
+            assert_eq!(frames::free_frames(), free - tables);
         };
         // The first run grows the queues to fit, which they keep.
         run();

@@ -681,27 +681,21 @@ mod tests {
     /// that the process recorded that end and closed its handles, and that
     /// every frame taken since there were `before` free came back: those of
     /// the space and its pages, and those of the thread's stack.
-    /// Kernel-space tables the stack needed stay, so those are left out.
+    /// Kernel-space tables the stack needed stay, so those are taken off.
     /// Meanwhile it checks that this thread, a kernel thread, runs on the
     /// kernel's tables every time ticks switch back to it.
     fn run_in(program: Program, before: usize, process: &Arc<Process>, arg: u64) -> End {
-        let space_frames = before - frames::free_frames();
+        let tables = paging::stack_table_frames();
         let entry = program.entry;
         Arch::without_interrupts(|| *ENDED.lock() = None);
         program.start(Arc::clone(process), arg);
-        // User code allocates nothing, and nothing frees the thread until
-        // wait_for_exits, so this counts its stack whenever it runs.
-        let spawned = frames::free_frames();
         spin_until("the user thread to end", || {
             assert_eq!(Arch::translate_active(entry), None, "user code's page");
             Arch::without_interrupts(|| ENDED.lock().is_some())
         });
         thread::wait_for_exits();
-        assert_eq!(
-            frames::free_frames(),
-            spawned + space_frames + thread::STACK_SIZE / 4096,
-            "frames leaked"
-        );
+        let tables = paging::stack_table_frames() - tables;
+        assert_eq!(frames::free_frames(), before - tables, "frames leaked");
         let Some(end) = Arch::without_interrupts(|| *ENDED.lock()) else {
             unreachable!("ENDED was set");
         };

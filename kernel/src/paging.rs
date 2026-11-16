@@ -4,6 +4,8 @@
 //! never return.
 
 use core::ops::Range;
+#[cfg(test)]
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use spin::Mutex;
 use thisos_frames::Frame;
@@ -121,13 +123,34 @@ pub fn map_stack(size: usize) -> Range<u64> {
             let Some(frame) = frames::alloc() else {
                 panic!("no free frame for a stack");
             };
-            if let Err(e) = kernel.tables.map(page, frame, true, &mut frames::alloc) {
+            if let Err(e) = kernel.tables.map(page, frame, true, &mut alloc_stack_table) {
                 panic!("mapping a stack page at {page:#x} failed: {:?}", e.kind);
             }
         }
         kernel.stacks = stack.end;
         stack
     })
+}
+
+/// A frame for a table that a stack's pages need, which stays when the
+/// stack goes.
+fn alloc_stack_table() -> Option<Frame> {
+    let frame = frames::alloc();
+    #[cfg(test)]
+    if frame.is_some() {
+        STACK_TABLE_FRAMES.fetch_add(1, Ordering::Relaxed);
+    }
+    frame
+}
+
+#[cfg(test)]
+static STACK_TABLE_FRAMES: AtomicUsize = AtomicUsize::new(0);
+
+/// How many frames the stacks' tables have taken, which tests take off
+/// the frames they expect back once a thread is freed.
+#[cfg(test)]
+pub fn stack_table_frames() -> usize {
+    STACK_TABLE_FRAMES.load(Ordering::Relaxed)
 }
 
 /// Maps `frame` at the end of the heap and adds it to the heap.
