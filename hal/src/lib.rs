@@ -261,8 +261,12 @@ pub enum UserProgram {
     /// writable; (7) closing the first endpoint succeeds; (8) waiting 10 ms
     /// for the second's peer to close returns at once, observing it
     /// readable with its peer closed; (9) waiting 10 ms on no items fails
-    /// with `TimedOut`. It exits with status 0, or with the number of the
-    /// first check that failed.
+    /// with `TimedOut`; (10) with a second channel and a 4 KiB memory
+    /// object mapped read-write at `0x40_0000` and read-only at
+    /// `0x41_0000`, an item for that channel's second endpoint to be
+    /// readable, written through the first mapping and waited on for good
+    /// through the second, fails with `BadAddress` at once. It exits with
+    /// status 0, or with the number of the first check that failed.
     Wait,
     /// Makes a syscall with the number `u64::MAX` from the last
     /// instruction of its page, so the syscall returns to the address after

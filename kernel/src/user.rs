@@ -475,7 +475,9 @@ fn wait(items: u64, count_arg: u64, timeout: u64) -> Result<u64, Error> {
     let count = count(count_arg, MAX_WAIT_ITEMS)?;
     let mut raw = [0; WAIT_ITEM_SIZE * MAX_WAIT_ITEMS];
     let raw = &mut raw[..WAIT_ITEM_SIZE * count];
-    if !copy_from_user(items, raw) {
+    // Written back unchanged, so that items the call can't write its result
+    // into fail before it blocks rather than after.
+    if !copy_from_user(items, raw) || !copy_to_user(items, raw) {
         return Err(Error::BadAddress);
     }
     let mut waits = Vec::new();

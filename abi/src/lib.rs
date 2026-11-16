@@ -124,7 +124,8 @@ pub enum Syscall {
     /// signals into when it succeeds, for every item. Its value is the
     /// number of items with a wanted signal. A handle may be in more than
     /// one item. With no items it waits out the time. Fails with
-    /// [`Error::TooLong`], [`Error::BadAddress`], [`Error::BadHandle`],
+    /// [`Error::TooLong`], with [`Error::BadAddress`] before it waits for
+    /// items it can't read and write, [`Error::BadHandle`],
     /// [`Error::WrongType`] for an object that has no signals,
     /// [`Error::AccessDenied`], [`Error::BadSignals`], [`Error::NoMemory`],
     /// or with [`Error::TimedOut`] once the time has passed with no wanted

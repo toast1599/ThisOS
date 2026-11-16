@@ -58,7 +58,7 @@ pub fn enter_user(ip: u64, sp: u64, arg: u64) -> ! {
 }
 
 /// The bytes each program has, from the start of its slot.
-const SLOT: usize = 512;
+const SLOT: usize = 1024;
 
 /// Where in its frame `UserProgram::LastSyscall` has its syscall: the last
 /// two bytes.
@@ -422,9 +422,11 @@ global_asm!(
     "ret",
     ".org thisos_user_programs + 10 * {slot}, 0xcc",
     // Wait. RBX holds the process handle in RDI, R12 and R13 the
-    // endpoints; EDI is set to each check's number before it's tested, as
-    // in Handles. Below the stack's top: two wait items at RSP, of handle,
-    // wanted and observed signals, and the byte to send at RSP + 32.
+    // endpoints, then R13 the second channel's second endpoint and R14 the
+    // memory object; EDI is set to each check's number before it's tested,
+    // as in Handles. Below the stack's top: two wait items at RSP, of
+    // handle, wanted and observed signals, and the byte to send at RSP +
+    // 32.
     "mov rbx, rdi",
     "sub rsp, 64",
     "mov eax, {channel_create}",
@@ -506,6 +508,50 @@ global_asm!(
     "mov edi, 9",
     "cmp rax, {timed_out}",
     "jne 2f",
+    "mov eax, {channel_create}",
+    "syscall",
+    "mov edi, 10",
+    "test rax, rax",
+    "jnz 2f",
+    "shr rdx, 32",
+    "mov r13, rdx",
+    "mov edi, 4096",
+    "mov eax, {memory_create}",
+    "syscall",
+    "mov edi, 10",
+    "test rax, rax",
+    "jnz 2f",
+    "mov r14, rdx",
+    "mov rdi, r14",
+    "xor esi, esi",
+    "mov edx, 4096",
+    "mov r10d, {a}",
+    "mov r8d, {read_write}",
+    "mov eax, {map}",
+    "syscall",
+    "mov edi, 10",
+    "test rax, rax",
+    "jnz 2f",
+    "mov dword ptr [{a}], r13d",
+    "mov dword ptr [{a} + 4], {readable}",
+    "mov rdi, r14",
+    "xor esi, esi",
+    "mov edx, 4096",
+    "mov r10d, {b}",
+    "mov r8d, {read}",
+    "mov eax, {map}",
+    "syscall",
+    "mov edi, 10",
+    "test rax, rax",
+    "jnz 2f",
+    "mov edi, {b}",
+    "mov esi, 1",
+    "mov rdx, -1",
+    "mov eax, {wait}",
+    "syscall",
+    "mov edi, 10",
+    "cmp rax, {bad_address}",
+    "jne 2f",
     "xor edi, edi",
     "2:",
     "mov eax, {exit}",
@@ -541,6 +587,7 @@ global_asm!(
     write_right = const Rights::WRITE.bits(),
     read_duplicate = const Rights::READ.union(Rights::DUPLICATE).bits(),
     bad_handle = const Error::BadHandle.code(),
+    bad_address = const Error::BadAddress.code(),
     bad_rights = const Error::BadRights.code(),
     access_denied = const Error::AccessDenied.code(),
     out_of_range = const Error::OutOfRange.code(),
