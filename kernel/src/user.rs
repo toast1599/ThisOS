@@ -787,6 +787,20 @@ mod tests {
         assert_eq!(end, End::Exited(0));
     }
 
+    // A user thread never returns from its entry, so what started it must
+    // be freed before it enters user code.
+    #[test_case]
+    fn a_user_thread_leaves_the_heap_as_it_found_it() {
+        // The first run grows the scheduler's queues to fit, which they
+        // keep.
+        run(UserProgram::Syscalls, |_, _| 0);
+        for program in [UserProgram::Syscalls, UserProgram::Privileged] {
+            let allocated = Arch::heap_stats().allocated;
+            run(program, |_, _| 0);
+            assert_eq!(Arch::heap_stats().allocated, allocated, "{program:?}");
+        }
+    }
+
     #[test_case]
     fn a_syscall_keeps_registers_and_an_unknown_one_fails() {
         let (end, _) = run(UserProgram::Syscalls, |_, _| 0);

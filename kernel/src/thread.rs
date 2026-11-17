@@ -48,7 +48,7 @@ struct Thread {
     /// loader's and is never freed.
     stack: Option<Range<u64>>,
     /// What it runs, until it starts.
-    run: Option<Box<dyn FnOnce() + Send>>,
+    run: Option<Box<dyn Run>>,
     /// The address space it runs user code in, or `None` for a kernel
     /// thread. The last thread to drop it destroys it.
     space: Option<Arc<paging::AddressSpace>>,
@@ -66,7 +66,7 @@ impl Thread {
     fn new(
         context: Option<Context>,
         stack: Option<Range<u64>>,
-        run: Option<Box<dyn FnOnce() + Send>>,
+        run: Option<Box<dyn Run>>,
         space: Option<Arc<paging::AddressSpace>>,
         process: Option<Arc<Process>>,
     ) -> Self {
@@ -512,13 +512,31 @@ fn reap() {
     }
 }
 
+/// What a spawned thread runs.
+trait Run: Send {
+    /// Frees the box, then runs. A user thread's closure never returns, so
+    /// a box freed after the call, as calling a `Box<dyn FnOnce>` frees
+    /// it, would leak.
+    fn run(self: Box<Self>);
+}
+
+impl<F: FnOnce() + Send> Run for F {
+    fn run(self: Box<Self>) {
+        let run = {
+            let boxed = self;
+            *boxed
+        };
+        run();
+    }
+}
+
 /// A spawned thread's entry.
 fn start(from: Context) -> ! {
     arrived(from);
     let run = with(|scheduler| scheduler.running.as_mut()?.run.take());
     Arch::enable_interrupts();
     if let Some(run) = run {
-        run();
+        run.run();
     }
     exit()
 }
