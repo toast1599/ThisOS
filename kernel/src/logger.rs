@@ -111,11 +111,11 @@ pub fn panic(head: fmt::Arguments, body: &dyn fmt::Display) {
     });
 }
 
-/// Writes the test summary, `body`, then PASS or FAIL: four times the
-/// font's size on the console, plain on serial. It goes where the panic
-/// report went, when there was one.
+/// Writes a test summary, then PASS or FAIL: `full` and the word plain on
+/// serial, and `brief` and the word at four times the font's size on the
+/// console. It goes where the panic report went, when there was one.
 #[cfg(test)]
-pub fn test_summary(body: &dyn fmt::Display, pass: bool) {
+pub fn test_summary(full: &dyn fmt::Display, brief: &dyn fmt::Display, pass: bool) {
     let (word, color) = if pass {
         ("PASS", Color::Green)
     } else {
@@ -123,10 +123,10 @@ pub fn test_summary(body: &dyn fmt::Display, pass: bool) {
     };
     report_sinks(|Sinks { serial, console }| {
         if let Some(serial) = serial {
-            let _ = writeln!(serial, "{body}{word}");
+            let _ = writeln!(serial, "{full}{word}");
         }
         console.set_color(Color::Gray);
-        let _ = write!(console, "{body}");
+        let _ = write!(console, "{brief}");
         console.set_color(color);
         console.write_large(word, 4);
     });

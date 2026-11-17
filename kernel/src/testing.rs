@@ -1,6 +1,8 @@
 //! The test runner for the kernel's `#[test_case]` functions. It ends on a
 //! summary of the results with a large PASS or FAIL, which is all the
-//! laptop shows, then exits QEMU.
+//! laptop shows, then exits QEMU. Serial gets every test's result; the
+//! console gets counts, so that a failure's report stays on the laptop's
+//! screen above them.
 
 use alloc::vec::Vec;
 use core::fmt::{self, Write};
@@ -308,7 +310,8 @@ fn finish(pass: bool) -> ! {
             // through the panic path.
             logger::panic(format_args!("test {} failed", test.name()), &"");
         }
-        logger::test_summary(&Summary { run, pass }, pass);
+        let summary = Summary { run, pass };
+        logger::test_summary(&summary, &Brief(&summary), pass);
     }
     Arch::exit_qemu(pass)
 }
@@ -334,6 +337,42 @@ impl fmt::Display for Summary {
     }
 }
 
+/// The summary for the console: how many tests passed, failed and didn't
+/// run, and the failed one's name, in at most three lines.
+struct Brief<'a>(&'a Summary);
+
+impl fmt::Display for Brief<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Some(run) = self.0.run else {
+            return writeln!(f, "summary: panic before the tests started");
+        };
+        let (mut ok, mut not_run) = (0, 0);
+        let mut failed = None;
+        for (i, test) in run.tests.iter().enumerate() {
+            match run.result(i) {
+                "ok" => ok += 1,
+                "FAILED" => failed = Some(test.name()),
+                _ => not_run += 1,
+            }
+        }
+        write!(f, "summary: {ok} ok")?;
+        if failed.is_some() {
+            write!(f, ", 1 FAILED")?;
+        }
+        if not_run > 0 {
+            write!(f, ", {not_run} not run")?;
+        }
+        writeln!(f)?;
+        if let Some(name) = failed {
+            writeln!(f, "  FAILED {name}")?;
+        }
+        if !self.0.pass && run.current == run.tests.len() {
+            writeln!(f, "  panic after the last test")?;
+        }
+        Ok(())
+    }
+}
+
 impl Run {
     /// What the summary says of test `i`. The tests ran in order, except the
     /// one that expects a panic, which ran last.
@@ -352,7 +391,54 @@ impl Run {
 
 #[cfg(test)]
 mod tests {
+    use alloc::format;
+
     use thisos_hal::Probe;
+
+    use super::{Brief, ExpectPanic, Run, Summary, Test};
+
+    fn brief(run: Option<Run>, pass: bool) -> alloc::string::String {
+        format!("{}", Brief(&Summary { run, pass }))
+    }
+
+    // Four tests, the last of which expects a panic, so it runs last.
+    #[test_case]
+    fn the_console_summary_counts_tests_and_names_the_failed_one() {
+        static TESTS: [&dyn Test; 4] = [
+            &|| {},
+            &|| {},
+            &|| {},
+            &ExpectPanic {
+                name: "panics",
+                run: || {},
+                message: "",
+            },
+        ];
+        let run = |current| Run {
+            tests: &TESTS,
+            current,
+            last: Some(3),
+            started: 0,
+        };
+        let second = TESTS[1].name();
+        assert_eq!(
+            brief(Some(run(1)), false),
+            format!("summary: 1 ok, 1 FAILED, 2 not run\n  FAILED {second}\n")
+        );
+        assert_eq!(
+            brief(Some(run(3)), false),
+            "summary: 3 ok, 1 FAILED\n  FAILED panics\n"
+        );
+        assert_eq!(brief(Some(run(4)), true), "summary: 4 ok\n");
+        assert_eq!(
+            brief(Some(run(4)), false),
+            "summary: 4 ok\n  panic after the last test\n"
+        );
+        assert_eq!(
+            brief(None, false),
+            "summary: panic before the tests started\n"
+        );
+    }
 
     // The watchdog's own report ends the run, so this stands in a 1 s
     // timeout for its 10 s one and checks the timer stops the probe.
