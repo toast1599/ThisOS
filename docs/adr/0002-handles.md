@@ -26,4 +26,4 @@ Any of these can work. The goal here is a model that is simple, safe and explici
 
 - There is no derivation tree, so revoking access that was already handed out needs a separate mechanism, such as a revocable proxy object. None is designed yet.
 - Read-only sharing of memory uses a handle without the write right, not a separate object type.
-- How a handle is represented, and the syscalls that create, duplicate and close handles, are still open. Both are due at milestones 3 and 4.
+- Milestone 4 settled how a handle is represented: a `u32` naming a slot in its process's table, the slot's index in the low 16 bits and its generation, from 1, in the high 16, so 0 is never a handle and a closed handle fails with `Error::BadHandle` instead of naming whatever took its slot. A table holds up to 65536 slots. `close(h)` closes a handle, `duplicate(h, rights)` makes another with a subset of h's rights and needs the duplicate right, and `restrict(h, rights)` drops rights from h in place. Each object type's own syscall creates its handles.

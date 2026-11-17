@@ -374,8 +374,11 @@ extern "C" fn trap_entry(frame: &mut TrapFrame) {
         }
     };
     handler(trap, frame);
-    // After the handler, as x86_64's EOI, so that the next tick can't come
-    // while this one is still handled. An abandoned handler ends it too.
+    // After the handler, so that the next tick can't come while this one is
+    // still handled. An abandoned handler ends it too. x86_64 sends its EOI
+    // before the handler instead, because a tick's handler may switch to a
+    // thread that runs for many ticks before it returns here; porting threads
+    // has to move this call the same way.
     if let Some(interrupt) = acknowledged {
         interrupt.end();
     }
