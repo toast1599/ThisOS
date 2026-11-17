@@ -32,8 +32,8 @@ use aarch64_cpu::asm::{barrier, wfi};
 use aarch64_cpu::registers::{DAIF, ReadWriteable, Readable, Writeable};
 use thisos_frames::Frame;
 use thisos_hal::{
-    BacktraceEnd, Cpu, Framebuffer, HeapStats, Platform, Probe, TimerFrequencies, TimerFrequency,
-    Translation, UserProgram,
+    BacktraceEnd, Cpu, Framebuffer, HeapStats, Platform, Probe, Stack, TimerFrequencies,
+    TimerFrequency, Translation, UserProgram,
 };
 
 pub use framebuffer::FramebufferPixels;
@@ -151,7 +151,7 @@ impl Platform for Aarch64 {
         not_ported("Platform::activate_kernel_tables")
     }
 
-    fn move_trap_stacks(stack: &mut dyn FnMut(usize) -> u64) {
+    fn move_trap_stacks(stack: &mut dyn FnMut(usize) -> Stack<Self>) {
         trap::move_stack(stack);
     }
 
@@ -159,8 +159,12 @@ impl Platform for Aarch64 {
         trap::stacks()
     }
 
-    fn new_context(_: Range<u64>, _: fn(NoContext) -> !) -> NoContext {
+    fn new_context(_: Stack<Self>, _: fn(NoContext) -> !) -> NoContext {
         not_ported("Platform::new_context")
+    }
+
+    fn into_stack(_: NoContext) -> Option<Stack<Self>> {
+        not_ported("Platform::into_stack")
     }
 
     fn switch(_: NoContext) -> NoContext {

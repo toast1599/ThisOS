@@ -331,24 +331,25 @@ pub trait Platform {
     fn activate_kernel_tables();
 
     /// Moves the stacks the CPU switches to for some traps, which start out
-    /// with nothing unmapped below them, onto stacks `stack` maps. For each
-    /// it calls `stack(size)`, which returns the address just past a stack
-    /// of `size` bytes with an unmapped page below it, and its start
-    /// aligned to the power of two at or above twice its size. Call it
+    /// with nothing unmapped below them, onto stacks from `stack`, which it
+    /// calls with each one's size in bytes and keeps for good. Call it
     /// once, after [`Platform::take_page_tables`].
-    fn move_trap_stacks(stack: &mut dyn FnMut(usize) -> u64);
+    fn move_trap_stacks(stack: &mut dyn FnMut(usize) -> Stack<Self>);
 
     /// The stacks the CPU switches to for some traps. For tests.
     fn trap_stacks() -> impl Iterator<Item = Range<u64>>;
 
     /// A kernel thread that, once [`Platform::switch`] resumes it, calls
     /// `entry` on `stack` with interrupts off, passing it the context of
-    /// the thread that switched to it. `stack` is a stack of
-    /// [`PageTables::kernel_space`] that nothing else uses, with an
-    /// unmapped page below it, such as `move_trap_stacks`'s callback
-    /// returns; the architecture writes the thread's first frame at its
-    /// top. Panics unless `stack` is whole pages inside kernel space.
-    fn new_context(stack: Range<u64>, entry: fn(Self::Context) -> !) -> Self::Context;
+    /// the thread that switched to it. The architecture writes the thread's
+    /// first frame at the stack's top. The context holds the stack until
+    /// [`Platform::into_stack`] gives it back.
+    fn new_context(stack: Stack<Self>, entry: fn(Self::Context) -> !) -> Self::Context;
+
+    /// The stack `context`'s thread ran on, which it never runs on again,
+    /// for [`PageTables::unmap_stack`]; `None` for the boot thread's, which
+    /// the loader mapped.
+    fn into_stack(context: Self::Context) -> Option<Stack<Self>>;
 
     /// Suspends the calling thread and resumes `to`. Returns once another
     /// thread switches to the caller's context, with that thread's own
@@ -446,6 +447,12 @@ pub trait PageTables: Send {
     /// A user address space whose mappings each hold an `O`.
     type AddressSpace<O: Deref<Target = [Frame]> + Send + Sync>: AddressSpace<O>;
 
+    /// A kernel stack that [`PageTables::map_stack`] mapped, which nothing
+    /// else makes: neither `Clone` nor constructible outside the
+    /// architecture, so no two threads run on one. Dropping it leaves its
+    /// pages mapped for good.
+    type Stack;
+
     /// The virtual addresses [`PageTables::map`] maps into. The loader
     /// mapped nothing there.
     fn kernel_space(&self) -> Range<u64>;
@@ -466,6 +473,21 @@ pub trait PageTables: Send {
     /// Kernel-space addresses are never mapped again after this, so code
     /// that still uses the page faults and reaches no other memory.
     fn unmap(&mut self, page: u64) -> Option<Frame>;
+
+    /// Maps a stack of `size` bytes, rounded up to whole pages, writable
+    /// and no-execute, with frames from `alloc`, which also gives any new
+    /// table on the way. It lies outside [`PageTables::kernel_space`], with
+    /// an unmapped page below it that an overflow runs into, and its start
+    /// is aligned to the power of two at or above twice its size, so that
+    /// an architecture can tell an overflow by one bit of the stack
+    /// pointer. Stack addresses are never mapped again after
+    /// [`PageTables::unmap_stack`]. Panics if `alloc` or the stacks'
+    /// addresses run out.
+    fn map_stack(&mut self, size: usize, alloc: &mut dyn FnMut() -> Option<Frame>) -> Self::Stack;
+
+    /// Unmaps `stack` and hands each of its frames to `free`. The tables
+    /// its pages needed stay.
+    fn unmap_stack(&mut self, stack: Self::Stack, free: &mut dyn FnMut(Frame));
 
     /// Maps `frame` at the page after the heap's last one, writable and
     /// no-execute, and adds the page to the heap the global allocator
@@ -557,6 +579,9 @@ pub enum Protection {
     /// Reads and instruction fetches.
     ReadExecute,
 }
+
+/// The kernel stacks of platform `P`.
+pub type Stack<P> = <<P as Platform>::PageTables as PageTables>::Stack;
 
 /// The kernel heap's counters, as [`Platform::heap_stats`] reads them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

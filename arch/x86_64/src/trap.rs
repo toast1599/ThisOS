@@ -22,7 +22,7 @@ use x86_64::structures::tss::TaskStateSegment;
 
 use crate::once::Once;
 use crate::paging::USER_SPACE;
-use crate::{X86_64, apic, backtrace, catch};
+use crate::{X86_64, apic, backtrace, catch, paging};
 
 // Each stub sits 16 bytes after the one before it, so that the IDT can find
 // stub n at thisos_trap_stubs + 16n. The .org fails to assemble if a stub
@@ -654,17 +654,25 @@ fn install_on<F>(entry: &mut Entry<F>, vector: u8, ist: u16) {
     }
 }
 
-/// Moves each IST slot to a stack `stack` maps: `stack(size)` returns the
-/// address just past a stack of `size` bytes with an unmapped page below
-/// it.
-pub fn move_stacks(stack: &mut dyn FnMut(usize) -> u64) {
-    for slot in IST_SLOTS {
-        let top = stack(IST_STACK_SIZE);
+/// The stacks `move_stacks` put in the IST slots, which keep them for good.
+static MOVED_STACKS: Once<[paging::Stack; 4]> = Once::new();
+
+/// Moves each IST slot to a stack from `stack`, which it calls with the
+/// stack's size; see `Platform::move_trap_stacks`.
+pub fn move_stacks(stack: &mut dyn FnMut(usize) -> paging::Stack) {
+    assert!(
+        MOVED_STACKS.get().is_none(),
+        "the trap stacks moved already"
+    );
+    let moved = IST_SLOTS.map(|slot| {
+        let moved = stack(IST_STACK_SIZE);
         // The CPU reads the slot on this core, which sees its own stores in
         // order, and the boot stack it held stays valid, so a trap meanwhile
         // takes either stack.
-        TSS.slot(slot).store(top, Ordering::Relaxed);
-    }
+        TSS.slot(slot).store(moved.range().end, Ordering::Relaxed);
+        moved
+    });
+    MOVED_STACKS.init(moved);
 }
 
 /// Makes `top` the stack a trap from user code starts on, through IDT or

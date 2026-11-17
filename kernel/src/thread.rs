@@ -23,7 +23,6 @@ use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::mem;
-use core::ops::Range;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use spin::Mutex;
@@ -42,11 +41,8 @@ pub const STACK_SIZE: usize = 64 << 10;
 struct Thread {
     /// Names it to [`unpark`]. Never reused, so a stale id unparks nothing.
     id: u64,
-    /// Where it stopped, while it isn't running.
+    /// Where it stopped, while it isn't running, which holds its stack.
     context: Option<Context>,
-    /// Its stack, or `None` for the boot thread, whose stack is the
-    /// loader's and is never freed.
-    stack: Option<Range<u64>>,
     /// What it runs, until it starts.
     run: Option<Box<dyn Run>>,
     /// The address space it runs user code in, or `None` for a kernel
@@ -65,7 +61,6 @@ struct Thread {
 impl Thread {
     fn new(
         context: Option<Context>,
-        stack: Option<Range<u64>>,
         run: Option<Box<dyn Run>>,
         space: Option<Arc<paging::AddressSpace>>,
         process: Option<Arc<Process>>,
@@ -74,7 +69,6 @@ impl Thread {
         Self {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             context,
-            stack,
             run,
             space,
             process,
@@ -146,23 +140,19 @@ fn with<T>(f: impl FnOnce(&mut Scheduler) -> T) -> T {
 /// the reaper. `kernel::init` calls this once, after `heap::init` and
 /// before the timer starts.
 pub fn init() {
-    let stack = paging::map_stack(STACK_SIZE);
     let idle = Box::new(Thread::new(
-        Some(Arch::new_context(stack.clone(), idle)),
-        Some(stack),
+        Some(Arch::new_context(paging::map_stack(STACK_SIZE), idle)),
         None,
         None,
         None,
     ));
-    let stack = paging::map_stack(STACK_SIZE);
     let reaper = Box::new(Thread::new(
-        Some(Arch::new_context(stack.clone(), start)),
-        Some(stack),
+        Some(Arch::new_context(paging::map_stack(STACK_SIZE), start)),
         Some(Box::new(reaper)),
         None,
         None,
     ));
-    let boot = Box::new(Thread::new(None, None, None, None, None));
+    let boot = Box::new(Thread::new(None, None, None, None));
     let mut scheduler = Scheduler {
         running: Some(boot),
         ready: VecDeque::with_capacity(2),
@@ -215,10 +205,8 @@ fn spawn_in(
     process: Option<Arc<Process>>,
     run: impl FnOnce() + Send + 'static,
 ) {
-    let stack = paging::map_stack(STACK_SIZE);
     let mut thread = Some(Box::new(Thread::new(
-        Some(Arch::new_context(stack.clone(), start)),
-        Some(stack),
+        Some(Arch::new_context(paging::map_stack(STACK_SIZE), start)),
         Some(Box::new(run)),
         space,
         process,
@@ -493,15 +481,8 @@ fn reap() {
         scheduler.threads -= 1;
         Some(thread)
     }) {
-        for page in thread
-            .stack
-            .iter()
-            .flat_map(|stack| stack.clone().step_by(4096))
-        {
-            let Some(frame) = paging::unmap(page) else {
-                panic!("stack page {page:#x} wasn't mapped");
-            };
-            frames::free(frame);
+        if let Some(stack) = thread.context.take().and_then(Arch::into_stack) {
+            paging::unmap_stack(stack);
         }
         if let Some(process) = thread.process.take() {
             process.close_handles();

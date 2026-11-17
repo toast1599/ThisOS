@@ -9,10 +9,13 @@ use core::ops::Range;
 use x86_64::VirtAddr;
 use x86_64::instructions::interrupts;
 
-use crate::{backtrace, paging, trap};
+use crate::paging::Stack;
+use crate::{backtrace, trap};
 
 /// A suspended thread: the stack pointer its registers were pushed at,
-/// and the stack it runs on.
+/// and the stack it runs on, which it holds: a `Stack`'s range, or the
+/// boot thread's. A switch hands the leaving thread's on to the thread it
+/// resumes, which makes its context.
 #[derive(Debug)]
 pub struct Context {
     rsp: u64,
@@ -81,20 +84,10 @@ const _: () = assert!((size_of::<Start>() - offset_of!(Start, pad)) % 16 == 0);
 
 /// A thread that runs `entry` on `stack` once switched to; see
 /// `Platform::new_context`.
-pub fn new(stack: Range<u64>, entry: fn(Context) -> !) -> Context {
-    let Some(space) = paging::KERNEL_SPACE.get() else {
-        panic!("a thread's stack before the kernel's page tables");
-    };
-    assert!(
-        stack.start % 4096 == 0
-            && stack.end % 4096 == 0
-            && stack.start < stack.end
-            && space.start <= stack.start
-            && stack.end <= space.end,
-        "{stack:#x?} isn't whole pages inside kernel space {space:#x?}"
-    );
-    // The address comes from a page the arch crate mapped in the reserved
-    // level 4 entry, for the caller.
+pub fn new(stack: Stack, entry: fn(Context) -> !) -> Context {
+    let stack = stack.into_range();
+    // The address comes from a page map_stack mapped in the reserved level
+    // 4 entry.
     let top = VirtAddr::new(stack.end)
         .as_mut_ptr::<Start>()
         .wrapping_sub(1);
@@ -108,11 +101,10 @@ pub fn new(stack: Range<u64>, entry: fn(Context) -> !) -> Context {
         ret: thisos_thread_start,
         pad: [0; 2],
     };
-    // SAFETY: The caller hands over a stack in kernel space, which the
-    // assert checks, that it mapped writable for this thread alone, as
-    // Platform::new_context asks, so the Start at its top is mapped, and
-    // nothing else reads or writes it. The stack's end is page-aligned, so
-    // top is aligned for a Start.
+    // SAFETY: Only map_stack makes a Stack, mapped writable, and this
+    // consumed it, so the Start at its top is mapped, and nothing else
+    // reads or writes it. map_stack's stacks are whole pages, so top is
+    // aligned for a Start.
     unsafe {
         top.write(start);
     }
@@ -120,6 +112,12 @@ pub fn new(stack: Range<u64>, entry: fn(Context) -> !) -> Context {
         rsp: VirtAddr::from_ptr(top).as_u64(),
         stack,
     }
+}
+
+/// The stack `context` held, unless it is the boot thread's; see
+/// `Platform::into_stack`.
+pub fn into_stack(context: Context) -> Option<Stack> {
+    Stack::of_suspended(context.stack)
 }
 
 /// Suspends the running thread and resumes `to`; see `Platform::switch`.

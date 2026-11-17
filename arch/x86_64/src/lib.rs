@@ -36,8 +36,8 @@ use bootloader_api::info::{FrameBuffer, PixelFormat};
 use once::Once;
 use thisos_frames::Frame;
 use thisos_hal::{
-    BacktraceEnd, BootInfo, Cpu, Framebuffer, HeapStats, Platform, Probe, Serial, TimerFrequencies,
-    TimerFrequency, Translation, TrapHandler, UserProgram,
+    BacktraceEnd, BootInfo, Cpu, Framebuffer, HeapStats, Platform, Probe, Serial, Stack,
+    TimerFrequencies, TimerFrequency, Translation, TrapHandler, UserProgram,
 };
 use uart_16550::backend::PioBackend;
 use uart_16550::{BaudRate, Config, Uart16550Tty};
@@ -138,7 +138,7 @@ impl Platform for X86_64 {
         paging::activate_kernel();
     }
 
-    fn move_trap_stacks(stack: &mut dyn FnMut(usize) -> u64) {
+    fn move_trap_stacks(stack: &mut dyn FnMut(usize) -> Stack<Self>) {
         trap::move_stacks(stack);
     }
 
@@ -146,8 +146,12 @@ impl Platform for X86_64 {
         trap::stacks()
     }
 
-    fn new_context(stack: Range<u64>, entry: fn(Context) -> !) -> Context {
+    fn new_context(stack: Stack<Self>, entry: fn(Context) -> !) -> Context {
         context::new(stack, entry)
+    }
+
+    fn into_stack(context: Context) -> Option<Stack<Self>> {
+        context::into_stack(context)
     }
 
     fn switch(to: Context) -> Context {

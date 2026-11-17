@@ -38,8 +38,8 @@ pub fn link_address(address: u64) -> u64 {
 }
 
 /// The lowest address of the running thread's stack. The loader, and
-/// the kernel's `map_stack` for the other threads, leave the page below it
-/// unmapped, as a guard page.
+/// `map_stack` for the other threads, leave the page below it unmapped, as
+/// a guard page.
 pub fn stack_bottom() -> u64 {
     STACK_START.load(Ordering::Relaxed)
 }

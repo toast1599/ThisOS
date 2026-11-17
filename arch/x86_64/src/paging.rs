@@ -448,14 +448,45 @@ unsafe fn load(level_4: u64) {
 #[derive(Debug)]
 pub struct KernelPageTables {
     tables: PageTables,
-    /// The level 4 entry the heap and `map` map into.
+    /// The level 4 entry the heap, the stacks and `map` map into.
     space: PageTableIndex,
     heap: Heap,
+    /// The lowest address in the stacks' window that no stack has taken,
+    /// which `map_stack` moves up.
+    stacks: u64,
 }
 
-/// [`thisos_hal::PageTables::kernel_space`], which `take` records for
-/// checks that have no `KernelPageTables` to ask.
-pub static KERNEL_SPACE: Once<Range<u64>> = Once::new();
+/// The stacks' window, which `take` records for `Stack::of_suspended`.
+static STACKS: Once<Range<u64>> = Once::new();
+
+/// A kernel stack: whole pages of the stacks' window, mapped writable for
+/// one thread, with an unmapped page below. Only `map_stack` makes one, and
+/// `Stack::of_suspended` makes it again from the context that took it.
+#[derive(Debug)]
+pub struct Stack {
+    range: Range<u64>,
+}
+
+impl Stack {
+    pub(crate) fn range(&self) -> Range<u64> {
+        self.range.clone()
+    }
+
+    pub(crate) fn into_range(self) -> Range<u64> {
+        self.range
+    }
+
+    /// The stack a suspended thread's context holds, `range`, or `None`
+    /// if it is outside the stacks' window: the boot thread's, which the
+    /// loader mapped. Only a context, which holds what it was made with,
+    /// may call this, and only as it is consumed.
+    pub(crate) fn of_suspended(range: Range<u64>) -> Option<Stack> {
+        let Some(window) = STACKS.get() else {
+            panic!("a context before the kernel's page tables");
+        };
+        (window.start <= range.start && range.end <= window.end).then_some(Stack { range })
+    }
+}
 
 /// The kernel's level 4 table, which `take` records for `activate_kernel`.
 static KERNEL_LEVEL_4: Once<u64> = Once::new();
@@ -542,15 +573,17 @@ pub unsafe fn take(
         });
     }
     let heap_base = space_start(space);
-    KERNEL_SPACE.init(kernel_space(space));
+    let stacks = STACKS.init(stack_window(space)).start;
     KERNEL_LEVEL_4.init(level_4);
     Some(KernelPageTables {
         tables,
         space,
         // SAFETY: The loader mapped nothing in the space entry, TAKEN makes
         // this the only Heap, and only grow_heap maps in its range, since
-        // map stays inside kernel_space, which starts above it.
+        // map_stack and map stay inside the stacks' window and
+        // kernel_space, which start above it.
         heap: unsafe { Heap::new(heap_base) },
+        stacks,
     })
 }
 
@@ -560,14 +593,26 @@ fn space_start(index: PageTableIndex) -> VirtAddr {
     Page::<Size4KiB>::from_page_table_indices(index, zero, zero, zero).start_address()
 }
 
-/// Where `map` maps in level 4 entry `space`: all of it above the heap.
+/// The stacks' share of the reserved level 4 entry, right after the heap.
+/// A 64 KiB stack takes 128 KiB of it, for its alignment, and stack
+/// addresses are never reused, so it holds about 3.1 million.
+const STACKS_SIZE: u64 = 384 << 30;
+
+/// Where `map_stack` maps in level 4 entry `space`: right above the heap.
+fn stack_window(space: PageTableIndex) -> Range<u64> {
+    let start = space_start(space).as_u64() + heap::SIZE;
+    start..start + STACKS_SIZE
+}
+
+/// Where `map` maps in level 4 entry `space`: all of it above the stacks.
 fn kernel_space(space: PageTableIndex) -> Range<u64> {
     let start = space_start(space).as_u64();
-    start + heap::SIZE..start + (1 << 39)
+    start + heap::SIZE + STACKS_SIZE..start + (1 << 39)
 }
 
 impl thisos_hal::PageTables for KernelPageTables {
     type AddressSpace<O: Deref<Target = [Frame]> + Send + Sync> = UserSpace<O>;
+    type Stack = Stack;
 
     fn kernel_space(&self) -> Range<u64> {
         kernel_space(self.space)
@@ -609,6 +654,59 @@ impl thisos_hal::PageTables for KernelPageTables {
         unsafe {
             self.tables
                 .unmap_page(Page::containing_address(VirtAddr::new(page)), true)
+        }
+    }
+
+    fn map_stack(&mut self, size: usize, alloc: &mut dyn FnMut() -> Option<Frame>) -> Stack {
+        let Ok(size) = u64::try_from(size.next_multiple_of(4096)) else {
+            panic!("a stack of {size:#x} bytes doesn't fit a u64");
+        };
+        let align = (2 * size).next_power_of_two();
+        let window = stack_window(self.space);
+        // The page below start stays unmapped: it is at or above the
+        // cursor, where nothing is mapped yet.
+        let start = (self.stacks + 4096).next_multiple_of(align);
+        let range = start..start + size;
+        assert!(
+            range.end <= window.end,
+            "the stacks' {} GiB are used up",
+            STACKS_SIZE >> 30
+        );
+        for page in range.clone().step_by(4096) {
+            let Some(frame) = alloc() else {
+                panic!("no free frame for a stack");
+            };
+            if let Err(e) = self.tables.map_page(
+                Page::containing_address(VirtAddr::new(page)),
+                frame,
+                GLOBAL | NO_EXECUTE | WRITABLE,
+                WRITABLE,
+                true,
+                alloc,
+            ) {
+                panic!("mapping a stack page at {page:#x} failed: {:?}", e.kind);
+            }
+        }
+        self.stacks = range.end;
+        Stack { range }
+    }
+
+    fn unmap_stack(&mut self, stack: Stack, free: &mut dyn FnMut(Frame)) {
+        for page in stack.range.step_by(4096) {
+            // SAFETY: Only map_stack maps in the stacks' window, through
+            // map_page, and never at an address it mapped before, so code
+            // still using the page faults. The Stack was the page's one
+            // holder, and the context that ran on it is gone. Every space
+            // shares the upper half, so the TLB may hold the page whichever
+            // is active.
+            let frame = unsafe {
+                self.tables
+                    .unmap_page(Page::containing_address(VirtAddr::new(page)), true)
+            };
+            let Some(frame) = frame else {
+                panic!("stack page {page:#x} wasn't mapped");
+            };
+            free(frame);
         }
     }
 
@@ -1076,6 +1174,7 @@ mod tests {
             // SAFETY: Nothing is mapped in the space entry, and the test
             // never grows the heap.
             heap: unsafe { Heap::new(space_start(space)) },
+            stacks: stack_window(space).start,
         }
     }
 
@@ -1284,6 +1383,72 @@ mod tests {
         assert!(kernel.unmap(start).is_none());
         assert_eq!(space.translate(start + 0x10), None);
         memory.frames.free(frame);
+    }
+
+    #[test]
+    fn stacks_are_guarded_aligned_and_apart_from_kernel_space() {
+        let mut memory = Memory::new();
+        let mut kernel = kernel(&mut memory);
+        let window = stack_window(kernel.space);
+        let free = memory.frames.free_frames();
+        let mut taken = 0_usize;
+        let mut alloc = || {
+            taken += 1;
+            memory.frames.alloc()
+        };
+        // Sizes and alignments. The last stack's alignment puts its start
+        // right where the one before ends, but for the guard page.
+        let sizes = [
+            (20 * 1024, 64 * 1024),
+            (64 * 1024, 128 * 1024),
+            (4096, 8192),
+        ];
+        let stacks: Vec<Stack> = sizes
+            .iter()
+            .map(|&(size, _)| kernel.map_stack(size, &mut alloc))
+            .collect();
+        let ranges: Vec<Range<u64>> = stacks.iter().map(Stack::range).collect();
+        for (range, &(size, align)) in ranges.iter().zip(&sizes) {
+            assert_eq!(usize::try_from(range.end - range.start), Ok(size));
+            assert_eq!(range.start % align, 0, "{range:#x?}");
+            assert!(window.start <= range.start && range.end <= window.end);
+            assert_eq!(kernel.translate(range.start - 4096), None, "guard page");
+            for page in range.clone().step_by(4096) {
+                let Some(t) = kernel.translate(page) else {
+                    panic!("stack page {page:#x} isn't mapped");
+                };
+                assert!(t.writable && !t.executable && !t.user, "{page:#x}: {t:?}");
+            }
+        }
+
+        // map and unmap stay out of the window, guard pages included.
+        assert!(!kernel.kernel_space().contains(&(window.end - 1)));
+        for page in [ranges[0].start - 4096, ranges[1].start] {
+            let frame = memory.frame();
+            let Err(error) = kernel.map(page, frame, true, &mut || memory.frames.alloc()) else {
+                panic!("mapped {page:#x}");
+            };
+            assert_eq!(error.kind, MapErrorKind::OutsideKernelSpace);
+            memory.frames.free(error.given);
+            assert!(kernel.unmap(page).is_none(), "unmapped {page:#x}");
+        }
+
+        cpu::flushed();
+        let tables = taken - (5 + 16 + 1);
+        for stack in stacks {
+            kernel.unmap_stack(stack, &mut |frame| memory.frames.free(frame));
+        }
+        assert_eq!(memory.frames.free_frames(), free - tables);
+        let unmapped: Vec<u64> = ranges
+            .iter()
+            .flat_map(|range| range.clone().step_by(4096))
+            .collect();
+        assert_eq!(cpu::flushed(), unmapped);
+        assert!(
+            unmapped
+                .iter()
+                .all(|&page| kernel.translate(page).is_none())
+        );
     }
 
     #[test]

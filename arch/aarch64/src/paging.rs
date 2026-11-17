@@ -19,7 +19,7 @@ use thisos_hal::{MapError, MapErrorKind, Protection, Translation};
 use thisos_regions::{InsertError, Regions};
 
 use crate::heap::{self, Heap};
-use crate::ptr_at;
+use crate::{ptr_at, to_u64};
 
 // Descriptor bits, for the 4 KiB granule.
 const VALID: u64 = 1 << 0;
@@ -465,9 +465,36 @@ fn ttbr0_walks() -> bool {
 #[derive(Debug)]
 pub struct KernelPageTables {
     tables: PageTables,
-    /// The level 0 entry the heap and `map` map into.
+    /// The level 0 entry the heap, the stacks and `map` map into.
     space: u64,
     heap: Heap,
+    /// The lowest address in the stacks' window that no stack has taken,
+    /// which `map_stack` moves up.
+    stacks: u64,
+}
+
+/// A kernel stack: whole pages of the stacks' window, mapped writable for
+/// one owner, with an unmapped page below. Only `map_stack` makes one.
+#[derive(Debug)]
+pub struct Stack {
+    range: Range<u64>,
+}
+
+impl Stack {
+    pub(crate) fn range(&self) -> Range<u64> {
+        self.range.clone()
+    }
+}
+
+/// The stacks' share of the reserved level 0 entry, right after the heap.
+/// A 64 KiB stack takes 128 KiB of it, for its alignment, and stack
+/// addresses are never reused, so it holds about 3.1 million.
+const STACKS_SIZE: u64 = 384 << 30;
+
+/// Where `map_stack` maps in level 0 entry `space`: right above the heap.
+fn stack_window(space: u64) -> Range<u64> {
+    let start = space_start(space) + heap::SIZE;
+    start..start + STACKS_SIZE
 }
 
 /// Whether `range` and the `size` bytes from `va` share an address.
@@ -627,8 +654,10 @@ pub unsafe fn take(
         space,
         // SAFETY: Limine mapped nothing in the space entry, TAKEN makes
         // this the only Heap, and only grow_heap maps in its range, since
-        // map stays inside kernel_space, which starts above it.
+        // map_stack and map stay inside the stacks' window and
+        // kernel_space, which start above it.
         heap: unsafe { Heap::new(space_start(space)) },
+        stacks: stack_window(space).start,
     })
 }
 
@@ -730,10 +759,11 @@ fn space_start(index: u64) -> u64 {
 
 impl thisos_hal::PageTables for KernelPageTables {
     type AddressSpace<O: Deref<Target = [Frame]> + Send + Sync> = UserSpace<O>;
+    type Stack = Stack;
 
     fn kernel_space(&self) -> Range<u64> {
         let start = space_start(self.space);
-        start + heap::SIZE..start + entry_size(0)
+        start + heap::SIZE + STACKS_SIZE..start + entry_size(0)
     }
 
     fn map(
@@ -764,6 +794,46 @@ impl thisos_hal::PageTables for KernelPageTables {
         // the page faults. The page is global, which flush_kernel_page
         // drops whatever the ASID.
         unsafe { self.tables.unmap_page(page, flush_kernel_page) }
+    }
+
+    fn map_stack(&mut self, size: usize, alloc: &mut dyn FnMut() -> Option<Frame>) -> Stack {
+        let size = to_u64(size.next_multiple_of(4096));
+        let align = (2 * size).next_power_of_two();
+        let window = stack_window(self.space);
+        // The page below start stays unmapped: it is at or above the
+        // cursor, where nothing is mapped yet.
+        let start = (self.stacks + 4096).next_multiple_of(align);
+        let range = start..start + size;
+        assert!(
+            range.end <= window.end,
+            "the stacks' {} GiB are used up",
+            STACKS_SIZE >> 30
+        );
+        for page in range.clone().step_by(4096) {
+            let Some(frame) = alloc() else {
+                panic!("no free frame for a stack");
+            };
+            if let Err(e) = self.tables.map_page(page, frame, LEAF | PXN | UXN, alloc) {
+                panic!("mapping a stack page at {page:#x} failed: {:?}", e.kind);
+            }
+        }
+        self.stacks = range.end;
+        Stack { range }
+    }
+
+    fn unmap_stack(&mut self, stack: Stack, free: &mut dyn FnMut(Frame)) {
+        for page in stack.range.step_by(4096) {
+            // SAFETY: Only map_stack maps in the stacks' window, through
+            // map_page, and never at an address it mapped before, so code
+            // still using the page faults. The Stack was the page's one
+            // holder. The page is global, which flush_kernel_page drops
+            // whatever the ASID.
+            let frame = unsafe { self.tables.unmap_page(page, flush_kernel_page) };
+            let Some(frame) = frame else {
+                panic!("stack page {page:#x} wasn't mapped");
+            };
+            free(frame);
+        }
     }
 
     fn grow_heap(

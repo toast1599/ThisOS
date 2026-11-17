@@ -21,6 +21,6 @@ impl fmt::Write for NoSerial {
 
 impl thisos_hal::Serial for NoSerial {}
 
-/// No kernel threads yet: `Platform::new_context` panics.
+/// No kernel threads yet: `Platform::new_context` and `into_stack` panic.
 #[derive(Debug)]
 pub struct NoContext(());

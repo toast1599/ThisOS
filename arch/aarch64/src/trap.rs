@@ -14,7 +14,7 @@ use thisos_hal::{Access, BacktraceEnd, Cpu, Trap, TrapHandler};
 use crate::boot::STACK_SIZE;
 use crate::gic::{self, Acknowledged, Group};
 use crate::once::Once;
-use crate::{Aarch64, backtrace, catch, not_ported, timer, to_u64};
+use crate::{Aarch64, backtrace, catch, not_ported, paging, timer, to_u64};
 
 // The vector table: 16 entries of 0x80 bytes, for a synchronous exception,
 // an IRQ, an FIQ and an SError, taken from EL1 on SP_EL0, from EL1 on
@@ -463,11 +463,17 @@ pub unsafe fn init(handler: TrapHandler<Aarch64>) {
     }
 }
 
-/// Moves the overflow stack to one `stack` maps: `stack(size)` returns the
-/// address just past a stack of `size` bytes with an unmapped page below
-/// it, aligned as every stack EL1 runs on.
-pub fn move_stack(stack: &mut dyn FnMut(usize) -> u64) {
-    let top = stack(STACK_SIZE);
+/// The overflow stack `move_stack` put in place, which it keeps for good.
+static MOVED_STACK: Once<paging::Stack> = Once::new();
+
+/// Moves the overflow stack to one from `stack`, which it calls with the
+/// stack's size; see `Platform::move_trap_stacks`.
+pub fn move_stack(stack: &mut dyn FnMut(usize) -> paging::Stack) {
+    assert!(
+        MOVED_STACK.get().is_none(),
+        "the overflow stack moved already"
+    );
+    let top = MOVED_STACK.init(stack(STACK_SIZE)).range().end;
     let size = to_u64(STACK_SIZE);
     assert_eq!(
         (top - size) % (2 * size),

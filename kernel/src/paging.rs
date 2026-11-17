@@ -22,13 +22,13 @@ pub type AddressSpace = <PageTables as thisos_hal::PageTables>::AddressSpace<Map
 
 static PAGE_TABLES: Mutex<Option<Kernel>> = Mutex::new(None);
 
-/// The kernel's page tables, and what of kernel space is taken.
+/// The kernel's page tables.
 struct Kernel {
     tables: PageTables,
-    /// The lowest kernel-space address no stack has taken, which
-    /// [`map_stack`] moves up.
-    stacks: u64,
 }
+
+/// A kernel thread's or a trap's stack.
+pub type Stack = thisos_hal::Stack<Arch>;
 
 /// Switches to page tables of the kernel's own. `kernel::init` calls this
 /// once, after `frames::init`.
@@ -42,10 +42,7 @@ pub fn init() {
         space.start,
         space.end
     );
-    *PAGE_TABLES.lock() = Some(Kernel {
-        tables,
-        stacks: space.start,
-    });
+    *PAGE_TABLES.lock() = Some(Kernel { tables });
 }
 
 fn with<T>(f: impl FnOnce(&mut Kernel) -> T) -> T {
@@ -83,6 +80,13 @@ pub fn map(page: u64, frame: Frame, writable: bool) -> Result<(), MapError> {
 
 /// Unmaps the page at `page` in kernel space, and returns its frame, or
 /// `None` if nothing was mapped there. Its address is never mapped again.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "nothing outside the tests maps into kernel space yet"
+    )
+)]
 pub fn unmap(page: u64) -> Option<Frame> {
     with(|kernel| kernel.tables.unmap(page))
 }
@@ -105,42 +109,30 @@ pub fn activate() {
     with(|kernel| kernel.tables.activate());
 }
 
-/// Maps a stack of `size` bytes, rounded up to whole pages, in kernel space
-/// for good, writable and no-execute, with an unmapped page below it that
-/// an overflow runs into. Its start is aligned to the power of two at or
-/// above twice its size, so that an architecture can tell an overflow by
-/// one bit of the stack pointer. Returns its addresses. Panics if kernel
-/// space or the frames run out.
-pub fn map_stack(size: usize) -> Range<u64> {
-    let Ok(size) = u64::try_from(size.next_multiple_of(4096)) else {
-        panic!("a stack of {size:#x} bytes doesn't fit a u64");
-    };
-    let align = (2 * size).next_power_of_two();
-    with(|kernel| {
-        let start = (kernel.stacks + 4096).next_multiple_of(align);
-        let stack = start..start + size;
-        for page in stack.clone().step_by(4096) {
-            let Some(frame) = frames::alloc() else {
-                panic!("no free frame for a stack");
-            };
-            if let Err(e) = kernel.tables.map(page, frame, true, &mut alloc_stack_table) {
-                panic!("mapping a stack page at {page:#x} failed: {:?}", e.kind);
-            }
-        }
-        kernel.stacks = stack.end;
-        stack
-    })
+/// Maps a stack of `size` bytes, rounded up to whole pages, writable and
+/// no-execute, with an unmapped page below it that an overflow runs into,
+/// as `PageTables::map_stack` does. Panics if the stacks' addresses or the
+/// frames run out.
+pub fn map_stack(size: usize) -> Stack {
+    let stack = with(|kernel| {
+        kernel.tables.map_stack(size, &mut || {
+            let frame = frames::alloc();
+            #[cfg(test)]
+            STACK_TABLE_FRAMES.fetch_add(usize::from(frame.is_some()), Ordering::Relaxed);
+            frame
+        })
+    });
+    // Every frame but the stack's own pages went to a table, which stays
+    // when the stack goes.
+    #[cfg(test)]
+    STACK_TABLE_FRAMES.fetch_sub(size.div_ceil(4096), Ordering::Relaxed);
+    stack
 }
 
-/// A frame for a table that a stack's pages need, which stays when the
-/// stack goes.
-fn alloc_stack_table() -> Option<Frame> {
-    let frame = frames::alloc();
-    #[cfg(test)]
-    if frame.is_some() {
-        STACK_TABLE_FRAMES.fetch_add(1, Ordering::Relaxed);
-    }
-    frame
+/// Unmaps `stack` and frees its frames. Its addresses are never mapped
+/// again.
+pub fn unmap_stack(stack: Stack) {
+    with(|kernel| kernel.tables.unmap_stack(stack, &mut frames::free));
 }
 
 #[cfg(test)]
