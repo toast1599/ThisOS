@@ -15,7 +15,7 @@ use x86_64::instructions::segmentation::{CS, SS, Segment};
 use x86_64::instructions::tables::load_tss;
 use x86_64::registers::control::{Cr0, Cr0Flags, Cr2, Cr4, Cr4Flags};
 use x86_64::registers::model_specific::{Efer, EferFlags, LStar, SFMask, Star};
-use x86_64::registers::rflags::RFlags;
+use x86_64::registers::rflags::{self, RFlags};
 use x86_64::structures::gdt::{Descriptor, GlobalDescriptorTable, SegmentSelector};
 use x86_64::structures::idt::{Entry, EntryOptions, InterruptDescriptorTable};
 use x86_64::structures::tss::TaskStateSegment;
@@ -327,6 +327,26 @@ const DOUBLE_FAULT: u64 = 8;
 const MACHINE_CHECK: u64 = 18;
 
 extern "C" fn trap_entry(frame: &mut TrapFrame) {
+    // User code can set DF, AC, NT and TF, and SFMASK must clear them: with
+    // DF set the kernel's copies run backwards, with AC set SMAP is open.
+    // The list repeats the mask's rather than sharing it, so a bit dropped
+    // from the mask isn't dropped from the check.
+    if frame.vector == SYSCALL_VECTOR {
+        let leaked = rflags::read()
+            & (RFlags::INTERRUPT_FLAG
+                | RFlags::DIRECTION_FLAG
+                | RFlags::TRAP_FLAG
+                | RFlags::ALIGNMENT_CHECK
+                | RFlags::NESTED_TASK);
+        if !leaked.is_empty() {
+            // The panic handler's copies would run backwards with DF set,
+            // and the report would never reach the screen.
+            // SAFETY: cld only clears DF, which the Rust ABI expects clear,
+            // and touches no memory or stack.
+            unsafe { asm!("cld", options(nomem, nostack)) };
+            panic!("a syscall entered with {leaked:?} set");
+        }
+    }
     let trap = match frame.vector {
         SYSCALL_VECTOR => Trap::Syscall,
         3 => Trap::Breakpoint,

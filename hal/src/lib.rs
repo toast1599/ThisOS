@@ -196,10 +196,13 @@ pub enum Probe {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UserProgram {
     /// Puts a value of its own in every general register a syscall keeps,
-    /// makes a syscall with the number `u64::MAX`, which no syscall has,
-    /// then checks those registers. It exits with the error code the
-    /// syscall returned if they all kept their values and the syscall's
-    /// value is 0, and with `u64::MAX` otherwise.
+    /// and on x86_64 sets the direction, alignment-check and nested-task
+    /// flags, which the kernel must not run with, makes a syscall with the
+    /// number `u64::MAX`, which no syscall has, then checks those registers
+    /// and flags. It exits with the error code the syscall returned if they
+    /// all kept their values and the syscall's value is 0, and with
+    /// `u64::MAX` otherwise. It leaves the trap flag clear, since set it
+    /// would single-step the program itself.
     Syscalls,
     /// Reads the byte at its argument, then exits with status 0.
     Read,

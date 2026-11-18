@@ -7,6 +7,7 @@ use thisos_abi::{Error, Rights, Signals, Syscall};
 use thisos_frames::Frame;
 use thisos_hal::UserProgram;
 use x86_64::VirtAddr;
+use x86_64::registers::rflags::RFlags;
 
 use crate::paging::USER_SPACE;
 use crate::trap::{USER_CODE, USER_DATA};
@@ -77,7 +78,14 @@ global_asm!(
     ".hidden thisos_user_programs",
     "thisos_user_programs:",
     // Syscalls. Every value is negative, so its upper half is all ones,
-    // and a register zeroed or truncated on the way shows.
+    // and a register zeroed or truncated on the way shows. DF, AC and NT
+    // go in with the registers, for trap_entry's check that SFMASK keeps
+    // them out of the kernel, and come back through SYSRET. TF stays clear:
+    // set, it would single-step this program, and the kernel kills a
+    // program that takes #DB.
+    "pushfq",
+    "or qword ptr [rsp], {user_flags}",
+    "popfq",
     "mov rbx, -0x01010101",
     "mov rbp, -0x02020202",
     "mov rsi, -0x03030303",
@@ -93,6 +101,11 @@ global_asm!(
     "syscall",
     "test rdx, rdx",
     "jnz 2f",
+    "pushfq",
+    "pop rcx",
+    "and rcx, {user_flags}",
+    "cmp rcx, {user_flags}",
+    "jne 2f",
     "cmp rbx, -0x01010101",
     "jne 2f",
     "cmp rbp, -0x02020202",
@@ -120,6 +133,9 @@ global_asm!(
     "2:",
     "mov rdi, -1",
     "3:",
+    "pushfq",
+    "and qword ptr [rsp], {not_user_flags}",
+    "popfq",
     "mov eax, {exit}",
     "syscall",
     "ud2",
@@ -572,6 +588,8 @@ global_asm!(
     ".org thisos_user_programs + 12 * {slot}, 0xcc",
     ".popsection",
     exit = const Syscall::Exit.number(),
+    user_flags = const USER_FLAGS.bits(),
+    not_user_flags = const (!USER_FLAGS.bits()).cast_signed(),
     write = const Syscall::Write.number(),
     close = const Syscall::Close.number(),
     duplicate = const Syscall::Duplicate.number(),
@@ -614,6 +632,11 @@ global_asm!(
     last_syscall = const LAST_SYSCALL,
     cycles = const 1 << 28,
 );
+
+/// The flags `UserProgram::Syscalls` sets before its syscall.
+const USER_FLAGS: RFlags = RFlags::DIRECTION_FLAG
+    .union(RFlags::ALIGNMENT_CHECK)
+    .union(RFlags::NESTED_TASK);
 
 unsafe extern "C" {
     static thisos_user_programs: [u8; 12 * SLOT];
