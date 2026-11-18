@@ -54,6 +54,7 @@ pub fn flash(release: bool, kernel: Kernel, device: Option<&str>) -> Result<()> 
     // From here on every command names the disk by its by-id link, so a
     // stick swapped while the question below waits makes them fail.
     let (disk, dev) = pick(&disks, device)?;
+    check_link(dev, &disk.path)?;
     ensure!(
         data.len() as u64 <= disk.size,
         "the image is {} bytes, larger than {disk}",
@@ -84,6 +85,9 @@ pub fn flash(release: bool, kernel: Kernel, device: Option<&str>) -> Result<()> 
     unmount(dev)?;
     // Ask for the password now, not in the middle of dd's progress output.
     exec(Command::new("sudo").arg("-v"))?;
+    // A stick swapped during the question or the password prompt for one
+    // with the same model and serial keeps the link but may not keep the path.
+    check_link(dev, &disk.path)?;
     // nocreat, because a stick pulled during the password prompt takes its
     // link with it, and dd would otherwise write the image to a new file there.
     exec(Command::new("sudo").args([
@@ -158,6 +162,18 @@ fn pick<'a>(disks: &'a [Disk], device: Option<&str>) -> Result<(&'a Disk, &'a st
         )
     })?;
     Ok((disk, dev))
+}
+
+/// Fails unless `link` resolves to `path`. Disks with the same model and
+/// serial share one by-id link name, which udev points at only one of them.
+fn check_link(link: &str, path: &str) -> Result<()> {
+    let target = fs::canonicalize(link).with_context(|| format!("resolving {link}"))?;
+    ensure!(
+        target == Path::new(path),
+        "{link} points to {}, not to the chosen {path}; another disk may have the same model and serial",
+        target.display()
+    );
+    Ok(())
 }
 
 /// Reads the build ID from the first FAT partition on `device`, mounting it
@@ -293,5 +309,30 @@ mod tests {
         );
         assert!(pick(&[], None).is_err());
         assert!(pick(&disks, Some("/dev/sde")).is_err(), "no by-id link");
+    }
+
+    #[test]
+    fn checks_where_the_link_points() {
+        let dir = std::env::temp_dir().join(format!("xtask-check-link-{}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let dir = fs::canonicalize(&dir).unwrap();
+        let path = |name: &str| dir.join(name).to_str().unwrap().to_owned();
+        fs::write(path("sdb"), "").unwrap();
+        fs::write(path("sdc"), "").unwrap();
+        // Relative, as udev's ../../sdb is.
+        std::os::unix::fs::symlink("sdb", path("link")).unwrap();
+
+        let right = check_link(&path("link"), &path("sdb"));
+        let wrong = check_link(&path("link"), &path("sdc"));
+        let missing = check_link(&path("gone"), &path("sdb"));
+        fs::remove_dir_all(&dir).unwrap();
+
+        right.unwrap();
+        let wrong = wrong.unwrap_err().to_string();
+        assert!(
+            wrong.contains(&path("sdb")) && wrong.contains(&path("sdc")),
+            "{wrong}"
+        );
+        assert!(missing.is_err());
     }
 }
