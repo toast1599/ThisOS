@@ -1,5 +1,6 @@
 //! The source check for the banned patterns in CONTRIBUTING.md that no
-//! lint catches: `static mut` and `&'static mut`.
+//! lint catches: `static mut`, `&'static mut`, and unchecked operations,
+//! which `disallowed-methods` catches only one listed path at a time.
 
 use std::fs;
 use std::io;
@@ -15,6 +16,11 @@ use crate::root;
 /// is in this file and the line holding its `'static` names the loader's
 /// `BootInfo`.
 const LOADER_ENTRY: (&str, &str) = ("arch/x86_64/src/lib.rs", "bootloader_api::BootInfo");
+
+/// The one unchecked operation allowed, and only in its file: the safe
+/// `Descriptor::tss_segment` needs a `&'static TaskStateSegment`, which
+/// `Tss::slot`'s atomic writes would alias.
+const TSS_DESCRIPTOR: (&str, &str) = ("arch/x86_64/src/trap.rs", "tss_segment_unchecked");
 
 /// Fails, naming each line, if any Rust source in the repository, tracked or
 /// not yet added, has a banned pattern.
@@ -54,6 +60,8 @@ fn source(path: &str) -> Result<Option<String>> {
 /// The banned patterns in `source`, one `path:line: pattern` each, naming
 /// the line of the pattern's first word. The words of a pattern may be on
 /// different lines, which rustfmt would join, but not under rustfmt::skip.
+/// An unchecked operation is any name with an `unchecked` part between
+/// underscores, which is how core, alloc and the crates here name them.
 fn scan(path: &str, source: &str) -> Vec<String> {
     let lines: Vec<&str> = source.lines().collect();
     let code = code(source);
@@ -67,13 +75,21 @@ fn scan(path: &str, source: &str) -> Vec<String> {
         );
     }
     let mut found = Vec::new();
-    for pair in words.windows(2) {
-        let (i, banned) = match pair {
-            [(i, "static"), (_, "mut")] => (i, "static mut"),
-            [(i, "'static"), (_, "mut")]
-                if !(path == LOADER_ENTRY.0 && lines[*i].contains(LOADER_ENTRY.1)) =>
+    for (j, &(i, word)) in words.iter().enumerate() {
+        let next = words.get(j + 1).map(|&(_, next)| next);
+        let banned = match (word, next) {
+            ("static", Some("mut")) => "static mut".to_owned(),
+            ("'static", Some("mut"))
+                if !(path == LOADER_ENTRY.0 && lines[i].contains(LOADER_ENTRY.1)) =>
             {
-                (i, "&'static mut")
+                "&'static mut".to_owned()
+            }
+            _ if word
+                .split('_')
+                .any(|part| part.eq_ignore_ascii_case("unchecked"))
+                && (path, word) != TSS_DESCRIPTOR =>
+            {
+                format!("unchecked operation {word}")
             }
             _ => continue,
         };
@@ -285,7 +301,51 @@ static mut H: u8 = 0;
     }
 
     #[test]
+    fn finds_skipped_checks_outside_comments_and_strings() {
+        let source = "let a = unsafe { s.get_unchecked(0) };\n\
+                      let b = unsafe { x.unchecked_add(1) };\n\
+                      // get_unchecked in a comment\n\
+                      let c = \"get_unchecked in a string\";\n\
+                      unsafe fn as_chunks_unchecked_mut() {}\n\
+                      const UNCHECKED_LIMIT: u8 = 0;\n\
+                      let d = unsafe { NonNull::new_unchecked(p) };\n";
+        assert_eq!(
+            scan("arch/x86_64/src/lib.rs", source),
+            [
+                "arch/x86_64/src/lib.rs:1: unchecked operation get_unchecked",
+                "arch/x86_64/src/lib.rs:2: unchecked operation unchecked_add",
+                "arch/x86_64/src/lib.rs:5: unchecked operation as_chunks_unchecked_mut",
+                "arch/x86_64/src/lib.rs:6: unchecked operation UNCHECKED_LIMIT",
+                "arch/x86_64/src/lib.rs:7: unchecked operation new_unchecked",
+            ]
+        );
+    }
+
+    #[test]
+    fn allows_the_tss_descriptor_only() {
+        let source = "gdt.append(unsafe { Descriptor::tss_segment_unchecked(t) });\n\
+                      let a = unsafe { s.get_unchecked(0) };\n";
+        assert_eq!(
+            scan("arch/x86_64/src/trap.rs", source),
+            ["arch/x86_64/src/trap.rs:2: unchecked operation get_unchecked"]
+        );
+        assert_eq!(
+            scan("arch/x86_64/src/lib.rs", source),
+            [
+                "arch/x86_64/src/lib.rs:1: unchecked operation tss_segment_unchecked",
+                "arch/x86_64/src/lib.rs:2: unchecked operation get_unchecked",
+            ]
+        );
+    }
+
+    #[test]
     fn ignores_names_that_only_contain_the_words() {
-        assert!(scan("a.rs", "let static_mutex = mut_static;\n").is_empty());
+        assert!(
+            scan(
+                "a.rs",
+                "let static_mutex = mut_static;\nlet checked = uncheckedness;\n"
+            )
+            .is_empty()
+        );
     }
 }

@@ -11,7 +11,7 @@ The rules for unsafe code in CONTRIBUTING.md say how unsafe code is written, not
 
 CONTRIBUTING.md's Banned patterns section lists constructs that no crate uses, each with what to use instead and how it is caught. They cover aliasing (`static mut`, `&'static mut`, references to memory the hardware or another mapping writes, unbounded lifetimes, leaking to get `'static`), values (`transmute`, uninitialized memory, integers turned into pointers, unchecked operations) and escape hatches (locks shared with handlers, `Send` and `Sync` impls that don't encode their invariant, `#[allow]`, unsafe attributes outside the arch crate).
 
-Lints catch what they can: `clippy::allow_attributes`, `clippy::mem_forget` and a `disallowed-methods` list in `clippy.toml`. `cargo xtask ci` runs a source check for `static mut` and `&'static mut`, which no lint catches. Review catches the rest.
+Lints catch what they can: `clippy::allow_attributes`, `clippy::mem_forget` and a `disallowed-methods` list in `clippy.toml`. `cargo xtask ci` runs a source check for `static mut` and `&'static mut`, which no lint catches, and for any name with an `unchecked` part, since `disallowed-methods` catches only the paths it lists and core and alloc have about 200 unchecked ones. Review catches the rest.
 
 The loader is the one exception, for the two references `bootloader_api` hands over. `entry_point!` fixes the entry signature as `fn(&'static mut BootInfo) -> !`, so that reference goes no further than the function `entry!` generates and `boot_info`, which copies out what the kernel needs, and it never leaves the arch crate. `FrameBuffer` keeps the framebuffer's address private, and every accessor returns a slice, so `framebuffer()` makes one `&mut [u8]` with `buffer_mut`, takes its pointer range, and never reads or writes through it. Replacing `entry_point!` with ThisOS's own `_start`, and reading the framebuffer's address from the loader's structure some other way, would remove both, at the cost of checking every `bootloader` upgrade against what that crate does.
 
@@ -21,5 +21,6 @@ Integers become pointers only in the arch crate, for addresses that reach it as 
 
 - The framebuffer is an arch type over a raw pointer, and the console draws through the HAL's `Pixels` trait, which its host tests implement over a `Vec`. The PAT setup walks the page tables itself, one atomic access per entry, instead of through `OffsetPageTable`.
 - Each kernel-lifetime value written after boot needs a type with interior mutability, and the unsafe code inside it is reviewed once.
-- The source check is a text match: it misses an inferred `&'static mut`, and review has to catch that.
+- The source check is a text match: it misses an inferred `&'static mut`, and an unchecked operation imported under another name, and review has to catch those.
+- The x86_64 crate's TSS descriptor is built with the `x86_64` crate's `Descriptor::tss_segment_unchecked`, because the safe `tss_segment` takes a `&'static TaskStateSegment` that the atomic writes of the IST stack tops would alias. The source check allows that name in `trap.rs` only.
 - Adding a pattern, or making an exception to one, updates CONTRIBUTING.md and this record.

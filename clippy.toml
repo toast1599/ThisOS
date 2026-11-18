@@ -9,6 +9,8 @@ disallowed-methods = [
     { path = "core::mem::forget", reason = "kernel-lifetime values go in statics; don't skip destructors" },
     { path = "core::mem::ManuallyDrop::new", reason = "kernel-lifetime values go in statics; don't skip destructors" },
     { path = "alloc::boxed::Box::leak", reason = "kernel-lifetime values go in statics, never a leaked &'static mut" },
+    { path = "alloc::vec::Vec::leak", reason = "kernel-lifetime values go in statics, never a leaked &'static mut" },
+    { path = "alloc::string::String::leak", reason = "kernel-lifetime values go in statics, never a leaked &'static mut" },
     { path = "core::ptr::with_exposed_provenance", reason = "keep provenance with addr/with_addr/map_addr" },
     { path = "core::ptr::with_exposed_provenance_mut", reason = "keep provenance with addr/with_addr/map_addr" },
     { path = "core::hint::unreachable_unchecked", reason = "use the checked operation" },
