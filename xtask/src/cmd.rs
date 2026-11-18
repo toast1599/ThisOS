@@ -51,7 +51,7 @@ pub fn output_bytes(cmd: &mut Command) -> Result<Vec<u8>> {
     Ok(out.stdout)
 }
 
-fn show(cmd: &Command) -> String {
+pub fn show(cmd: &Command) -> String {
     let mut words = vec![cmd.get_program().to_string_lossy().into_owned()];
     words.extend(cmd.get_args().map(|arg| arg.to_string_lossy().into_owned()));
     words.join(" ")
