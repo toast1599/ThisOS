@@ -211,9 +211,14 @@ dependencies = [
  "thisos-frames",
  "thisos-hal",
  "thisos-handles",
+ "thisos-logring",
  "thisos-regions",
  "thisos-ustar",
 ]
+
+[[package]]
+name = "thisos-logring"
+version = "0.0.0"
 
 [[package]]
 name = "thisos-regions"

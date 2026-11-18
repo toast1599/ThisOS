@@ -41,9 +41,11 @@ pub enum Syscall {
     /// at most [`MAX_WRITE`] bytes, in the kernel's log, one record per
     /// line. A newline at its end is dropped, and other control characters
     /// show as escapes such as `\u{1b}`. A zero-length write reads nothing,
-    /// checks no address and logs one empty line. Its value is the length.
-    /// It fails, writing nothing, with [`Error::TooLong`],
-    /// [`Error::BadAddress`] or [`Error::NotUtf8`].
+    /// checks no address and logs one empty line. It waits while the log
+    /// has no room for all its lines. Its value is the length. It fails,
+    /// writing nothing, with [`Error::TooLong`], [`Error::BadAddress`] or
+    /// [`Error::NotUtf8`], or with [`Error::NoMemory`] when the kernel has
+    /// no room to note that it waits.
     Write,
     /// Closes the handle in its first argument. Fails with
     /// [`Error::BadHandle`].

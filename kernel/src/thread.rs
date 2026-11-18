@@ -189,26 +189,12 @@ pub fn init() {
 
 /// Starts a thread that runs `run`, then exits. Panics if kernel space or
 /// the frames run out.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "only the tests run kernel threads besides boot and idle so far"
-    )
-)]
 pub fn spawn(run: impl FnOnce() + Send + 'static) {
     spawn_in(None, None, run);
 }
 
-/// Starts a kernel thread that runs `run` in `space` and `process`, for
-/// tests. Panics if kernel space or the frames run out.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "only the tests run kernel threads besides boot and idle so far"
-    )
-)]
+/// Starts a kernel thread that runs `run` in `space` and `process`, which
+/// only tests give. Panics if kernel space or the frames run out.
 fn spawn_in(
     space: Option<Arc<paging::Space>>,
     process: Option<Arc<Process>>,
@@ -614,7 +600,7 @@ fn counts() -> (usize, usize) {
 
 /// Whether the thread `id` names is parked.
 #[cfg(test)]
-fn is_blocked(id: u64) -> bool {
+pub fn is_blocked(id: u64) -> bool {
     with(|scheduler| {
         scheduler
             .blocked
@@ -623,14 +609,14 @@ fn is_blocked(id: u64) -> bool {
     })
 }
 
-/// Waits until the reaper has freed every thread but the boot thread and
-/// itself and parked again, so that the next test starts with those two
-/// alone. The reaper takes a thread off the dead ones before it frees it,
-/// so only its park says that it is done.
+/// Waits until the reaper has freed every thread but the boot thread, the
+/// logger's drainer and itself, and parked again, so that the next test
+/// starts with those three alone. The reaper takes a thread off the dead
+/// ones before it frees it, so only its park says that it is done.
 #[cfg(test)]
 pub fn wait_for_exits() {
     crate::testing::spin_until("the reaper to free every thread", || {
-        counts() == (2, 0) && is_blocked(with(|scheduler| scheduler.reaper))
+        counts() == (3, 0) && is_blocked(with(|scheduler| scheduler.reaper))
     });
 }
 

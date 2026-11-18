@@ -24,6 +24,7 @@ thisos-console.workspace = true
 thisos-elf.workspace = true
 thisos-frames.workspace = true
 thisos-handles.workspace = true
+thisos-logring.workspace = true
 thisos-regions.workspace = true
 thisos-hal.workspace = true
 thisos-ustar.workspace = true

@@ -21,7 +21,7 @@ use crate::memory::{Mapping, MemoryObject};
 use crate::paging::Space;
 use crate::process::{End, Object, PROCESS_RIGHTS, Process};
 use crate::wait::Waitable;
-use crate::{Arch, frames, paging, thread, wait};
+use crate::{Arch, frames, logger, paging, thread, wait};
 
 /// The size of a program's stack, which ends where user space does.
 const STACK_SIZE: u64 = 64 << 10;
@@ -674,7 +674,8 @@ fn wait(items: u64, count_arg: u64, timeout: u64) -> Result<u64, Error> {
 
 /// Logs the `len` bytes of text at `buf` in user space as the write
 /// syscall does, one record per line, and returns `len`. Copies the text
-/// into a buffer on the stack first.
+/// into a buffer on the stack first, and waits while the log has no room
+/// for all of it.
 fn write(buf: u64, len: u64) -> Result<u64, Error> {
     let mut bytes = [0; MAX_WRITE];
     let bytes = usize::try_from(len)
@@ -686,9 +687,7 @@ fn write(buf: u64, len: u64) -> Result<u64, Error> {
     }
     let text = str::from_utf8(bytes).map_err(|_| Error::NotUtf8)?;
     let text = text.strip_suffix('\n').unwrap_or(text);
-    for line in text.split('\n') {
-        log::info!(target: "user", "{}", Escaped(line));
-    }
+    logger::write_user(text.split('\n').map(Escaped))?;
     #[cfg(test)]
     Arch::without_interrupts(|| {
         use fmt::Write as _;
@@ -815,6 +814,7 @@ mod tests {
         setup: impl FnOnce(u64, &Arc<Process>) -> (Vec<u8>, u64),
     ) -> (End, u64) {
         let before = frames::free_frames();
+        let tables = paging::stack_table_frames();
         let Some(space) = paging::new_space() else {
             panic!("no free frame for a space");
         };
@@ -839,7 +839,6 @@ mod tests {
         // The process and its thread hold the space from here, so that it
         // goes with them.
         drop(space);
-        let tables = paging::stack_table_frames();
         process.start_with(code, stack + 4096, arg);
         (finish(&process, before, tables, code), code)
     }
@@ -988,8 +987,21 @@ mod tests {
     /// given where `text` is in the stack page, and returns its exit
     /// status and what it wrote.
     fn run_write(buf: impl FnOnce(u64) -> u64, len: usize, text: &[u8]) -> (End, String) {
+        run_write_after(|| {}, buf, len, text)
+    }
+
+    /// [`run_write`], calling `first` before the program starts but after
+    /// [`run_at`] counts the free frames, so that a thread `first` starts
+    /// counts among those it checks.
+    fn run_write_after(
+        first: impl FnOnce(),
+        buf: impl FnOnce(u64) -> u64,
+        len: usize,
+        text: &[u8],
+    ) -> (End, String) {
         take_written();
         let (end, _) = run_with_stack(UserProgram::Write, |stack, _| {
+            first();
             let at = stack + 16;
             let mut bytes = Vec::new();
             bytes.extend(buf(at).to_le_bytes());
@@ -1021,6 +1033,26 @@ mod tests {
         // A zero-length write reads nothing, so even a null pointer logs
         // its empty line.
         assert_eq!(run_write(|_| 0, 0, b""), (End::Exited(0), String::new()));
+    }
+
+    // The thread empties the ring only once the write waits, so the write
+    // can't have found room before.
+    #[test_case]
+    fn a_write_waits_for_room_in_the_log() {
+        logger::tests::pause();
+        logger::tests::fill();
+        let empty_when_waiting = || {
+            thread::spawn(|| {
+                spin_until("the write to wait", || logger::tests::waiting() == 1);
+                logger::tests::discard();
+                logger::tests::resume();
+            });
+        };
+        let text = b"written once the log had room\n";
+        let (end, written) = run_write_after(empty_when_waiting, |at| at, text.len(), text);
+        assert_eq!(end, End::Exited(0));
+        assert_eq!(written, "written once the log had room");
+        assert_eq!(logger::tests::waiting(), 0);
     }
 
     #[test_case]

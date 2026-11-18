@@ -57,6 +57,10 @@ pub trait Test: Sync {
     fn expected_panic(&self) -> Option<&'static str> {
         None
     }
+    /// What else must hold once that panic is reported.
+    fn after_panic(&self) -> Option<fn() -> bool> {
+        None
+    }
 }
 
 /// A `#[test_case]` const for a test that passes by panicking with a
@@ -69,6 +73,9 @@ pub struct ExpectPanic {
     pub run: fn(),
     /// Part of the panic message it expects.
     pub message: &'static str,
+    /// What else must hold once the panic is reported, for the test to
+    /// pass.
+    pub after: Option<fn() -> bool>,
 }
 
 impl Test for ExpectPanic {
@@ -82,6 +89,10 @@ impl Test for ExpectPanic {
 
     fn expected_panic(&self) -> Option<&'static str> {
         Some(self.message)
+    }
+
+    fn after_panic(&self) -> Option<fn() -> bool> {
+        self.after
     }
 }
 
@@ -141,18 +152,21 @@ pub fn fail() -> ! {
 }
 
 /// Ends the run after a panic's report: with success when the running test
-/// expects a panic whose message contains what it names, which also makes
-/// it the last, and with failure otherwise.
+/// expects a panic whose message contains what it names, and its `after`
+/// check holds if it has one, which also makes it the last, and with
+/// failure otherwise.
 pub fn panicked(message: &dyn fmt::Display) -> ! {
     let passed = RUN.try_lock().is_some_and(|mut run| {
         let Some(run) = run.as_mut() else {
             return false;
         };
-        let expected = run
-            .tests
-            .get(run.current)
-            .and_then(|test| test.expected_panic());
-        let passed = expected.is_some_and(|expected| contains(message, expected));
+        let Some(test) = run.tests.get(run.current) else {
+            return false;
+        };
+        let passed = test
+            .expected_panic()
+            .is_some_and(|expected| contains(message, expected))
+            && test.after_panic().is_none_or(|after| after());
         if passed {
             run.current = run.tests.len();
         }
@@ -412,6 +426,7 @@ mod tests {
                 name: "panics",
                 run: || {},
                 message: "",
+                after: None,
             },
         ];
         let run = |current| Run {

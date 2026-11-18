@@ -59,8 +59,8 @@ const BUILD: &str = match option_env!("THISOS_BUILD") {
 };
 
 /// Starts logging to the devices in `boot`, and logs the build ID first.
-/// Ends by starting the timer, with interrupts on. Every entry point calls
-/// this once, first.
+/// Ends by starting the timer, with interrupts on, then the logger's
+/// drainer. Every entry point calls this once, first.
 fn init(boot: BootInfo<Arch>) {
     let has_framebuffer = boot.framebuffer.is_some();
     logger::init(boot.serial, boot.framebuffer);
@@ -80,6 +80,7 @@ fn init(boot: BootInfo<Arch>) {
     user::init(boot.ramdisk);
     thread::init();
     timer::init();
+    logger::start();
 }
 
 /// The kernel binary's main function.
