@@ -31,10 +31,12 @@ pub fn test(arch: Arch) -> Result<()> {
         arch.target().to_uppercase().replace('-', "_")
     );
     let mut command = format!("{xtask} qemu-test --arch {}", arch.name());
-    // Inside the repository, as the xtask executable is, so the check above
-    // covers it too.
     if let Some(ramdisk) = arch.ramdisk(false)? {
         let ramdisk = ramdisk.to_str().context("the ramdisk path isn't UTF-8")?;
+        ensure!(
+            !ramdisk.contains(char::is_whitespace),
+            "cargo splits its runner on whitespace, and the ramdisk path {ramdisk:?} has some"
+        );
         command = format!("{command} --ramdisk {ramdisk}");
     }
     exec(

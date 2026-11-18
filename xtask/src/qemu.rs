@@ -11,7 +11,6 @@ use ovmf_prebuilt::{FileType, Prebuilt, Source};
 
 use crate::build::{self, Arch, Kernel};
 use crate::cmd::exec;
-use crate::root;
 
 const OVMF: Source = Source::EDK2_STABLE202605_R1;
 
@@ -28,7 +27,7 @@ const TEST_SUCCESS: i32 = 33;
 /// terminal.
 pub fn run(arch: Arch, release: bool, gdb: bool) -> Result<()> {
     let image = build::build(arch, release, Kernel::Main)?;
-    let vars = root().join(format!("target/ovmf-vars{}.fd", arch.suffix()));
+    let vars = build::target_dir()?.join(format!("ovmf-vars{}.fd", arch.suffix()));
     let mut qemu = qemu(arch, &image.path, &vars)?;
     if gdb {
         qemu.args(["-s", "-S"]);
@@ -90,7 +89,7 @@ fn qemu(arch: Arch, image: &Path, vars: &Path) -> Result<Command> {
         Arch::X86_64 => ovmf_prebuilt::Arch::X64,
         Arch::Aarch64 => ovmf_prebuilt::Arch::Aarch64,
     };
-    let ovmf = Prebuilt::fetch(OVMF, root().join("target/ovmf")).context("fetching OVMF")?;
+    let ovmf = Prebuilt::fetch(OVMF, build::target_dir()?.join("ovmf")).context("fetching OVMF")?;
     let code = ovmf.get_file(firmware, FileType::Code);
     fs::copy(ovmf.get_file(firmware, FileType::Vars), vars)
         .with_context(|| format!("copying OVMF vars to {}", vars.display()))?;

@@ -6,7 +6,7 @@ use std::process::{Command, Stdio};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::Value;
 
-use crate::cmd::{cargo, exec, output};
+use crate::cmd::{cargo, output};
 use crate::{limine, root};
 
 /// The file in the image's FAT partition that holds the build ID.
@@ -79,18 +79,10 @@ impl Arch {
         if release {
             cargo_build.arg("--release");
         }
-        exec(&mut cargo_build)?;
-        let profile = if release { "release" } else { "debug" };
-        Ok(Some(
-            root()
-                .join("target")
-                .join(self.target())
-                .join(profile)
-                .join("thisos-init"),
-        ))
+        executable(&mut cargo_build, "thisos-init", false).map(Some)
     }
 
-    /// What follows `thisos` in the names of its files in `target/`:
+    /// What follows `thisos` in the names of its files in [`target_dir`]:
     /// nothing for x86_64, which came first.
     pub fn suffix(self) -> &'static str {
         match self {
@@ -118,7 +110,6 @@ pub struct Image {
 
 /// Builds `kernel` and writes its UEFI disk image.
 pub fn build(arch: Arch, release: bool, kernel: Kernel) -> Result<Image> {
-    let profile = if release { "release" } else { "debug" };
     let pkgid = output(cargo().args(["pkgid", "-p", "thisos-kernel"]))?;
     let version = pkgid
         .trim()
@@ -141,19 +132,14 @@ pub fn build(arch: Arch, release: bool, kernel: Kernel) -> Result<Image> {
             if release {
                 cargo_build.arg("--release");
             }
-            exec(&mut cargo_build)?;
             (
-                root()
-                    .join("target")
-                    .join(arch.target())
-                    .join(profile)
-                    .join("thisos-kernel"),
-                root().join(format!("target/thisos{}.img", arch.suffix())),
+                executable(&mut cargo_build, "thisos-kernel", false)?,
+                target_dir()?.join(format!("thisos{}.img", arch.suffix())),
             )
         }
         Kernel::Tests => (
             test_elf(arch, release, &build)?,
-            root().join(format!("target/thisos{}-tests.img", arch.suffix())),
+            target_dir()?.join(format!("thisos{}-tests.img", arch.suffix())),
         ),
     };
 
@@ -179,26 +165,35 @@ pub fn build_env(release: bool, kernel: Kernel) -> Result<String> {
     Ok(format!("{} {profile}{kind} {}", commit.trim(), time.trim()))
 }
 
-/// Builds the kernel library's test binary and returns its path. Cargo
-/// names it only in its JSON messages.
+/// Builds the kernel library's test binary and returns its path.
 fn test_elf(arch: Arch, release: bool, build: &str) -> Result<PathBuf> {
     let mut cargo_test = cargo();
     cargo_test
         .env("THISOS_BUILD", build)
         .args(["test", "-p", "thisos-kernel", "--no-run", "--lib"])
-        .args(["--target", arch.target()])
-        .arg("--message-format=json-render-diagnostics")
-        .stderr(Stdio::inherit());
+        .args(["--target", arch.target()]);
     if release {
         cargo_test.arg("--release");
     }
-    let messages = output(&mut cargo_test)?;
+    executable(&mut cargo_test, "thisos_kernel", true)
+}
+
+/// Runs `cargo_build`, a cargo build or test command, and returns the path
+/// of the one executable it reports for the target named `name`, a test
+/// binary when `test` is true. Cargo names it only in its JSON messages, and
+/// where it puts it depends on `CARGO_TARGET_DIR` and cargo's config.
+fn executable(cargo_build: &mut Command, name: &str, test: bool) -> Result<PathBuf> {
+    cargo_build
+        .arg("--message-format=json-render-diagnostics")
+        .stderr(Stdio::inherit());
+    let messages = output(cargo_build)?;
     let mut elfs = Vec::new();
     for line in messages.lines() {
         let message: Value =
             serde_json::from_str(line).with_context(|| format!("cargo message {line:?}"))?;
         if message["reason"] == "compiler-artifact"
-            && message["profile"]["test"] == true
+            && message["target"]["name"] == name
+            && message["profile"]["test"] == test
             && let Some(elf) = message["executable"].as_str()
         {
             elfs.push(PathBuf::from(elf));
@@ -206,6 +201,17 @@ fn test_elf(arch: Arch, release: bool, build: &str) -> Result<PathBuf> {
     }
     match <[PathBuf; 1]>::try_from(elfs) {
         Ok([elf]) => Ok(elf),
-        Err(elfs) => bail!("expected one kernel test binary, cargo built {elfs:?}"),
+        Err(elfs) => bail!("expected one executable for {name}, cargo built {elfs:?}"),
     }
+}
+
+/// Cargo's target directory, `<root>/target` unless `CARGO_TARGET_DIR` or a
+/// cargo config moves it. xtask keeps its images and caches there too.
+pub fn target_dir() -> Result<PathBuf> {
+    let metadata = output(cargo().args(["metadata", "--format-version", "1", "--no-deps"]))?;
+    let metadata: Value = serde_json::from_str(&metadata).context("cargo metadata's output")?;
+    let dir = metadata["target_directory"]
+        .as_str()
+        .context("cargo metadata gave no target_directory")?;
+    Ok(PathBuf::from(dir))
 }

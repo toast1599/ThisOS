@@ -7,8 +7,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail, ensure};
 use sha2::{Digest, Sha256};
 
-use crate::build::BUILD_FILE;
-use crate::root;
+use crate::build::{self, BUILD_FILE};
 
 const VERSION: &str = "12.9.6";
 
@@ -51,9 +50,9 @@ pub fn write_image(elf: &Path, id: Option<&str>, path: &Path) -> Result<()> {
 }
 
 /// `BOOTAA64.EFI` from the pinned release, which the first call downloads
-/// into `target/limine/<version>/`.
+/// into `limine/<version>/` in cargo's target directory.
 fn loader() -> Result<PathBuf> {
-    let dir = root().join("target/limine").join(VERSION);
+    let dir = build::target_dir()?.join("limine").join(VERSION);
     let efi = dir.join("BOOTAA64.EFI");
     if efi.is_file() {
         return Ok(efi);
