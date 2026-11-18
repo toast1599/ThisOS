@@ -25,6 +25,12 @@ pub const MAX_WAIT_ITEMS: usize = 64;
 /// the handle, the wanted [`Signals`] and the observed ones.
 pub const WAIT_ITEM_SIZE: usize = 12;
 
+/// The end of the addresses user code may map, where a loader puts a new
+/// program's stack: below the last page of the lower half, since SYSRET
+/// can't return past it (ADR 0007).
+#[cfg(target_arch = "x86_64")]
+pub const USER_SPACE_END: u64 = 0x7fff_ffff_f000;
+
 /// A syscall, by its number in RAX.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Syscall {
@@ -131,6 +137,56 @@ pub enum Syscall {
     /// or with [`Error::TimedOut`] once the time has passed with no wanted
     /// signal.
     Wait,
+    /// Makes a process with an empty address space and no thread. Its
+    /// value is a handle to it with [`Rights::READ`], [`Rights::WRITE`],
+    /// [`Rights::DUPLICATE`] and [`Rights::TRANSFER`]. Fails with
+    /// [`Error::NoMemory`] or [`Error::NoHandles`].
+    ProcessCreate,
+    /// Maps a memory object into the space of the process of the handle in
+    /// its first argument, which needs [`Rights::WRITE`], before that
+    /// process starts: the rest of its arguments are [`Syscall::Map`]'s,
+    /// the memory object's handle, offset, length, address and rights.
+    /// Fails as map does, and with [`Error::Started`] once the process has
+    /// started.
+    MapInto,
+    /// Starts the process of the handle in its first argument, which needs
+    /// [`Rights::WRITE`], with one thread at the address in its second
+    /// argument and the stack pointer in its third, both in its user
+    /// space; the stack pointer may be at its end. The handle in its fourth
+    /// argument, which needs [`Rights::TRANSFER`], moves into the new
+    /// process's table with its rights, and the thread gets that handle in
+    /// its first argument register. Fails with [`Error::BadHandle`],
+    /// [`Error::WrongType`] if the first isn't a process,
+    /// [`Error::AccessDenied`], [`Error::BadAddress`], [`Error::Started`]
+    /// if the process has started already, [`Error::NoHandles`] or
+    /// [`Error::NoMemory`], and then starts nothing and moves no handle.
+    ProcessStart,
+    /// The exit status of the process of the handle in its first argument,
+    /// which needs [`Rights::READ`], once it has [`Signals::ENDED`]. Fails
+    /// with [`Error::BadHandle`], [`Error::WrongType`],
+    /// [`Error::AccessDenied`], with [`Error::ShouldWait`] if it hasn't
+    /// ended, or with [`Error::Killed`] if a trap ended it.
+    ProcessEnd,
+    /// Copies as many bytes as its fourth argument from the memory object
+    /// of the handle in its first argument, which needs [`Rights::READ`],
+    /// from the byte offset in its second, to the address in its third.
+    /// Offset and length may be any bytes in the object. Fails with
+    /// [`Error::BadHandle`], [`Error::WrongType`], [`Error::AccessDenied`],
+    /// with [`Error::OutOfRange`] for a range past the object's end, or
+    /// with [`Error::BadAddress`], having written the pages before the bad
+    /// one.
+    MemoryRead,
+    /// Copies as many bytes as its fourth argument from the address in its
+    /// third into the memory object of the handle in its first argument,
+    /// which needs [`Rights::WRITE`], from the byte offset in its second.
+    /// Offset and length may be any bytes in the object. Fails with
+    /// [`Error::BadHandle`], [`Error::WrongType`], [`Error::AccessDenied`],
+    /// with [`Error::OutOfRange`] for a range past the object's end, with
+    /// [`Error::Conflict`] while the object is mapped executable anywhere,
+    /// so that writing can't get around W^X, or with
+    /// [`Error::BadAddress`], having written the object's bytes before the
+    /// bad page.
+    MemoryWrite,
 }
 
 impl Syscall {
@@ -149,6 +205,12 @@ impl Syscall {
             Syscall::Send => 9,
             Syscall::Receive => 10,
             Syscall::Wait => 11,
+            Syscall::ProcessCreate => 12,
+            Syscall::MapInto => 13,
+            Syscall::ProcessStart => 14,
+            Syscall::ProcessEnd => 15,
+            Syscall::MemoryRead => 16,
+            Syscall::MemoryWrite => 17,
         }
     }
 }
@@ -170,6 +232,12 @@ impl TryFrom<u64> for Syscall {
             9 => Ok(Syscall::Send),
             10 => Ok(Syscall::Receive),
             11 => Ok(Syscall::Wait),
+            12 => Ok(Syscall::ProcessCreate),
+            13 => Ok(Syscall::MapInto),
+            14 => Ok(Syscall::ProcessStart),
+            15 => Ok(Syscall::ProcessEnd),
+            16 => Ok(Syscall::MemoryRead),
+            17 => Ok(Syscall::MemoryWrite),
             _ => Err(Error::UnknownSyscall),
         }
     }
@@ -222,6 +290,11 @@ pub enum Error {
     TimedOut,
     /// Signals have bits that no signal has.
     BadSignals,
+    /// The process has started, and the call works only before that.
+    Started,
+    /// The process was ended by a trap its code raised, so it has no exit
+    /// status.
+    Killed,
 }
 
 impl Error {
@@ -247,6 +320,8 @@ impl Error {
             Error::Cycle => 17,
             Error::TimedOut => 18,
             Error::BadSignals => 19,
+            Error::Started => 20,
+            Error::Killed => 21,
         }
     }
 
@@ -272,6 +347,8 @@ impl Error {
             17 => Some(Error::Cycle),
             18 => Some(Error::TimedOut),
             19 => Some(Error::BadSignals),
+            20 => Some(Error::Started),
+            21 => Some(Error::Killed),
             _ => None,
         }
     }
@@ -333,7 +410,7 @@ impl BitOr for Rights {
 }
 
 /// What [`Syscall::Wait`] waits for: states of an object that can come and
-/// go. Only channel endpoints have signals.
+/// go. Channel endpoints and processes have signals.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Signals(u32);
 
@@ -346,8 +423,11 @@ impl Signals {
     pub const WRITABLE: Signals = Signals(1 << 1);
     /// The other endpoint is closed.
     pub const PEER_CLOSED: Signals = Signals(1 << 2);
+    /// The process has ended, and its handles are closed and its memory
+    /// freed. It stays set.
+    pub const ENDED: Signals = Signals(1 << 3);
     /// Every signal.
-    pub const ALL: Signals = Signals((1 << 3) - 1);
+    pub const ALL: Signals = Signals((1 << 4) - 1);
 
     /// The signals with these bits, or `None` if a bit has no signal.
     pub const fn from_bits(bits: u32) -> Option<Signals> {

@@ -437,13 +437,11 @@ global_asm!(
     "syscall",
     "ret",
     ".org thisos_user_programs + 10 * {slot}, 0xcc",
-    // Wait. RBX holds the process handle in RDI, R12 and R13 the
-    // endpoints, then R13 the second channel's second endpoint and R14 the
-    // memory object; EDI is set to each check's number before it's tested,
-    // as in Handles. Below the stack's top: two wait items at RSP, of
-    // handle, wanted and observed signals, and the byte to send at RSP +
-    // 32.
-    "mov rbx, rdi",
+    // Wait. R12 and R13 hold the endpoints, then R13 the second channel's
+    // second endpoint and R14 the memory object; EDI is set to each check's
+    // number before it's tested, as in Handles. Below the stack's top: two
+    // wait items at RSP, of handle, wanted and observed signals, and the
+    // byte to send at RSP + 32.
     "sub rsp, 64",
     "mov eax, {channel_create}",
     "syscall",
@@ -468,7 +466,13 @@ global_asm!(
     "mov edi, 3",
     "cmp rax, {bad_signals}",
     "jne 2f",
-    "mov dword ptr [rsp], ebx",
+    "mov edi, 4096",
+    "mov eax, {memory_create}",
+    "syscall",
+    "mov edi, 4",
+    "test rax, rax",
+    "jnz 2f",
+    "mov dword ptr [rsp], edx",
     "mov dword ptr [rsp + 4], {readable}",
     "mov esi, 1",
     "xor edx, edx",

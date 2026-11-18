@@ -3,14 +3,46 @@
 //! signal unparks it, and it takes its id off every list before it looks
 //! again. Since an unpark that comes before the park makes the park return
 //! at once, a signal that arrives between the check and the park isn't
-//! lost. Only channel endpoints have signals so far.
+//! lost. Channel endpoints and processes have signals.
 
 use alloc::sync::Arc;
 
 use thisos_abi::{Error, Signals};
 
 use crate::channel::Endpoint;
+use crate::process::{Object, Process};
 use crate::{thread, timer};
+
+/// An object that has signals.
+pub enum Waitable {
+    Channel(Arc<Endpoint>),
+    Process(Arc<Process>),
+}
+
+impl Waitable {
+    /// `object`, or `None` if it has no signals.
+    pub fn new(object: Object) -> Option<Self> {
+        match object {
+            Object::Channel(endpoint) => Some(Waitable::Channel(endpoint)),
+            Object::Process(process) => Some(Waitable::Process(process)),
+            Object::Memory(_) => None,
+        }
+    }
+
+    fn add_waiter(&self, id: u64) -> Result<Signals, Error> {
+        match self {
+            Waitable::Channel(endpoint) => endpoint.add_waiter(id),
+            Waitable::Process(process) => process.add_waiter(id),
+        }
+    }
+
+    fn remove_waiter(&self, id: u64) -> Signals {
+        match self {
+            Waitable::Channel(endpoint) => endpoint.remove_waiter(id),
+            Waitable::Process(process) => process.remove_waiter(id),
+        }
+    }
+}
 
 /// The tick a wait of `timeout` nanoseconds ends at: now for 0, never for
 /// `u64::MAX`, and otherwise late enough that at least `timeout` passes,
@@ -25,14 +57,14 @@ pub fn deadline(timeout: u64) -> Option<u64> {
     }
 }
 
-/// Blocks until one of the endpoints in `items` has one of the signals
+/// Blocks until one of the objects in `items` has one of the signals
 /// paired with it, or until [`timer::ticks`] reaches `deadline`, then
-/// writes each endpoint's signals at the same place in `observed` and
+/// writes each object's signals at the same place in `observed` and
 /// returns how many items have a wanted one. Fails with
 /// [`Error::NoMemory`] if a waiter list can't grow, or
 /// [`Error::TimedOut`] once the deadline has passed with none.
 pub fn wait(
-    items: &[(Arc<Endpoint>, Signals)],
+    items: &[(Waitable, Signals)],
     observed: &mut [Signals],
     deadline: Option<u64>,
 ) -> Result<usize, Error> {
@@ -41,12 +73,12 @@ pub fn wait(
     let expired = || deadline.is_some_and(|deadline| timer::ticks() >= deadline);
     loop {
         let mut ready = false;
-        for (i, (endpoint, wanted)) in items.iter().enumerate() {
-            match endpoint.add_waiter(id) {
+        for (i, (object, wanted)) in items.iter().enumerate() {
+            match object.add_waiter(id) {
                 Ok(signals) => ready |= signals.intersects(*wanted),
                 Err(e) => {
-                    for (endpoint, _) in &items[..i] {
-                        endpoint.remove_waiter(id);
+                    for (object, _) in &items[..i] {
+                        object.remove_waiter(id);
                     }
                     return Err(e);
                 }
@@ -59,8 +91,8 @@ pub fn wait(
             };
         }
         let mut count = 0;
-        for ((endpoint, wanted), observed) in items.iter().zip(observed.iter_mut()) {
-            *observed = endpoint.remove_waiter(id);
+        for ((object, wanted), observed) in items.iter().zip(observed.iter_mut()) {
+            *observed = object.remove_waiter(id);
             if observed.intersects(*wanted) {
                 count += 1;
             }
@@ -106,8 +138,11 @@ mod tests {
         let (a, b) = (Arc::new(a), Arc::new(b));
         let (c, _d) = channel::pair();
         let items = [
-            (Arc::clone(&b), Signals::READABLE),
-            (Arc::new(c), Signals::READABLE | Signals::PEER_CLOSED),
+            (Waitable::Channel(Arc::clone(&b)), Signals::READABLE),
+            (
+                Waitable::Channel(Arc::new(c)),
+                Signals::READABLE | Signals::PEER_CLOSED,
+            ),
         ];
         thread::spawn(move || {
             STARTED.store(true, Ordering::Relaxed);
@@ -138,7 +173,7 @@ mod tests {
     #[test_case]
     fn a_wait_times_out_and_a_zero_timeout_only_checks() {
         let (_a, b) = channel::pair();
-        let items = [(Arc::new(b), Signals::READABLE)];
+        let items = [(Waitable::Channel(Arc::new(b)), Signals::READABLE)];
         let mut observed = [Signals::NONE];
         let start = timer::ticks();
         assert_eq!(
@@ -161,8 +196,8 @@ mod tests {
         let (a, b) = channel::pair();
         ping(&a);
         let items = [
-            (Arc::new(b), Signals::READABLE),
-            (Arc::new(a), Signals::WRITABLE),
+            (Waitable::Channel(Arc::new(b)), Signals::READABLE),
+            (Waitable::Channel(Arc::new(a)), Signals::WRITABLE),
         ];
         let mut observed = [Signals::NONE; 2];
         assert_eq!(wait(&items, &mut observed, None), Ok(2));

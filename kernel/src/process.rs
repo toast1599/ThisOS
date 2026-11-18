@@ -1,33 +1,44 @@
-//! Processes: the handle table of the objects a process can reach, and how
-//! the process ended. Its threads hold a process, and so do the handles
-//! that name it. Ending a process closes its handles, which also breaks the
-//! cycle that a handle to itself makes.
+//! Processes: the handle table of the objects a process can reach, its
+//! address space, and how the process ended. Its threads hold a process,
+//! and so do the handles that name it. A process starts once, with one
+//! thread and one handle, and ending it closes its handles, which also
+//! breaks the cycle that a handle to itself makes, and lets go of its
+//! space.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::mem;
 
 use spin::Mutex;
-use thisos_abi::{Error, Rights};
-use thisos_hal::{Cpu, Trap};
+use thisos_abi::{Error, Rights, Signals};
+use thisos_hal::{AddressSpace as _, Cpu, Trap};
 use thisos_handles::Table;
 
-use crate::Arch;
 use crate::channel::Endpoint;
 use crate::memory::MemoryObject;
+use crate::paging::Space;
+use crate::{Arch, thread};
+
+/// The rights of a handle to a new process.
+pub const PROCESS_RIGHTS: Rights = Rights::READ
+    .union(Rights::WRITE)
+    .union(Rights::DUPLICATE)
+    .union(Rights::TRANSFER);
 
 /// A kernel object, as a handle names it.
 #[derive(Clone)]
 pub enum Object {
-    Process(
-        #[expect(
-            dead_code,
-            reason = "no syscall acts on a process through its handle yet"
-        )]
-        Arc<Process>,
-    ),
+    Process(Arc<Process>),
     Memory(Arc<MemoryObject>),
     Channel(Arc<Endpoint>),
+}
+
+fn signals(life: &Life) -> Signals {
+    if life.ended {
+        Signals::ENDED
+    } else {
+        Signals::NONE
+    }
 }
 
 /// How a process ended.
@@ -46,18 +57,181 @@ pub struct Process {
     /// Taken only with interrupts off, since the trap handler that kills a
     /// thread sets it.
     end: Mutex<Option<End>>,
+    /// Taken with interrupts on, and never by a trap handler: starting the
+    /// process and mapping into it allocate. Taken before the process's
+    /// and its creator's handle-table locks.
+    life: Mutex<Life>,
+}
+
+/// Where a process is in its life, and who waits for its end.
+struct Life {
+    /// Its address space, until it ends.
+    space: Option<Arc<Space>>,
+    started: bool,
+    /// Whether it ended and the reaper freed it, which
+    /// [`Signals::ENDED`] reports.
+    ended: bool,
+    /// The ids of the threads waiting for it to end.
+    waiters: Vec<u64>,
 }
 
 impl Process {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self {
+    /// A process with `space` and no thread. Fails with
+    /// [`Error::NoMemory`].
+    pub fn new(space: Arc<Space>) -> Result<Arc<Self>, Error> {
+        Arc::try_new(Self {
             handles: Mutex::new(Table::new()),
             end: Mutex::new(None),
+            life: Mutex::new(Life {
+                space: Some(space),
+                started: false,
+                ended: false,
+                waiters: Vec::new(),
+            }),
         })
+        .map_err(|_| Error::NoMemory)
+    }
+
+    /// Runs `map` on the process's space, if the process hasn't started:
+    /// once it has, only its own threads change its space. Fails with
+    /// [`Error::Started`] otherwise.
+    pub fn map_into<R>(&self, map: impl FnOnce(&Space) -> Result<R, Error>) -> Result<R, Error> {
+        let life = self.life.lock();
+        if life.started {
+            return Err(Error::Started);
+        }
+        let Some(space) = &life.space else {
+            unreachable!("a process that hasn't started hasn't ended");
+        };
+        map(space)
+    }
+
+    /// Starts the process with one thread at `ip`, with stack pointer `sp`,
+    /// and moves the handle `take` hands over into its table, whose value
+    /// the thread gets as its argument. `take` runs last, once nothing else
+    /// can fail, so a handle it takes from another table never has to go
+    /// back. Fails with [`Error::Started`] if the process has started
+    /// already, [`Error::BadAddress`] unless `ip` is in user space and `sp`
+    /// in it or at its end, [`Error::NoMemory`], or with what `take` fails
+    /// with.
+    pub fn start(
+        self: &Arc<Self>,
+        ip: u64,
+        sp: u64,
+        take: impl FnOnce() -> Result<(Object, Rights), Error>,
+    ) -> Result<(), Error> {
+        let mut life = self.life.lock();
+        let thread = self.new_thread(&life, ip, sp)?;
+        // Only start puts handles in the table of a process that hasn't
+        // started, and the life lock keeps out another start, so the room
+        // stays reserved, and take's lock on its table needn't nest in this
+        // one.
+        self.handles
+            .lock()
+            .try_reserve(1)
+            .map_err(|_| Error::NoMemory)?;
+        let (object, rights) = take()?;
+        let Ok(handle) = self.handles.lock().insert(object, rights) else {
+            unreachable!("the empty table had memory reserved");
+        };
+        life.started = true;
+        thread.start(u64::from(handle));
+        Ok(())
+    }
+
+    /// Starts the process with one thread at `ip`, with stack pointer `sp`
+    /// and `arg` as its argument, whatever that is. Panics if the thread
+    /// can't start.
+    #[cfg(test)]
+    pub fn start_with(self: &Arc<Self>, ip: u64, sp: u64, arg: u64) {
+        let mut life = self.life.lock();
+        match self.new_thread(&life, ip, sp) {
+            Ok(thread) => thread.start(arg),
+            Err(e) => panic!("starting the process failed: {e:?}"),
+        }
+        life.started = true;
+    }
+
+    /// The thread [`start`](Self::start) starts.
+    fn new_thread(
+        self: &Arc<Self>,
+        life: &Life,
+        ip: u64,
+        sp: u64,
+    ) -> Result<thread::Unstarted, Error> {
+        if life.started {
+            return Err(Error::Started);
+        }
+        let Some(space) = &life.space else {
+            unreachable!("a process that hasn't started hasn't ended");
+        };
+        let user = space.user_space();
+        if !user.contains(&ip) || !(user.start..=user.end).contains(&sp) {
+            return Err(Error::BadAddress);
+        }
+        thread::new_user(Arc::clone(self), Arc::clone(space), ip, sp)
+    }
+
+    /// The exit status of the process, once it has [`Signals::ENDED`].
+    /// Fails with [`Error::ShouldWait`] before that, and with
+    /// [`Error::Killed`] if a trap ended it.
+    pub fn exit_status(&self) -> Result<u64, Error> {
+        if !self.life.lock().ended {
+            return Err(Error::ShouldWait);
+        }
+        match Arch::without_interrupts(|| *self.end.lock()) {
+            Some(End::Exited(status)) => Ok(status),
+            Some(End::Killed { .. }) => Err(Error::Killed),
+            None => unreachable!("a user process ends through exit or a trap"),
+        }
+    }
+
+    /// The process's signals.
+    #[cfg(test)]
+    pub fn signals(&self) -> Signals {
+        signals(&self.life.lock())
+    }
+
+    /// Adds `id` to the threads waiting for the process to end, and returns
+    /// its signals. Fails with [`Error::NoMemory`].
+    pub fn add_waiter(&self, id: u64) -> Result<Signals, Error> {
+        let mut life = self.life.lock();
+        life.waiters.try_reserve(1).map_err(|_| Error::NoMemory)?;
+        life.waiters.push(id);
+        Ok(signals(&life))
+    }
+
+    /// Takes `id` off the threads waiting for the process to end, if it is
+    /// there, and returns its signals.
+    pub fn remove_waiter(&self, id: u64) -> Signals {
+        let mut life = self.life.lock();
+        if let Some(i) = life.waiters.iter().position(|&waiter| waiter == id) {
+            life.waiters.swap_remove(i);
+        }
+        signals(&life)
+    }
+
+    /// Lets go of the process's space and wakes the threads waiting for it
+    /// to end. The reaper calls this once it has closed the handles of the
+    /// process's last thread, with interrupts on.
+    pub fn reaped(&self) {
+        let space = self.life.lock().space.take();
+        // The reaper dropped the thread's hold first, so this destroys the
+        // space, before ENDED says the process's memory is free.
+        drop(space);
+        let waiters = {
+            let mut life = self.life.lock();
+            life.ended = true;
+            mem::take(&mut life.waiters)
+        };
+        for id in waiters {
+            thread::unpark(id);
+        }
     }
 
     /// Puts a handle to this process with `rights` in its own table, and
     /// returns it.
+    #[cfg(test)]
     pub fn insert_self(self: &Arc<Self>, rights: Rights) -> Result<u32, Error> {
         self.insert(Object::Process(Arc::clone(self)), rights)
     }
@@ -167,8 +341,8 @@ mod tests {
     use thisos_hal::Platform;
 
     use super::*;
-    use crate::frames;
     use crate::testing::fill_heap;
+    use crate::{frames, paging};
 
     fn memory() -> Object {
         let Ok(object) = MemoryObject::new(1) else {
@@ -180,8 +354,14 @@ mod tests {
     #[test_case]
     fn a_full_heap_makes_no_handle_and_frees_the_object() {
         let allocated = Arch::heap_stats().allocated;
+        let before = frames::free_frames();
+        let Some(space) = paging::new_space() else {
+            panic!("no free frame for a space");
+        };
+        let Ok(process) = Process::new(Arc::new(space)) else {
+            panic!("no memory for a process");
+        };
         let free = frames::free_frames();
-        let process = Process::new();
         let (one, all) = (memory(), vec![(memory(), Rights::ALL)]);
         let filler = fill_heap();
         // The table is empty, so its first handle needs memory.
@@ -196,7 +376,7 @@ mod tests {
         assert_eq!(process.insert_self(Rights::READ), Ok(1 << 16));
         process.close_handles();
         drop((all, process));
-        assert_eq!(frames::free_frames(), free);
+        assert_eq!(frames::free_frames(), before);
         assert_eq!(Arch::heap_stats().allocated, allocated);
     }
 }

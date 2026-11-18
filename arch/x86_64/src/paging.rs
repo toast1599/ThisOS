@@ -657,7 +657,12 @@ impl thisos_hal::PageTables for KernelPageTables {
         }
     }
 
-    fn map_stack(&mut self, size: usize, alloc: &mut dyn FnMut() -> Option<Frame>) -> Stack {
+    fn map_stack(
+        &mut self,
+        size: usize,
+        alloc: &mut dyn FnMut() -> Option<Frame>,
+        free: &mut dyn FnMut(Frame),
+    ) -> Option<Stack> {
         let Ok(size) = u64::try_from(size.next_multiple_of(4096)) else {
             panic!("a stack of {size:#x} bytes doesn't fit a u64");
         };
@@ -667,14 +672,15 @@ impl thisos_hal::PageTables for KernelPageTables {
         // cursor, where nothing is mapped yet.
         let start = (self.stacks + 4096).next_multiple_of(align);
         let range = start..start + size;
-        assert!(
-            range.end <= window.end,
-            "the stacks' {} GiB are used up",
-            STACKS_SIZE >> 30
-        );
+        if range.end > window.end {
+            return None;
+        }
+        // A failed stack's addresses aren't mapped again either.
+        self.stacks = range.end;
         for page in range.clone().step_by(4096) {
             let Some(frame) = alloc() else {
-                panic!("no free frame for a stack");
+                self.unmap_stack(Stack { range: start..page }, free);
+                return None;
             };
             if let Err(e) = self.tables.map_page(
                 Page::containing_address(VirtAddr::new(page)),
@@ -684,11 +690,17 @@ impl thisos_hal::PageTables for KernelPageTables {
                 true,
                 alloc,
             ) {
-                panic!("mapping a stack page at {page:#x} failed: {:?}", e.kind);
+                assert_eq!(
+                    e.kind,
+                    MapErrorKind::NoFrames,
+                    "mapping a stack page at {page:#x} failed"
+                );
+                free(e.given);
+                self.unmap_stack(Stack { range: start..page }, free);
+                return None;
             }
         }
-        self.stacks = range.end;
-        Stack { range }
+        Some(Stack { range })
     }
 
     fn unmap_stack(&mut self, stack: Stack, free: &mut dyn FnMut(Frame)) {
@@ -951,6 +963,44 @@ pub fn fill_frame(phys_offset: VirtAddr, frame: &mut Frame, offset: usize, bytes
     page[..offset].fill(0);
     page[offset..end].copy_from_slice(bytes);
     page[end..].fill(0);
+}
+
+/// The physical-memory mapping's address of `frame`'s bytes from `offset`,
+/// for `len` bytes. Panics with interrupts on, or unless the bytes fit in
+/// the frame.
+fn frame_bytes(phys_offset: VirtAddr, frame: &Frame, offset: usize, len: usize) -> *mut u8 {
+    assert!(
+        !cpu::interrupts_enabled(),
+        "copying a shared frame with interrupts on"
+    );
+    assert!(
+        offset.checked_add(len).is_some_and(|end| end <= 4096),
+        "{len:#x} bytes at offset {offset:#x} don't fit in a frame"
+    );
+    // A physical address, reached through the physical-memory mapping.
+    (phys_offset + frame.start() + u64::try_from(offset).unwrap_or(4096)).as_mut_ptr::<u8>()
+}
+
+/// Copies `frame`'s bytes from `offset` into `buf`; see
+/// `Platform::read_frame`.
+pub fn read_frame(phys_offset: VirtAddr, frame: &Frame, offset: usize, buf: &mut [u8]) {
+    let source = frame_bytes(phys_offset, frame, offset, buf.len());
+    // SAFETY: The bytes are inside the frame, which is RAM the
+    // physical-memory mapping maps. The kernel's only reference into a
+    // frame's bytes is fill_frame's, which needs the frame mutably, and user
+    // code that maps it doesn't run while interrupts are off on the only
+    // CPU, so nothing writes them meanwhile. buf is the caller's own memory,
+    // apart from the frame's.
+    unsafe { ptr::copy_nonoverlapping(source, buf.as_mut_ptr(), buf.len()) };
+}
+
+/// Copies `bytes` into `frame` from `offset`; see `Platform::write_frame`.
+pub fn write_frame(phys_offset: VirtAddr, frame: &Frame, offset: usize, bytes: &[u8]) {
+    let target = frame_bytes(phys_offset, frame, offset, bytes.len());
+    // SAFETY: As in read_frame: the bytes are inside the frame, no Rust
+    // reference reaches them, and nothing else runs to read or write them
+    // meanwhile.
+    unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), target, bytes.len()) };
 }
 
 /// Copies the bytes at `addr` in the tables CR3 points at into `buf`; see
@@ -1385,6 +1435,55 @@ mod tests {
         memory.frames.free(frame);
     }
 
+    // A syscall can start a thread, so running out of frames for its stack
+    // fails the call rather than the kernel.
+    #[test]
+    fn a_stack_without_frames_gives_back_what_it_took() {
+        let mut memory = Memory::new();
+        let mut kernel = kernel(&mut memory);
+        let size = 4 * 4096;
+        let mut freed = Vec::new();
+        // The first stack adds the tables the window's first stacks share.
+        let Some(first) = kernel.map_stack(size, &mut || memory.frames.alloc(), &mut |frame| {
+            freed.push(frame);
+        }) else {
+            panic!("no first stack");
+        };
+        let free = memory.frames.free_frames();
+        let mut left = 2;
+        let failed = kernel.map_stack(
+            size,
+            &mut || {
+                left -= 1;
+                if left < 0 {
+                    None
+                } else {
+                    memory.frames.alloc()
+                }
+            },
+            &mut |frame| freed.push(frame),
+        );
+        assert!(failed.is_none());
+        assert_eq!(freed.len(), 2);
+        for frame in freed.drain(..) {
+            memory.frames.free(frame);
+        }
+        assert_eq!(memory.frames.free_frames(), free);
+        let Some(next) = kernel.map_stack(size, &mut || memory.frames.alloc(), &mut |frame| {
+            freed.push(frame);
+        }) else {
+            panic!("no stack after the failed one");
+        };
+        // The failed stack's pages stay unmapped, below the next stack.
+        let failed = first.range().end + 4096..next.range().start - 4096;
+        assert!(!failed.is_empty());
+        assert!(
+            failed
+                .step_by(4096)
+                .all(|page| kernel.translate(page).is_none())
+        );
+    }
+
     #[test]
     fn stacks_are_guarded_aligned_and_apart_from_kernel_space() {
         let mut memory = Memory::new();
@@ -1405,7 +1504,14 @@ mod tests {
         ];
         let stacks: Vec<Stack> = sizes
             .iter()
-            .map(|&(size, _)| kernel.map_stack(size, &mut alloc))
+            .map(|&(size, _)| {
+                let Some(stack) = kernel.map_stack(size, &mut alloc, &mut |_| {
+                    panic!("a stack freed a frame");
+                }) else {
+                    panic!("no stack of {size:#x} bytes");
+                };
+                stack
+            })
             .collect();
         let ranges: Vec<Range<u64>> = stacks.iter().map(Stack::range).collect();
         for (range, &(size, align)) in ranges.iter().zip(&sizes) {
@@ -1484,6 +1590,45 @@ mod tests {
         assert!(copy_from_user(phys_offset, 0x40_0ffd, &mut buf));
         assert_eq!(&buf, b"awxyzf");
         assert!(!copy_to_user(phys_offset, start, b"k"));
+    }
+
+    // A memory object's frames are shared, so the kernel reads and writes
+    // them by &Frame while user code maps them.
+    #[test]
+    fn shared_frame_copies_meet_user_copies() {
+        let mut memory = Memory::new();
+        let kernel = kernel(&mut memory);
+        let space = new_space(&kernel, &mut memory);
+        let phys_offset = memory.phys_offset;
+        let object = memory.object(1);
+        let mapped = space.map(
+            0x40_0000,
+            object.clone(),
+            0,
+            1,
+            Protection::ReadWrite,
+            &mut || memory.frames.alloc(),
+        );
+        assert!(mapped.is_ok());
+        space.activate();
+
+        write_frame(phys_offset, &object[0], 4094, b"ab");
+        let mut buf = [0; 3];
+        assert!(copy_from_user(phys_offset, 0x40_0ffd, &mut buf));
+        assert_eq!(&buf, b"\0ab");
+        assert!(copy_to_user(phys_offset, 0x40_0000, b"xy"));
+        let mut buf = [0; 3];
+        read_frame(phys_offset, &object[0], 0, &mut buf);
+        assert_eq!(&buf, b"xy\0");
+        read_frame(phys_offset, &object[0], 4096, &mut []);
+    }
+
+    #[test]
+    #[should_panic(expected = "don't fit in a frame")]
+    fn shared_frame_copies_stay_in_the_frame() {
+        let mut memory = Memory::new();
+        let frame = memory.frame();
+        write_frame(memory.phys_offset, &frame, 4095, b"ab");
     }
 
     #[test]

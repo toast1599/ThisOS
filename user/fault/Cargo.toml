@@ -1,0 +1,18 @@
+[package]
+name = "thisos-fault"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "thisos-fault"
+test = false
+bench = false
+
+[dependencies]
+thisos-rt.workspace = true
+
+[lints]
+workspace = true

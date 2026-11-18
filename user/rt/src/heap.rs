@@ -79,10 +79,10 @@ unsafe impl Source for Objects {
 /// `addr`, and closes its handle: the mapping holds the object.
 fn map_new(addr: u64, len: usize) -> Result<(), ()> {
     let len = u64::try_from(len).map_err(|_| ())?;
-    let handle = crate::syscall(Syscall::MemoryCreate, [len, 0, 0, 0, 0]).map_err(|_| ())?;
+    let handle = crate::syscall(Syscall::MemoryCreate, [len]).map_err(|_| ())?;
     let rights = u64::from(Rights::READ.union(Rights::WRITE).bits());
     let mapped = crate::map_syscall([handle, 0, len, addr, rights]);
-    if let Err(e) = crate::syscall(Syscall::Close, [handle, 0, 0, 0, 0]) {
+    if let Err(e) = crate::syscall(Syscall::Close, [handle]) {
         panic!("closing the heap's memory object failed: {e:?}");
     }
     mapped.map(|_| ()).map_err(|_| ())

@@ -11,7 +11,7 @@ use core::ops::Deref;
 use spin::Mutex;
 use thisos_abi::Error;
 use thisos_frames::Frame;
-use thisos_hal::{Platform, Protection};
+use thisos_hal::{Cpu, Platform, Protection};
 use thisos_regions::Uses;
 
 use crate::{Arch, frames};
@@ -51,6 +51,84 @@ impl MemoryObject {
     /// The frames, to fill before anything shares or maps the object.
     pub fn frames_mut(&mut self) -> &mut [Frame] {
         &mut self.frames
+    }
+
+    /// Copies out the object's `len` bytes from `offset`, a page or less at
+    /// a time: hands `out` each piece and its offset from `offset`, and
+    /// returns `false` at the first piece `out` refuses. Fails with
+    /// [`Error::OutOfRange`] if the bytes run past the object's end.
+    pub fn read(
+        &self,
+        offset: usize,
+        len: usize,
+        mut out: impl FnMut(usize, &[u8]) -> bool,
+    ) -> Result<bool, Error> {
+        let mut buf = [0; 4096];
+        for (frame, at, done, piece) in self.pieces(offset, len)? {
+            let buf = &mut buf[..piece];
+            Arch::without_interrupts(|| Arch::read_frame(&self.frames[frame], at, buf));
+            if !out(done, buf) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Copies `len` bytes into the object from `offset`, a page or less at
+    /// a time: `fill` writes each piece, given its offset from `offset`,
+    /// and the copy stops with `false` at the first piece `fill` refuses,
+    /// with the pieces before it written. Fails with
+    /// [`Error::OutOfRange`] if the bytes run past the object's end, or
+    /// [`Error::Conflict`] while the object is mapped executable; no
+    /// executable mapping starts until it is done.
+    pub fn write(
+        &self,
+        offset: usize,
+        len: usize,
+        mut fill: impl FnMut(usize, &mut [u8]) -> bool,
+    ) -> Result<bool, Error> {
+        let pieces = self.pieces(offset, len)?;
+        let uses = self.uses.lock();
+        if uses.executable() {
+            return Err(Error::Conflict);
+        }
+        let mut buf = [0; 4096];
+        for (frame, at, done, piece) in pieces {
+            let buf = &mut buf[..piece];
+            if !fill(done, buf) {
+                return Ok(false);
+            }
+            Arch::without_interrupts(|| Arch::write_frame(&self.frames[frame], at, buf));
+        }
+        Ok(true)
+    }
+
+    /// The pieces of the `len` bytes from `offset`, one per frame they
+    /// touch: the frame's index, the offset in it, the piece's offset from
+    /// `offset`, and its length. Fails with [`Error::OutOfRange`] if the
+    /// bytes run past the object's end.
+    fn pieces(
+        &self,
+        offset: usize,
+        len: usize,
+    ) -> Result<impl Iterator<Item = (usize, usize, usize, usize)>, Error> {
+        if offset
+            .checked_add(len)
+            .is_none_or(|end| end > 4096 * self.frames.len())
+        {
+            return Err(Error::OutOfRange);
+        }
+        let mut done = 0;
+        Ok(core::iter::from_fn(move || {
+            if done == len {
+                return None;
+            }
+            let at = offset + done;
+            let piece = (4096 - at % 4096).min(len - done);
+            let item = (at / 4096, at % 4096, done, piece);
+            done += piece;
+            Some(item)
+        }))
     }
 }
 

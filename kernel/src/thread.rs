@@ -14,8 +14,8 @@
 //! The scheduler's lock is only ever held with interrupts off, so the
 //! timer's handler never finds it held, and nothing allocates or frees
 //! while holding it: a tick can preempt a thread that holds the heap's lock,
-//! and the heap would then spin with interrupts off for good. `spawn`
-//! reserves room in the queues for every thread, so moving one never
+//! and the heap would then spin with interrupts off for good. Making a
+//! thread reserves room in the queues for it, so moving one never
 //! allocates.
 
 use alloc::boxed::Box;
@@ -26,10 +26,11 @@ use core::mem;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use spin::Mutex;
+use thisos_abi::Error;
 use thisos_hal::{AddressSpace as _, Cpu, Platform};
 
 use crate::process::Process;
-use crate::{Arch, frames, paging, timer};
+use crate::{Arch, paging, timer};
 
 type Context = <Arch as Platform>::Context;
 
@@ -44,10 +45,10 @@ struct Thread {
     /// Where it stopped, while it isn't running, which holds its stack.
     context: Option<Context>,
     /// What it runs, until it starts.
-    run: Option<Box<dyn Run>>,
+    entry: Option<Entry>,
     /// The address space it runs user code in, or `None` for a kernel
-    /// thread. The last thread to drop it destroys it.
-    space: Option<Arc<paging::AddressSpace>>,
+    /// thread.
+    space: Option<Arc<paging::Space>>,
     /// The process it belongs to, or `None` for a kernel thread.
     process: Option<Arc<Process>>,
     /// The tick at which it stops being blocked, while it is.
@@ -61,21 +62,30 @@ struct Thread {
 impl Thread {
     fn new(
         context: Option<Context>,
-        run: Option<Box<dyn Run>>,
-        space: Option<Arc<paging::AddressSpace>>,
+        entry: Option<Entry>,
+        space: Option<Arc<paging::Space>>,
         process: Option<Arc<Process>>,
     ) -> Self {
         static NEXT_ID: AtomicU64 = AtomicU64::new(0);
         Self {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             context,
-            run,
+            entry,
             space,
             process,
             deadline: None,
             wake: None,
         }
     }
+}
+
+/// What a thread runs when it starts.
+enum Entry {
+    /// A kernel thread's closure.
+    Kernel(Box<dyn FnOnce() + Send>),
+    /// User code at `ip`, with stack pointer `sp` and `arg` as its first
+    /// argument, which [`Unstarted::start`] sets.
+    User { ip: u64, sp: u64, arg: u64 },
 }
 
 /// Why a park returned.
@@ -140,15 +150,21 @@ fn with<T>(f: impl FnOnce(&mut Scheduler) -> T) -> T {
 /// the reaper. `kernel::init` calls this once, after `heap::init` and
 /// before the timer starts.
 pub fn init() {
+    let boot_stack = || {
+        let Some(stack) = paging::map_stack(STACK_SIZE) else {
+            panic!("no frames for the idle thread's and the reaper's stacks");
+        };
+        stack
+    };
     let idle = Box::new(Thread::new(
-        Some(Arch::new_context(paging::map_stack(STACK_SIZE), idle)),
+        Some(Arch::new_context(boot_stack(), idle)),
         None,
         None,
         None,
     ));
     let reaper = Box::new(Thread::new(
-        Some(Arch::new_context(paging::map_stack(STACK_SIZE), start)),
-        Some(Box::new(reaper)),
+        Some(Arch::new_context(boot_stack(), start)),
+        Some(Entry::Kernel(Box::new(reaper))),
         None,
         None,
     ));
@@ -184,33 +200,87 @@ pub fn spawn(run: impl FnOnce() + Send + 'static) {
     spawn_in(None, None, run);
 }
 
-/// Starts a thread of `process` that runs user code at `ip` in `space`,
-/// with stack pointer `sp` and `arg` as its first argument. It ends through
-/// `user::trap`, and its space is destroyed along with the last thread that
-/// holds it. Panics if kernel space or the frames run out.
-pub fn spawn_user(
-    process: Arc<Process>,
-    space: Arc<paging::AddressSpace>,
-    ip: u64,
-    sp: u64,
-    arg: u64,
-) {
-    spawn_in(Some(space), Some(process), move || {
-        Arch::enter_user(ip, sp, arg)
-    });
-}
-
+/// Starts a kernel thread that runs `run` in `space` and `process`, for
+/// tests. Panics if kernel space or the frames run out.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "only the tests run kernel threads besides boot and idle so far"
+    )
+)]
 fn spawn_in(
-    space: Option<Arc<paging::AddressSpace>>,
+    space: Option<Arc<paging::Space>>,
     process: Option<Arc<Process>>,
     run: impl FnOnce() + Send + 'static,
 ) {
-    let mut thread = Some(Box::new(Thread::new(
-        Some(Arch::new_context(paging::map_stack(STACK_SIZE), start)),
-        Some(Box::new(run)),
-        space,
-        process,
-    )));
+    match new_thread(space, process, Entry::Kernel(Box::new(run))) {
+        Ok(thread) => thread.start(0),
+        Err(e) => panic!("starting a kernel thread failed: {e:?}"),
+    }
+}
+
+/// A thread of `process` that will run user code at `ip` in `space`, with
+/// stack pointer `sp`, once [`Unstarted::start`] gives its argument. It ends
+/// through `user::trap`. Fails with [`Error::NoMemory`] if kernel space, the
+/// frames or the heap run short.
+pub fn new_user(
+    process: Arc<Process>,
+    space: Arc<paging::Space>,
+    ip: u64,
+    sp: u64,
+) -> Result<Unstarted, Error> {
+    new_thread(Some(space), Some(process), Entry::User { ip, sp, arg: 0 })
+}
+
+/// A thread that is made but not ready: it holds its stack and room in the
+/// scheduler's queues, which dropping it gives back.
+pub struct Unstarted(Option<Box<Thread>>);
+
+impl Unstarted {
+    /// Makes the thread ready, with `arg` as a user thread's first
+    /// argument.
+    pub fn start(mut self, arg: u64) {
+        let Some(mut thread) = self.0.take() else {
+            unreachable!("only start and drop take the thread");
+        };
+        if let Some(Entry::User { arg: user_arg, .. }) = &mut thread.entry {
+            *user_arg = arg;
+        }
+        // new_thread reserved the room, so this doesn't allocate.
+        with(|scheduler| scheduler.ready.push_back(thread));
+    }
+}
+
+impl Drop for Unstarted {
+    fn drop(&mut self) {
+        if let Some(mut thread) = self.0.take() {
+            free_stack(&mut thread);
+            with(|scheduler| scheduler.threads -= 1);
+        }
+    }
+}
+
+/// Makes a thread that runs `entry`, with its stack and room in the queues.
+fn new_thread(
+    space: Option<Arc<paging::Space>>,
+    process: Option<Arc<Process>>,
+    entry: Entry,
+) -> Result<Unstarted, Error> {
+    let thread = Thread::new(None, Some(entry), space, process);
+    let mut thread = Box::try_new(thread).map_err(|_| Error::NoMemory)?;
+    let stack = paging::map_stack(STACK_SIZE).ok_or(Error::NoMemory)?;
+    thread.context = Some(Arch::new_context(stack, start));
+    if let Err(e) = reserve() {
+        free_stack(&mut thread);
+        return Err(e);
+    }
+    Ok(Unstarted(Some(thread)))
+}
+
+/// Counts one more thread, after giving `ready`, `blocked` and `dead` room
+/// for it.
+fn reserve() -> Result<(), Error> {
     loop {
         let short = with(|scheduler| {
             let need = scheduler.threads + 1;
@@ -221,24 +291,27 @@ fn spawn_in(
                 return Some(need);
             }
             scheduler.threads = need;
-            if let Some(thread) = thread.take() {
-                scheduler.ready.push_back(thread);
-            }
             None
         });
         match short {
-            Some(need) => grow(need),
-            None => return,
+            Some(need) => grow(need)?,
+            None => return Ok(()),
         }
     }
 }
 
 /// Gives `ready`, `blocked` and `dead` room for `need` threads each.
 /// Another thread may grow them meanwhile, so the caller checks again.
-fn grow(need: usize) {
-    let mut ready = VecDeque::with_capacity(need);
-    let mut blocked = Vec::with_capacity(need);
-    let mut dead = Vec::with_capacity(need);
+fn grow(need: usize) -> Result<(), Error> {
+    let mut ready = VecDeque::new();
+    let mut blocked = Vec::new();
+    let mut dead = Vec::new();
+    if ready.try_reserve_exact(need).is_err()
+        || blocked.try_reserve_exact(need).is_err()
+        || dead.try_reserve_exact(need).is_err()
+    {
+        return Err(Error::NoMemory);
+    }
     with(|scheduler| {
         if scheduler.ready.capacity() < need {
             ready.append(&mut scheduler.ready);
@@ -255,6 +328,14 @@ fn grow(need: usize) {
     });
     // Whichever of each pair the scheduler doesn't keep is empty, and is
     // freed here with interrupts on.
+    Ok(())
+}
+
+/// Unmaps the stack of `thread`, which isn't running.
+fn free_stack(thread: &mut Thread) {
+    if let Some(stack) = thread.context.take().and_then(Arch::into_stack) {
+        paging::unmap_stack(stack);
+    }
 }
 
 /// The running thread's id.
@@ -268,7 +349,7 @@ pub fn process() -> Option<Arc<Process>> {
 }
 
 /// The running thread's address space, or `None` for a kernel thread.
-pub fn space() -> Option<Arc<paging::AddressSpace>> {
+pub fn space() -> Option<Arc<paging::Space>> {
     with(|scheduler| running(scheduler).space.clone())
 }
 
@@ -468,9 +549,10 @@ fn arrived(from: Context) {
 }
 
 /// Frees every thread that exited: unmaps its stack and frees its frames,
-/// closes its process's handles, destroys its address space if no other
-/// thread holds it, then drops it. A process has one thread, so that
-/// thread's end is the process's. Interrupts are on, since the page
+/// closes its process's handles and lets go of its address space, then
+/// drops it. A process has one thread, so that thread's end is the
+/// process's: it lets go of its space too, which the last holder destroys,
+/// then its waiters see it ended. Interrupts are on, since the page
 /// tables', the frames' and the heap's locks may be held by a thread a
 /// tick preempted. Only the reaper calls this: a tick that preempts it
 /// while it holds one of those locks puts it back in the ready queue,
@@ -481,43 +563,24 @@ fn reap() {
         scheduler.threads -= 1;
         Some(thread)
     }) {
-        if let Some(stack) = thread.context.take().and_then(Arch::into_stack) {
-            paging::unmap_stack(stack);
-        }
+        free_stack(&mut thread);
+        drop(thread.space.take());
         if let Some(process) = thread.process.take() {
             process.close_handles();
+            process.reaped();
         }
-        if let Some(space) = thread.space.take().and_then(Arc::into_inner) {
-            space.destroy(&mut drop, &mut frames::free);
-        }
-    }
-}
-
-/// What a spawned thread runs.
-trait Run: Send {
-    /// Frees the box, then runs. A user thread's closure never returns, so
-    /// a box freed after the call, as calling a `Box<dyn FnOnce>` frees
-    /// it, would leak.
-    fn run(self: Box<Self>);
-}
-
-impl<F: FnOnce() + Send> Run for F {
-    fn run(self: Box<Self>) {
-        let run = {
-            let boxed = self;
-            *boxed
-        };
-        run();
     }
 }
 
 /// A spawned thread's entry.
 fn start(from: Context) -> ! {
     arrived(from);
-    let run = with(|scheduler| scheduler.running.as_mut()?.run.take());
+    let entry = with(|scheduler| scheduler.running.as_mut()?.entry.take());
     Arch::enable_interrupts();
-    if let Some(run) = run {
-        run.run();
+    match entry {
+        Some(Entry::Kernel(run)) => run(),
+        Some(Entry::User { ip, sp, arg }) => Arch::enter_user(ip, sp, arg),
+        None => {}
     }
     exit()
 }
@@ -580,6 +643,7 @@ mod tests {
     use thisos_hal::{BacktraceEnd, Probe, Trap};
 
     use super::*;
+    use crate::frames;
     use crate::testing::{self, spin_until};
 
     // Neither the spawned threads nor this one yields, so all three make
@@ -613,7 +677,12 @@ mod tests {
             STOP.store(false, Ordering::Relaxed);
             let free = frames::free_frames();
             let tables = paging::stack_table_frames();
-            let process = Process::new();
+            let Some(space) = paging::new_space() else {
+                panic!("no free frame for a space");
+            };
+            let Ok(process) = Process::new(Arc::new(space)) else {
+                panic!("no memory for a process");
+            };
             assert!(process.insert_self(Rights::READ).is_ok());
             spawn(|| {
                 while !STOP.load(Ordering::Relaxed) {

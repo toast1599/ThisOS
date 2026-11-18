@@ -21,3 +21,4 @@ The kernel parses one ELF file: `init`'s, from the bootloader's ramdisk. Every o
 - The kernel keeps a minimal ELF parser for `init` only. All program loading policy stays out of the kernel's ABI.
 - `init` holds the first loader. The syscalls for building another process's address space are needed by milestone 4.
 - Starting a process takes several syscalls in place of one. If that proves too slow, it gets a new record.
+- [0009](0009-process-building.md) has the syscalls milestone 4 gave this: a process owns its space and gets one thread and one handle when it starts.

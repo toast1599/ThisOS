@@ -1,5 +1,7 @@
 //! Building the kernel and its disk image.
 
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -7,7 +9,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde_json::Value;
 
 use crate::cmd::{cargo, output};
-use crate::{limine, root};
+use crate::{limine, ramdisk, root};
 
 /// The file in the image's FAT partition that holds the build ID.
 pub const BUILD_FILE: &str = "thisos-build.txt";
@@ -68,18 +70,37 @@ impl Arch {
     }
 
     /// Builds what the kernel's images carry as the loader's ramdisk and
-    /// returns its path: init's ELF file on x86_64, and nothing on aarch64,
-    /// which has no user mode yet (ADR 0006).
+    /// returns its path: on x86_64 a ustar archive of the programs in
+    /// [`ramdisk::PROGRAMS`], the same for every image, and nothing on
+    /// aarch64, which has no user mode yet (ADR 0006).
     pub fn ramdisk(self, release: bool) -> Result<Option<PathBuf>> {
         if self == Arch::Aarch64 {
             return Ok(None);
         }
         let mut cargo_build = cargo();
-        cargo_build.args(["build", "-p", "thisos-init", "--target", self.target()]);
+        cargo_build.arg("build");
+        for package in ramdisk::PROGRAMS {
+            cargo_build.args(["-p", package]);
+        }
+        cargo_build.args(["--target", self.target()]);
         if release {
             cargo_build.arg("--release");
         }
-        executable(&mut cargo_build, "thisos-init", false).map(Some)
+        let elfs = executables(&mut cargo_build, &ramdisk::PROGRAMS, false)?;
+        let mut files = Vec::new();
+        for (package, elf) in ramdisk::PROGRAMS.into_iter().zip(&elfs) {
+            let bytes = fs::read(elf).with_context(|| format!("reading {}", elf.display()))?;
+            files.push((ramdisk::name(package), bytes));
+        }
+        let files: Vec<(&str, &[u8])> = files
+            .iter()
+            .map(|(name, bytes)| (*name, bytes.as_slice()))
+            .collect();
+        let path = target_dir()?.join("thisos-ramdisk.tar");
+        let file =
+            fs::File::create(&path).with_context(|| format!("creating {}", path.display()))?;
+        ramdisk::write(&files, io::BufWriter::new(file))?;
+        Ok(Some(path))
     }
 
     /// What follows `thisos` in the names of its files in [`target_dir`]:
@@ -180,29 +201,45 @@ fn test_elf(arch: Arch, release: bool, build: &str) -> Result<PathBuf> {
 
 /// Runs `cargo_build`, a cargo build or test command, and returns the path
 /// of the one executable it reports for the target named `name`, a test
-/// binary when `test` is true. Cargo names it only in its JSON messages, and
-/// where it puts it depends on `CARGO_TARGET_DIR` and cargo's config.
+/// binary when `test` is true.
 fn executable(cargo_build: &mut Command, name: &str, test: bool) -> Result<PathBuf> {
+    let [elf] = executables(cargo_build, &[name], test)?
+        .try_into()
+        .unwrap_or_else(|_| unreachable!("one path per name"));
+    Ok(elf)
+}
+
+/// Runs `cargo_build` as [`executable`] does, and returns the path of the
+/// one executable it reports for each target in `names`, in that order.
+/// Cargo names them only in its JSON messages, and where it puts them
+/// depends on `CARGO_TARGET_DIR` and cargo's config.
+fn executables(cargo_build: &mut Command, names: &[&str], test: bool) -> Result<Vec<PathBuf>> {
     cargo_build
         .arg("--message-format=json-render-diagnostics")
         .stderr(Stdio::inherit());
     let messages = output(cargo_build)?;
-    let mut elfs = Vec::new();
+    let mut elfs = vec![Vec::new(); names.len()];
     for line in messages.lines() {
         let message: Value =
             serde_json::from_str(line).with_context(|| format!("cargo message {line:?}"))?;
         if message["reason"] == "compiler-artifact"
-            && message["target"]["name"] == name
             && message["profile"]["test"] == test
+            && let Some(i) = names
+                .iter()
+                .position(|&name| message["target"]["name"] == name)
             && let Some(elf) = message["executable"].as_str()
         {
-            elfs.push(PathBuf::from(elf));
+            elfs[i].push(PathBuf::from(elf));
         }
     }
-    match <[PathBuf; 1]>::try_from(elfs) {
-        Ok([elf]) => Ok(elf),
-        Err(elfs) => bail!("expected one executable for {name}, cargo built {elfs:?}"),
-    }
+    names
+        .iter()
+        .zip(elfs)
+        .map(|(name, elfs)| match <[PathBuf; 1]>::try_from(elfs) {
+            Ok([elf]) => Ok(elf),
+            Err(elfs) => bail!("expected one executable for {name}, cargo built {elfs:?}"),
+        })
+        .collect()
 }
 
 /// Cargo's target directory, `<root>/target` unless `CARGO_TARGET_DIR` or a

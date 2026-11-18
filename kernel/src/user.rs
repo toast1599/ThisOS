@@ -1,4 +1,4 @@
-//! User code: loading init from the ramdisk, and the traps user code
+//! User code: the ramdisk, starting init from it, and the traps user code
 //! raises, its syscalls and the faults that end it.
 
 use alloc::sync::Arc;
@@ -18,23 +18,18 @@ use thisos_hal::{
 
 use crate::channel::{self, ENDPOINT_RIGHTS, Endpoint};
 use crate::memory::{Mapping, MemoryObject};
-use crate::process::{End, Object, Process};
+use crate::paging::Space;
+use crate::process::{End, Object, PROCESS_RIGHTS, Process};
+use crate::wait::Waitable;
 use crate::{Arch, frames, paging, thread, wait};
 
 /// The size of a program's stack, which ends where user space does.
 const STACK_SIZE: u64 = 64 << 10;
 
-/// The rights of init's handle to itself.
-const INIT_RIGHTS: Rights = Rights::READ
-    .union(Rights::WRITE)
+/// The rights of a program's handle to the ramdisk.
+const RAMDISK_RIGHTS: Rights = Rights::READ
     .union(Rights::DUPLICATE)
     .union(Rights::TRANSFER);
-
-/// How the last user process to end ended, for tests to wait on. The trap
-/// handler takes the lock with interrupts off, so everything else must
-/// too.
-#[cfg(test)]
-static ENDED: Mutex<Option<End>> = Mutex::new(None);
 
 /// The records the last write syscall logged, joined by newlines, for
 /// tests. Taken with interrupts off.
@@ -67,44 +62,65 @@ impl fmt::Write for Written {
     }
 }
 
-/// The loader's ramdisk, which holds init's ELF file.
-static RAMDISK: Mutex<Option<&'static [u8]>> = Mutex::new(None);
+/// The loader's ramdisk: the ustar archive the kernel finds init in, and a
+/// memory object holding a copy, which programs read.
+struct Ramdisk {
+    archive: &'static [u8],
+    object: Arc<MemoryObject>,
+}
 
-/// Logs the size of the loader's ramdisk, and keeps it for [`start_init`].
+static RAMDISK: Mutex<Option<Ramdisk>> = Mutex::new(None);
+
+/// Logs the size of the loader's ramdisk, copies it into a memory object,
+/// and keeps both for [`start_init`]. Panics if there is no memory for the
+/// copy.
 pub fn init(ramdisk: Option<&'static [u8]>) {
-    match ramdisk {
-        Some(ramdisk) => log::info!("ramdisk is {} bytes", ramdisk.len()),
-        None => log::warn!("no ramdisk, so no init to run"),
+    let Some(archive) = ramdisk else {
+        log::warn!("no ramdisk, so no init to run");
+        return;
+    };
+    log::info!("ramdisk is {} bytes", archive.len());
+    let Ok(mut object) = MemoryObject::new(archive.len().div_ceil(4096)) else {
+        panic!("no memory for a copy of the {}-byte ramdisk", archive.len());
+    };
+    for (frame, bytes) in object.frames_mut().iter_mut().zip(archive.chunks(4096)) {
+        Arch::fill_frame(frame, 0, bytes);
     }
-    *RAMDISK.lock() = ramdisk;
+    *RAMDISK.lock() = Some(Ramdisk {
+        archive,
+        object: Arc::new(object),
+    });
+}
+
+/// The ramdisk's archive and its copy, if there is a ramdisk.
+fn ramdisk() -> Option<(&'static [u8], Arc<MemoryObject>)> {
+    let ramdisk = RAMDISK.lock();
+    let ramdisk = ramdisk.as_ref()?;
+    Some((ramdisk.archive, Arc::clone(&ramdisk.object)))
+}
+
+/// The file `name` in the ramdisk's `archive`. Panics if there is none, or
+/// the archive isn't one the kernel reads, since xtask builds both.
+fn ramdisk_file(archive: &'static [u8], name: &str) -> &'static [u8] {
+    match thisos_ustar::find(archive, name) {
+        Ok(Some(file)) => file,
+        Ok(None) => panic!("the ramdisk has no {name}"),
+        Err(e) => panic!("the ramdisk isn't an archive the kernel reads: {e:?}"),
+    }
 }
 
 /// Starts init from the ramdisk, if there is one. Panics if it doesn't
-/// load.
+/// start.
 pub fn start_init() {
-    let Some(ramdisk) = *RAMDISK.lock() else {
+    let Some((archive, object)) = ramdisk() else {
         return;
     };
-    match load(ramdisk) {
-        Ok(program) => {
-            let (process, handle) = new_init();
-            program.start(process, u64::from(handle));
-        }
-        Err(e) => panic!("loading init failed: {e}"),
+    if let Err(e) = start_program(ramdisk_file(archive, "init"), object) {
+        panic!("starting init failed: {e}");
     }
 }
 
-/// A process for init, holding a handle to itself with [`INIT_RIGHTS`],
-/// and that handle.
-fn new_init() -> (Arc<Process>, u32) {
-    let process = Process::new();
-    let Ok(handle) = process.insert_self(INIT_RIGHTS) else {
-        panic!("a new handle table is full");
-    };
-    (process, handle)
-}
-
-/// Why [`load`] failed.
+/// Why [`start_program`] failed.
 enum LoadError {
     /// The file isn't an executable the kernel loads.
     Elf(thisos_elf::Error),
@@ -112,6 +128,8 @@ enum LoadError {
     Map { addr: u64, kind: MapErrorKind },
     /// No memory was free.
     NoMemory,
+    /// The loaded program didn't start.
+    Start(Error),
 }
 
 impl fmt::Display for LoadError {
@@ -120,23 +138,49 @@ impl fmt::Display for LoadError {
             LoadError::Elf(e) => write!(f, "not an executable the kernel loads: {e:?}"),
             LoadError::Map { addr, kind } => write!(f, "mapping {addr:#x} failed: {kind:?}"),
             LoadError::NoMemory => write!(f, "no free memory"),
+            LoadError::Start(e) => write!(f, "starting it failed: {e:?}"),
         }
     }
 }
 
 /// A program loaded into an address space of its own, with a stack.
 struct Program {
-    space: Arc<paging::AddressSpace>,
+    space: Arc<Space>,
     entry: u64,
     stack_top: u64,
 }
 
-impl Program {
-    /// Starts the program in a thread of `process`, with `arg` as its
-    /// argument. Panics if kernel space or the frames run out.
-    fn start(self, process: Arc<Process>, arg: u64) {
-        thread::spawn_user(process, self.space, self.entry, self.stack_top, arg);
-    }
+/// Loads the executable in `file` and starts it in a process of its own,
+/// as a user-space loader starts one: its one handle is the receiving end
+/// of a channel whose other end is closed, where one message waits, with a
+/// handle to the process itself with [`PROCESS_RIGHTS`] and one to
+/// `ramdisk` with [`RAMDISK_RIGHTS`].
+fn start_program(file: &[u8], ramdisk: Arc<MemoryObject>) -> Result<Arc<Process>, LoadError> {
+    let program = load(file)?;
+    let process = Process::new(program.space).map_err(LoadError::Start)?;
+    let (ours, theirs) = channel::create().map_err(LoadError::Start)?;
+    let theirs = Arc::try_new(theirs).map_err(|_| LoadError::NoMemory)?;
+    let mut handles = Vec::new();
+    handles
+        .try_reserve_exact(2)
+        .map_err(|_| LoadError::NoMemory)?;
+    handles.push((Object::Process(Arc::clone(&process)), PROCESS_RIGHTS));
+    handles.push((Object::Memory(ramdisk), RAMDISK_RIGHTS));
+    // A new channel has room, and its other end is open.
+    ours.send(|| {
+        Ok(Message {
+            bytes: Vec::new(),
+            handles,
+        })
+    })
+    .map_err(LoadError::Start)?;
+    drop(ours);
+    process
+        .start(program.entry, program.stack_top, || {
+            Ok((Object::Channel(theirs), ENDPOINT_RIGHTS))
+        })
+        .map_err(LoadError::Start)?;
+    Ok(process)
 }
 
 /// Loads the executable in `file` into a new address space, with a zeroed
@@ -145,22 +189,18 @@ impl Program {
 fn load(file: &[u8]) -> Result<Program, LoadError> {
     let elf = Elf::new(file).map_err(LoadError::Elf)?;
     let space = paging::new_space().ok_or(LoadError::NoMemory)?;
-    match map_program(&elf, &space) {
-        Ok(stack_top) => Ok(Program {
-            space: Arc::new(space),
-            entry: elf.entry(),
-            stack_top,
-        }),
-        Err(e) => {
-            space.destroy(&mut drop, &mut frames::free);
-            Err(e)
-        }
-    }
+    // On failure the space drops, and destroys itself.
+    let stack_top = map_program(&elf, &space)?;
+    Ok(Program {
+        space: Arc::try_new(space).map_err(|_| LoadError::NoMemory)?,
+        entry: elf.entry(),
+        stack_top,
+    })
 }
 
 /// Maps `elf`'s segments and a stack into `space`, and returns the stack's
 /// top.
-fn map_program(elf: &Elf, space: &paging::AddressSpace) -> Result<u64, LoadError> {
+fn map_program(elf: &Elf, space: &Space) -> Result<u64, LoadError> {
     for segment in elf.segments() {
         // Elf::new rejects segments both writable and executable.
         let protection = if segment.executable {
@@ -178,6 +218,13 @@ fn map_program(elf: &Elf, space: &paging::AddressSpace) -> Result<u64, LoadError
         map_object(space, range.start, object, protection)?;
     }
     let top = space.user_space().end;
+    // User-space loaders put stacks there too.
+    #[cfg(target_arch = "x86_64")]
+    assert_eq!(
+        top,
+        thisos_abi::USER_SPACE_END,
+        "the HAL's user space ends elsewhere than the ABI says"
+    );
     let stack = new_object(STACK_SIZE)?;
     map_object(space, top - STACK_SIZE, stack, Protection::ReadWrite)?;
     Ok(top)
@@ -191,7 +238,7 @@ fn new_object(size: u64) -> Result<MemoryObject, LoadError> {
 
 /// Maps all of `object`, which nothing else holds, at `addr` in `space`.
 fn map_object(
-    space: &paging::AddressSpace,
+    space: &Space,
     addr: u64,
     object: MemoryObject,
     protection: Protection,
@@ -246,12 +293,19 @@ fn syscall(number: u64, args: [u64; 6]) -> Result<u64, Error> {
             .restrict(handle(args[0])?, rights(args[1])?)
             .map(|()| 0),
         Syscall::MemoryCreate => memory_create(args[0]),
-        Syscall::Map => map(args[0], args[1], args[2], args[3], args[4]),
+        Syscall::Map => map(&space(), args[0], args[1], args[2], args[3], args[4]),
         Syscall::Unmap => space().unmap(args[0]).map(|_| 0).ok_or(Error::BadAddress),
         Syscall::ChannelCreate => channel_create(),
         Syscall::Send => send(args[0], args[1], args[2], args[3], args[4]),
         Syscall::Receive => receive(args[0], args[1], args[2], args[3], args[4]),
         Syscall::Wait => wait(args[0], args[1], args[2]),
+        Syscall::ProcessCreate => process_create(),
+        Syscall::MapInto => target(args[0], Rights::WRITE)?
+            .map_into(|space| map(space, args[1], args[2], args[3], args[4], args[5])),
+        Syscall::ProcessStart => process_start(args[0], args[1], args[2], args[3]),
+        Syscall::ProcessEnd => target(args[0], Rights::READ)?.exit_status(),
+        Syscall::MemoryRead => memory_read(args[0], args[1], args[2], args[3]),
+        Syscall::MemoryWrite => memory_write(args[0], args[1], args[2], args[3]),
     }
 }
 
@@ -262,8 +316,6 @@ fn end(end: End) {
         End::Killed { trap, ip } => log::warn!("user process killed by {trap} at {ip:#x}"),
     }
     process().set_end(end);
-    #[cfg(test)]
-    Arch::without_interrupts(|| *ENDED.lock() = Some(end));
 }
 
 /// The running thread's process.
@@ -275,7 +327,7 @@ fn process() -> Arc<Process> {
 }
 
 /// The running thread's address space.
-fn space() -> Arc<paging::AddressSpace> {
+fn space() -> Arc<Space> {
     let Some(space) = thread::space() else {
         panic!("a kernel thread trapped as user code");
     };
@@ -312,8 +364,15 @@ fn memory_create(size: u64) -> Result<u64, Error> {
 }
 
 /// Maps `len` bytes of the memory object `handle` names from `offset` at
-/// `addr`, with the rights in `rights`, as the map syscall does.
-fn map(handle_arg: u64, offset: u64, len: u64, addr: u64, rights_arg: u64) -> Result<u64, Error> {
+/// `addr` in `space`, with the rights in `rights`, as the map syscall does.
+fn map(
+    space: &Space,
+    handle_arg: u64,
+    offset: u64,
+    len: u64,
+    addr: u64,
+    rights_arg: u64,
+) -> Result<u64, Error> {
     let (object, held) = process().get(handle(handle_arg)?)?;
     let Object::Memory(object) = object else {
         return Err(Error::WrongType);
@@ -343,7 +402,7 @@ fn map(handle_arg: u64, offset: u64, len: u64, addr: u64, rights_arg: u64) -> Re
         return Err(Error::OutOfRange);
     }
     let mapping = Mapping::new(object, protection)?;
-    space()
+    space
         .map(addr, mapping, first, pages, protection, &mut frames::alloc)
         .map_err(|e| match e.kind {
             MapErrorKind::Mapped => Error::AddressInUse,
@@ -354,6 +413,106 @@ fn map(handle_arg: u64, offset: u64, len: u64, addr: u64, rights_arg: u64) -> Re
             | MapErrorKind::OutOfRange => Error::BadAddress,
         })?;
     Ok(0)
+}
+
+/// The process `handle_arg` names, if its handle has `rights`.
+fn target(handle_arg: u64, rights: Rights) -> Result<Arc<Process>, Error> {
+    let (object, held) = process().get(handle(handle_arg)?)?;
+    let Object::Process(target) = object else {
+        return Err(Error::WrongType);
+    };
+    if !held.contains(rights) {
+        return Err(Error::AccessDenied);
+    }
+    Ok(target)
+}
+
+/// Makes a process with an empty address space, as the process-create
+/// syscall does, and returns a handle to it.
+fn process_create() -> Result<u64, Error> {
+    let space = paging::new_space().ok_or(Error::NoMemory)?;
+    let space = Arc::try_new(space).map_err(|_| Error::NoMemory)?;
+    let created = Process::new(space)?;
+    process()
+        .insert(Object::Process(created), PROCESS_RIGHTS)
+        .map(u64::from)
+}
+
+/// Starts the process `target_arg` names at `ip` with stack pointer `sp`,
+/// moving the caller's handle `start_arg` into it, as the process-start
+/// syscall does.
+fn process_start(target_arg: u64, ip: u64, sp: u64, start_arg: u64) -> Result<u64, Error> {
+    let target = target(target_arg, Rights::WRITE)?;
+    let start = handle(start_arg)?;
+    let caller = process();
+    target.start(ip, sp, || {
+        let mut taken = caller.take(&[start], |_, rights| {
+            if rights.contains(Rights::TRANSFER) {
+                Ok(())
+            } else {
+                Err(Error::AccessDenied)
+            }
+        })?;
+        let Some(taken) = taken.pop() else {
+            unreachable!("take took the one handle or failed");
+        };
+        Ok(taken)
+    })?;
+    Ok(0)
+}
+
+/// The memory object `handle_arg` names, if its handle has `rights`, and
+/// `offset` and `len` as sizes.
+fn memory(
+    handle_arg: u64,
+    rights: Rights,
+    offset: u64,
+    len: u64,
+) -> Result<(Arc<MemoryObject>, usize, usize), Error> {
+    let (object, held) = process().get(handle(handle_arg)?)?;
+    let Object::Memory(object) = object else {
+        return Err(Error::WrongType);
+    };
+    if !held.contains(rights) {
+        return Err(Error::AccessDenied);
+    }
+    let (Ok(offset), Ok(len)) = (usize::try_from(offset), usize::try_from(len)) else {
+        return Err(Error::OutOfRange);
+    };
+    Ok((object, offset, len))
+}
+
+/// `addr` plus `done`, or `None` past the end of the address space.
+fn at(addr: u64, done: usize) -> Option<u64> {
+    addr.checked_add(u64::try_from(done).ok()?)
+}
+
+/// Copies `len` bytes from `offset` in the memory object `handle_arg` names
+/// to `addr`, as the memory-read syscall does.
+fn memory_read(handle_arg: u64, offset: u64, addr: u64, len: u64) -> Result<u64, Error> {
+    let (object, offset, len) = memory(handle_arg, Rights::READ, offset, len)?;
+    let copied = object.read(offset, len, |done, piece| {
+        at(addr, done).is_some_and(|addr| copy_to_user(addr, piece))
+    })?;
+    if copied {
+        Ok(0)
+    } else {
+        Err(Error::BadAddress)
+    }
+}
+
+/// Copies `len` bytes from `addr` into the memory object `handle_arg` names
+/// from `offset`, as the memory-write syscall does.
+fn memory_write(handle_arg: u64, offset: u64, addr: u64, len: u64) -> Result<u64, Error> {
+    let (object, offset, len) = memory(handle_arg, Rights::WRITE, offset, len)?;
+    let copied = object.write(offset, len, |done, piece| {
+        at(addr, done).is_some_and(|addr| copy_from_user(addr, piece))
+    })?;
+    if copied {
+        Ok(0)
+    } else {
+        Err(Error::BadAddress)
+    }
 }
 
 /// Makes a channel, as the channel-create syscall does, and returns its
@@ -487,9 +646,13 @@ fn wait(items: u64, count_arg: u64, timeout: u64) -> Result<u64, Error> {
     for item in raw.as_chunks::<WAIT_ITEM_SIZE>().0 {
         let [handle, wanted] = [0, 4]
             .map(|at| u32::from_le_bytes([item[at], item[at + 1], item[at + 2], item[at + 3]]));
-        let endpoint = endpoint(u64::from(handle), Rights::READ)?;
+        let (object, held) = process().get(handle)?;
+        let object = Waitable::new(object).ok_or(Error::WrongType)?;
+        if !held.contains(Rights::READ) {
+            return Err(Error::AccessDenied);
+        }
         let wanted = Signals::from_bits(wanted).ok_or(Error::BadSignals)?;
-        waits.push((endpoint, wanted));
+        waits.push((object, wanted));
     }
     let mut observed = [Signals::NONE; MAX_WAIT_ITEMS];
     let observed = &mut observed[..count];
@@ -630,7 +793,7 @@ mod tests {
     /// Runs `program` in a new process and space, with its code in the
     /// first user page and a stack page after it, and the argument `arg`
     /// returns given the stack page's address and the process. Returns how
-    /// it ended and where its code was; see [`run_in`].
+    /// it ended and where its code was; see [`finish`].
     fn run(program: UserProgram, arg: impl FnOnce(u64, &Arc<Process>) -> u64) -> (End, u64) {
         run_with_stack(program, |stack, process| (Vec::new(), arg(stack, process)))
     }
@@ -655,8 +818,11 @@ mod tests {
         let Some(space) = paging::new_space() else {
             panic!("no free frame for a space");
         };
+        let space = Arc::new(space);
         let (code, stack) = place(space.user_space());
-        let process = Process::new();
+        let Ok(process) = Process::new(Arc::clone(&space)) else {
+            panic!("no memory for a process");
+        };
         let (bytes, arg) = setup(stack, &process);
         let mut code_object = page_object();
         Arch::write_user_program(&mut code_object.frames_mut()[0], program);
@@ -670,38 +836,53 @@ mod tests {
                 panic!("{e}");
             }
         }
-        let program = Program {
-            space: Arc::new(space),
-            entry: code,
-            stack_top: stack + 4096,
-        };
-        (run_in(program, before, &process, arg), code)
+        // The process and its thread hold the space from here, so that it
+        // goes with them.
+        drop(space);
+        let tables = paging::stack_table_frames();
+        process.start_with(code, stack + 4096, arg);
+        (finish(&process, before, tables, code), code)
     }
 
-    /// Starts `program` in `process` with `arg` as its argument, and
-    /// returns how it ended once its thread and space are freed. Checks
-    /// that the process recorded that end and closed its handles, and that
-    /// every frame taken since there were `before` free came back: those of
-    /// the space and its pages, and those of the thread's stack.
-    /// Kernel-space tables the stack needed stay, so those are taken off.
-    /// Meanwhile it checks that this thread, a kernel thread, runs on the
-    /// kernel's tables every time ticks switch back to it.
-    fn run_in(program: Program, before: usize, process: &Arc<Process>, arg: u64) -> End {
+    /// Runs the program `name` from the ramdisk as the kernel runs init,
+    /// and returns how it ended; see [`finish`].
+    fn run_program(name: &str) -> End {
+        let Some((archive, object)) = ramdisk() else {
+            panic!("no ramdisk");
+        };
+        let file = ramdisk_file(archive, name);
+        let entry = match Elf::new(file) {
+            Ok(elf) => elf.entry(),
+            Err(e) => panic!("{name} isn't an executable: {e:?}"),
+        };
+        let before = frames::free_frames();
         let tables = paging::stack_table_frames();
-        let entry = program.entry;
-        Arch::without_interrupts(|| *ENDED.lock() = None);
-        program.start(Arc::clone(process), arg);
-        spin_until("the user thread to end", || {
-            assert_eq!(Arch::translate_active(entry), None, "user code's page");
-            Arch::without_interrupts(|| ENDED.lock().is_some())
+        match start_program(file, object) {
+            Ok(process) => finish(&process, before, tables, entry),
+            Err(e) => panic!("starting {name} failed: {e}"),
+        }
+    }
+
+    /// Waits until `process`, whose code starts at `code`, has ended and
+    /// its thread is freed, and returns how it ended. Checks that it closed
+    /// its handles, and that every frame taken since there were `before`
+    /// free came back: those of its space and pages, and those of its
+    /// threads' stacks. Kernel-space tables the stacks needed, which
+    /// [`paging::stack_table_frames`] counted from `tables`, stay, so those
+    /// are taken off. Meanwhile it checks that this thread, a kernel
+    /// thread, runs on the kernel's tables every time ticks switch back to
+    /// it.
+    fn finish(process: &Arc<Process>, before: usize, tables: usize, code: u64) -> End {
+        spin_until("the user process to end", || {
+            assert_eq!(Arch::translate_active(code), None, "user code's page");
+            process.signals().contains(Signals::ENDED)
         });
         thread::wait_for_exits();
         let tables = paging::stack_table_frames() - tables;
         assert_eq!(frames::free_frames(), before - tables, "frames leaked");
-        let Some(end) = Arch::without_interrupts(|| *ENDED.lock()) else {
-            unreachable!("ENDED was set");
+        let Some(end) = process.end() else {
+            panic!("the process ended with no end recorded");
         };
-        assert_eq!(process.end(), Some(end));
         // Handles to itself are closed, and its thread is gone.
         assert_eq!(Arc::strong_count(process), 1);
         end
@@ -722,31 +903,27 @@ mod tests {
     }
 
     #[test_case]
-    fn init_loads_writes_and_exits() {
-        let Some(ramdisk) = *RAMDISK.lock() else {
-            panic!("no ramdisk");
-        };
+    fn init_starts_hello_and_fault_and_reports_their_ends() {
         take_written();
-        let before = frames::free_frames();
-        let program = match load(ramdisk) {
-            Ok(program) => program,
-            Err(e) => panic!("loading init failed: {e}"),
-        };
-        let (process, handle) = new_init();
-        assert_eq!(
-            run_in(program, before, &process, u64::from(handle)),
-            End::Exited(0)
-        );
+        assert_eq!(run_program("init"), End::Exited(0));
         assert_eq!(
             take_written(),
-            "hello from init, holding handle 0x10000; sent itself \"ping\" and 1 handle over a channel and waited for it"
+            "init: hello exited with status 0x5, fault was killed"
         );
+    }
+
+    // checks tests the process-building and memory-copy syscalls' error
+    // paths from Rust, and panics, exiting with 101, at the first that
+    // fails.
+    #[test_case]
+    fn the_process_and_memory_checks_pass() {
+        assert_eq!(run_program("checks"), End::Exited(0));
     }
 
     #[test_case]
     fn handle_syscalls_check_handles_and_rights() {
         let (end, _) = run(UserProgram::Handles, |_, process| {
-            let Ok(handle) = process.insert_self(INIT_RIGHTS) else {
+            let Ok(handle) = process.insert_self(PROCESS_RIGHTS) else {
                 panic!("a new handle table is full");
             };
             u64::from(handle)
@@ -757,7 +934,7 @@ mod tests {
     #[test_case]
     fn memory_syscalls_create_map_share_and_unmap() {
         let (end, _) = run(UserProgram::Memory, |_, process| {
-            let Ok(handle) = process.insert_self(INIT_RIGHTS) else {
+            let Ok(handle) = process.insert_self(PROCESS_RIGHTS) else {
                 panic!("a new handle table is full");
             };
             u64::from(handle)
@@ -768,7 +945,7 @@ mod tests {
     #[test_case]
     fn channel_syscalls_move_bytes_and_handles() {
         let (end, _) = run(UserProgram::Channel, |_, process| {
-            let Ok(handle) = process.insert_self(INIT_RIGHTS) else {
+            let Ok(handle) = process.insert_self(PROCESS_RIGHTS) else {
                 panic!("a new handle table is full");
             };
             u64::from(handle)
@@ -779,7 +956,7 @@ mod tests {
     #[test_case]
     fn wait_syscall_checks_its_items_and_observes_signals() {
         let (end, _) = run(UserProgram::Wait, |_, process| {
-            let Ok(handle) = process.insert_self(INIT_RIGHTS) else {
+            let Ok(handle) = process.insert_self(PROCESS_RIGHTS) else {
                 panic!("a new handle table is full");
             };
             u64::from(handle)

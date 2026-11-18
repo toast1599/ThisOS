@@ -25,11 +25,12 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration;
 
 pub use thisos_abi::{Error, Rights, Signals};
-pub use thisos_abi::{MAX_MESSAGE_BYTES, MAX_MESSAGE_HANDLES, MAX_WAIT_ITEMS};
+pub use thisos_abi::{MAX_MESSAGE_BYTES, MAX_MESSAGE_HANDLES, MAX_WAIT_ITEMS, USER_SPACE_END};
 use thisos_abi::{MAX_WRITE, Syscall};
 
-/// Makes `main`, a `fn(Handle<Process>) -> u64`, the program's main
-/// function. It gets the handle its creator started it with, and the
+/// Makes `main`, a `fn(Handle<Channel>) -> u64`, the program's main
+/// function. It gets the handle its creator started it with, by convention
+/// a channel endpoint over which the creator sends the rest, and the
 /// process ends through [`exit`] with the status it returns.
 #[macro_export]
 macro_rules! entry {
@@ -39,7 +40,7 @@ macro_rules! entry {
         const _: () = {
             #[unsafe(export_name = "__thisos_main")]
             fn __thisos_main(arg: u64) -> u64 {
-                let main: fn($crate::Handle<$crate::Process>) -> u64 = $main;
+                let main: fn($crate::Handle<$crate::Channel>) -> u64 = $main;
                 main($crate::Handle::__from_start(arg))
             }
         };
@@ -198,15 +199,81 @@ impl<T> Handle<T> {
     }
 }
 
-impl Handle<Process> {
-    /// The handle the kernel started the program with, in `arg`. Only
+impl Handle<Channel> {
+    /// The handle the program's creator started it with, in `arg`. Only
     /// [`entry!`] calls this.
     #[doc(hidden)]
-    pub fn __from_start(arg: u64) -> Handle<Process> {
+    pub fn __from_start(arg: u64) -> Handle<Channel> {
         let Ok(value) = u32::try_from(arg) else {
             panic!("the program started with {arg:#x}, which isn't a handle");
         };
         Handle::new(value)
+    }
+}
+
+impl Handle<Process> {
+    /// Makes a process with an empty address space and no thread, and
+    /// returns a handle to it with [`Rights::READ`], [`Rights::WRITE`],
+    /// [`Rights::DUPLICATE`] and [`Rights::TRANSFER`].
+    pub fn create() -> Result<Handle<Process>, Error> {
+        let value = syscall(Syscall::ProcessCreate, [])?;
+        Ok(Handle::from_kernel(value))
+    }
+
+    /// Maps `len` bytes of `memory` from `offset` at `addr` in the
+    /// process, with `rights`: [`Rights::READ`], with [`Rights::WRITE`] or
+    /// [`Rights::EXECUTE`] or neither. Works only before [`start`], and
+    /// needs [`Rights::WRITE`] here.
+    ///
+    /// [`start`]: Handle::start
+    pub fn map_into(
+        &self,
+        memory: &Handle<Memory>,
+        offset: usize,
+        len: usize,
+        addr: u64,
+        rights: Rights,
+    ) -> Result<(), Error> {
+        let (Ok(offset), Ok(len)) = (u64::try_from(offset), u64::try_from(len)) else {
+            unreachable!("x86_64 addresses are 64 bits");
+        };
+        syscall(
+            Syscall::MapInto,
+            [
+                u64::from(self.value),
+                u64::from(memory.value),
+                offset,
+                len,
+                addr,
+                u64::from(rights.bits()),
+            ],
+        )
+        .map(|_| ())
+    }
+
+    /// Starts the process with one thread at `ip`, with stack pointer `sp`,
+    /// and moves `handle`, which needs [`Rights::TRANSFER`], into it, where
+    /// the thread gets it as its argument. Needs [`Rights::WRITE`] here. On
+    /// failure nothing starts, and the handle comes back.
+    pub fn start<T>(&self, ip: u64, sp: u64, handle: Handle<T>) -> Result<(), (Error, Handle<T>)> {
+        match syscall(
+            Syscall::ProcessStart,
+            [u64::from(self.value), ip, sp, u64::from(handle.value)],
+        ) {
+            Ok(_) => {
+                // It moved to the process, so it no longer closes here.
+                handle.into_value();
+                Ok(())
+            }
+            Err(e) => Err((e, handle)),
+        }
+    }
+
+    /// The process's exit status, once it has [`Signals::ENDED`]. Needs
+    /// [`Rights::READ`]. Fails with [`Error::ShouldWait`] before that, and
+    /// with [`Error::Killed`] if a trap ended it.
+    pub fn exit_status(&self) -> Result<u64, Error> {
+        syscall(Syscall::ProcessEnd, [u64::from(self.value)])
     }
 }
 
@@ -224,15 +291,70 @@ impl Handle<Memory> {
         let Ok(size) = u64::try_from(size) else {
             unreachable!("x86_64 addresses are 64 bits");
         };
-        let value = syscall(Syscall::MemoryCreate, [size, 0, 0, 0, 0])?;
+        let value = syscall(Syscall::MemoryCreate, [size])?;
         Ok(Handle::from_kernel(value))
+    }
+
+    /// Copies the object's bytes from `offset` into `buf`. Needs
+    /// [`Rights::READ`]. Fails with [`Error::OutOfRange`] if they run past
+    /// the object's end.
+    pub fn read(&self, offset: usize, buf: &mut [u8]) -> Result<(), Error> {
+        let Ok(offset) = u64::try_from(offset) else {
+            unreachable!("x86_64 addresses are 64 bits");
+        };
+        let code;
+        // SAFETY: By ADR 0007, memory-read writes at most buf.len() bytes
+        // at buf.as_mut_ptr(), which buf holds, reads no user memory, and
+        // changes only RAX, RDX, RCX and R11.
+        unsafe {
+            asm!(
+                "syscall",
+                inlateout("rax") Syscall::MemoryRead.number() => code,
+                in("rdi") u64::from(self.value),
+                in("rsi") offset,
+                inlateout("rdx") buf.as_mut_ptr() => _,
+                in("r10") buf.len(),
+                lateout("rcx") _,
+                lateout("r11") _,
+                options(nostack),
+            );
+        }
+        result(code, 0).map(|_| ())
+    }
+
+    /// Copies `bytes` into the object from `offset`. Needs
+    /// [`Rights::WRITE`]. Fails with [`Error::OutOfRange`] if they run past
+    /// the object's end, and with [`Error::Conflict`] while the object is
+    /// mapped executable anywhere.
+    pub fn write(&self, offset: usize, bytes: &[u8]) -> Result<(), Error> {
+        let Ok(offset) = u64::try_from(offset) else {
+            unreachable!("x86_64 addresses are 64 bits");
+        };
+        let code;
+        // SAFETY: By ADR 0007, memory-write reads the bytes.len() bytes at
+        // bytes.as_ptr(), which bytes holds, writes no user memory, and
+        // changes only RAX, RDX, RCX and R11.
+        unsafe {
+            asm!(
+                "syscall",
+                inlateout("rax") Syscall::MemoryWrite.number() => code,
+                in("rdi") u64::from(self.value),
+                in("rsi") offset,
+                inlateout("rdx") bytes.as_ptr() => _,
+                in("r10") bytes.len(),
+                lateout("rcx") _,
+                lateout("r11") _,
+                options(nostack, readonly),
+            );
+        }
+        result(code, 0).map(|_| ())
     }
 }
 
 impl Handle<Channel> {
     /// Makes a channel, and returns its two endpoints.
     pub fn create() -> Result<(Handle<Channel>, Handle<Channel>), Error> {
-        let value = syscall(Syscall::ChannelCreate, [0; 5])?;
+        let value = syscall(Syscall::ChannelCreate, [])?;
         Ok((
             Handle::from_kernel(value & 0xffff_ffff),
             Handle::from_kernel(value >> 32),
@@ -327,8 +449,8 @@ impl Handle<Channel> {
     }
 }
 
-impl Handle<Channel> {
-    /// Waits until this endpoint has one of `signals`, for at most
+impl<T> Handle<T> {
+    /// Waits until this handle's object has one of `signals`, for at most
     /// `timeout`, or for good if it is `None`, and returns its signals;
     /// see [`wait`].
     pub fn wait(&self, signals: Signals, timeout: Option<Duration>) -> Result<Signals, Error> {
@@ -343,7 +465,7 @@ impl<T> Drop for Handle<T> {
         if self.value == 0 {
             return;
         }
-        if let Err(e) = syscall(Syscall::Close, [u64::from(self.value), 0, 0, 0, 0]) {
+        if let Err(e) = syscall(Syscall::Close, [u64::from(self.value)]) {
             panic!("closing handle {:#x} failed: {e:?}", self.value);
         }
     }
@@ -384,7 +506,7 @@ impl<'a> WaitItem<'a> {
 /// checks, and no items waits out the timeout. Fails with
 /// [`Error::TimedOut`] when the timeout passes, and with
 /// [`Error::TooLong`] for more than [`MAX_WAIT_ITEMS`] items. Each handle
-/// needs [`Rights::READ`]; only channel endpoints have signals.
+/// needs [`Rights::READ`]; channel endpoints and processes have signals.
 pub fn wait(items: &mut [WaitItem<'_>], timeout: Option<Duration>) -> Result<usize, Error> {
     if items.len() > MAX_WAIT_ITEMS {
         return Err(Error::TooLong);
@@ -431,10 +553,13 @@ pub fn wait(items: &mut [WaitItem<'_>], timeout: Option<Duration>) -> Result<usi
     Ok(ready)
 }
 
-/// Makes `number`, a syscall that takes at most five arguments, `args`,
-/// and reads, writes, maps and unmaps no user memory, and returns its
-/// value.
-fn syscall(number: Syscall, args: [u64; 5]) -> Result<u64, Error> {
+/// Makes `number`, a syscall that reads, writes, maps and unmaps no memory
+/// of this process, with `args` and zeros for the rest of its six
+/// arguments, and returns its value.
+fn syscall<const N: usize>(number: Syscall, args: [u64; N]) -> Result<u64, Error> {
+    const { assert!(N <= 6, "a syscall takes at most six arguments") };
+    let mut all = [0; 6];
+    all[..N].copy_from_slice(&args);
     let code;
     let value;
     // SAFETY: By ADR 0007, a syscall changes only RAX, RDX, RCX and R11,
@@ -443,11 +568,12 @@ fn syscall(number: Syscall, args: [u64; 5]) -> Result<u64, Error> {
         asm!(
             "syscall",
             inlateout("rax") number.number() => code,
-            in("rdi") args[0],
-            in("rsi") args[1],
-            inlateout("rdx") args[2] => value,
-            in("r10") args[3],
-            in("r8") args[4],
+            in("rdi") all[0],
+            in("rsi") all[1],
+            inlateout("rdx") all[2] => value,
+            in("r10") all[3],
+            in("r8") all[4],
+            in("r9") all[5],
             lateout("rcx") _,
             lateout("r11") _,
             options(nostack, nomem),

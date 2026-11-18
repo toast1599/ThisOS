@@ -72,11 +72,12 @@ fn init(boot: BootInfo<Arch>) {
     } else {
         log::warn!("framebuffer isn't write-combining, so the console may be slow");
     }
-    user::init(boot.ramdisk);
     frames::init(boot.memory);
     paging::init();
     trap::init();
     heap::init();
+    // Copying the ramdisk takes frames and the heap.
+    user::init(boot.ramdisk);
     thread::init();
     timer::init();
 }

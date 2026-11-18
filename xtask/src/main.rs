@@ -7,6 +7,7 @@ mod font;
 mod limine;
 mod lsblk;
 mod qemu;
+mod ramdisk;
 mod test;
 
 use std::path::{Path, PathBuf};

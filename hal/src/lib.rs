@@ -257,8 +257,9 @@ pub enum UserProgram {
     /// creating a channel succeeds; (2) waiting for its second endpoint to
     /// be readable, with a timeout of 0, fails with `TimedOut`; (3)
     /// waiting for a signal bit that no signal has fails with
-    /// `BadSignals`; (4) waiting on the process handle fails with
-    /// `WrongType`; (5) sending a byte on the first endpoint succeeds; (6)
+    /// `BadSignals`; (4) waiting on a new memory object, which has no
+    /// signals, fails with `WrongType`; (5) sending a byte on the first
+    /// endpoint succeeds; (6)
     /// waiting for either endpoint to be readable, for good, then returns
     /// 1 and observes the second readable and writable and the first only
     /// writable; (7) closing the first endpoint succeeds; (8) waiting 10 ms
@@ -411,6 +412,19 @@ pub trait Platform {
     /// Panics unless `bytes` fits in the frame from `offset`.
     fn fill_frame(frame: &mut Frame, offset: usize, bytes: &[u8]);
 
+    /// Copies `frame`'s bytes from `offset` into `buf`, reaching them
+    /// through the kernel's own mapping. The frame may be shared, and
+    /// mapped for user code: the kernel holds no reference into its bytes.
+    /// Panics if interrupts are on, since with them off nothing else runs
+    /// to write the frame during the copy, and unless `buf` fits in the
+    /// frame from `offset`.
+    fn read_frame(frame: &Frame, offset: usize, buf: &mut [u8]);
+
+    /// Copies `bytes` into `frame` from `offset`, leaving its other bytes
+    /// as they were, as [`read_frame`](Self::read_frame) copies the other
+    /// way. Panics as that does.
+    fn write_frame(frame: &Frame, offset: usize, bytes: &[u8]);
+
     /// Copies the bytes at `addr` in the address space the CPU uses into
     /// `buf`, reaching their frames through the kernel's own mapping, so
     /// the kernel never reaches user pages. Returns `false`, with `buf`
@@ -484,9 +498,15 @@ pub trait PageTables: Send {
     /// is aligned to the power of two at or above twice its size, so that
     /// an architecture can tell an overflow by one bit of the stack
     /// pointer. Stack addresses are never mapped again after
-    /// [`PageTables::unmap_stack`]. Panics if `alloc` or the stacks'
-    /// addresses run out.
-    fn map_stack(&mut self, size: usize, alloc: &mut dyn FnMut() -> Option<Frame>) -> Self::Stack;
+    /// [`PageTables::unmap_stack`], nor after a failed call. Returns
+    /// `None` if `alloc` or the stacks' addresses run out, having handed
+    /// the stack's frames it took to `free`; tables it added stay.
+    fn map_stack(
+        &mut self,
+        size: usize,
+        alloc: &mut dyn FnMut() -> Option<Frame>,
+        free: &mut dyn FnMut(Frame),
+    ) -> Option<Self::Stack>;
 
     /// Unmaps `stack` and hands each of its frames to `free`. The tables
     /// its pages needed stay.

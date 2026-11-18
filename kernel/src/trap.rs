@@ -11,7 +11,10 @@ pub fn init() {
     let mut count = 0;
     Arch::move_trap_stacks(&mut |size| {
         count += 1;
-        paging::map_stack(size)
+        let Some(stack) = paging::map_stack(size) else {
+            panic!("no frames for a trap stack");
+        };
+        stack
     });
     log::info!("trap stacks: {count}, each with a guard page");
 }

@@ -12,7 +12,9 @@ test = false
 bench = false
 
 [dependencies]
+thisos-elf.workspace = true
 thisos-rt.workspace = true
+thisos-ustar.workspace = true
 
 [lints]
 workspace = true

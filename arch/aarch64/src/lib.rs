@@ -219,6 +219,14 @@ impl Platform for Aarch64 {
         not_ported("Platform::fill_frame")
     }
 
+    fn read_frame(_: &Frame, _: usize, _: &mut [u8]) {
+        not_ported("Platform::read_frame")
+    }
+
+    fn write_frame(_: &Frame, _: usize, _: &[u8]) {
+        not_ported("Platform::write_frame")
+    }
+
     fn copy_from_user(_: u64, _: &mut [u8]) -> bool {
         not_ported("Platform::copy_from_user")
     }

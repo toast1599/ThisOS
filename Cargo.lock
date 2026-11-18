@@ -134,6 +134,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "thisos-checks"
+version = "0.0.0"
+dependencies = [
+ "thisos-rt",
+]
+
+[[package]]
 name = "thisos-console"
 version = "0.0.0"
 dependencies = [
@@ -143,6 +150,13 @@ dependencies = [
 [[package]]
 name = "thisos-elf"
 version = "0.0.0"
+
+[[package]]
+name = "thisos-fault"
+version = "0.0.0"
+dependencies = [
+ "thisos-rt",
+]
 
 [[package]]
 name = "thisos-fdt"
@@ -167,10 +181,19 @@ dependencies = [
 ]
 
 [[package]]
-name = "thisos-init"
+name = "thisos-hello"
 version = "0.0.0"
 dependencies = [
  "thisos-rt",
+]
+
+[[package]]
+name = "thisos-init"
+version = "0.0.0"
+dependencies = [
+ "thisos-elf",
+ "thisos-rt",
+ "thisos-ustar",
 ]
 
 [[package]]
@@ -189,6 +212,7 @@ dependencies = [
  "thisos-hal",
  "thisos-handles",
  "thisos-regions",
+ "thisos-ustar",
 ]
 
 [[package]]
@@ -207,6 +231,10 @@ dependencies = [
  "talc",
  "thisos-abi",
 ]
+
+[[package]]
+name = "thisos-ustar"
+version = "0.0.0"
 
 [[package]]
 name = "tock-registers"

@@ -796,7 +796,12 @@ impl thisos_hal::PageTables for KernelPageTables {
         unsafe { self.tables.unmap_page(page, flush_kernel_page) }
     }
 
-    fn map_stack(&mut self, size: usize, alloc: &mut dyn FnMut() -> Option<Frame>) -> Stack {
+    fn map_stack(
+        &mut self,
+        size: usize,
+        alloc: &mut dyn FnMut() -> Option<Frame>,
+        free: &mut dyn FnMut(Frame),
+    ) -> Option<Stack> {
         let size = to_u64(size.next_multiple_of(4096));
         let align = (2 * size).next_power_of_two();
         let window = stack_window(self.space);
@@ -804,21 +809,28 @@ impl thisos_hal::PageTables for KernelPageTables {
         // cursor, where nothing is mapped yet.
         let start = (self.stacks + 4096).next_multiple_of(align);
         let range = start..start + size;
-        assert!(
-            range.end <= window.end,
-            "the stacks' {} GiB are used up",
-            STACKS_SIZE >> 30
-        );
+        if range.end > window.end {
+            return None;
+        }
+        // A failed stack's addresses aren't mapped again either.
+        self.stacks = range.end;
         for page in range.clone().step_by(4096) {
             let Some(frame) = alloc() else {
-                panic!("no free frame for a stack");
+                self.unmap_stack(Stack { range: start..page }, free);
+                return None;
             };
             if let Err(e) = self.tables.map_page(page, frame, LEAF | PXN | UXN, alloc) {
-                panic!("mapping a stack page at {page:#x} failed: {:?}", e.kind);
+                assert_eq!(
+                    e.kind,
+                    MapErrorKind::NoFrames,
+                    "mapping a stack page at {page:#x} failed"
+                );
+                free(e.given);
+                self.unmap_stack(Stack { range: start..page }, free);
+                return None;
             }
         }
-        self.stacks = range.end;
-        Stack { range }
+        Some(Stack { range })
     }
 
     fn unmap_stack(&mut self, stack: Stack, free: &mut dyn FnMut(Frame)) {

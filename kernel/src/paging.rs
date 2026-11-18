@@ -3,7 +3,7 @@
 //! lock, and a handler that found it held by the code it interrupted would
 //! never return.
 
-use core::ops::Range;
+use core::ops::{Deref, Range};
 #[cfg(test)]
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -11,7 +11,7 @@ use spin::Mutex;
 use thisos_frames::Frame;
 #[cfg(test)]
 use thisos_hal::Translation;
-use thisos_hal::{MapError, PageTables as _, Platform};
+use thisos_hal::{AddressSpace as _, MapError, PageTables as _, Platform};
 
 use crate::memory::Mapping;
 use crate::{Arch, frames};
@@ -93,8 +93,34 @@ pub fn unmap(page: u64) -> Option<Frame> {
 
 /// A new address space with an empty lower half, or `None` if no frame is
 /// free.
-pub fn new_space() -> Option<AddressSpace> {
-    with(|kernel| kernel.tables.new_space(&mut frames::alloc))
+pub fn new_space() -> Option<Space> {
+    with(|kernel| kernel.tables.new_space(&mut frames::alloc)).map(|space| Space(Some(space)))
+}
+
+/// A user address space that destroys itself when it drops: its tables'
+/// frames go back to the allocator, and its mappings' holds on their
+/// objects go. A process and its threads share it, and whichever lets go
+/// last, the reaper or a process's last handle, destroys it, with
+/// interrupts on.
+pub struct Space(Option<AddressSpace>);
+
+impl Deref for Space {
+    type Target = AddressSpace;
+
+    fn deref(&self) -> &AddressSpace {
+        let Some(space) = &self.0 else {
+            unreachable!("only drop takes the space");
+        };
+        space
+    }
+}
+
+impl Drop for Space {
+    fn drop(&mut self) {
+        if let Some(space) = self.0.take() {
+            space.destroy(&mut drop, &mut frames::free);
+        }
+    }
 }
 
 /// Makes the CPU use the kernel's own tables, with an empty lower half.
@@ -111,21 +137,42 @@ pub fn activate() {
 
 /// Maps a stack of `size` bytes, rounded up to whole pages, writable and
 /// no-execute, with an unmapped page below it that an overflow runs into,
-/// as `PageTables::map_stack` does. Panics if the stacks' addresses or the
-/// frames run out.
-pub fn map_stack(size: usize) -> Stack {
-    let stack = with(|kernel| {
-        kernel.tables.map_stack(size, &mut || {
-            let frame = frames::alloc();
-            #[cfg(test)]
-            STACK_TABLE_FRAMES.fetch_add(usize::from(frame.is_some()), Ordering::Relaxed);
-            frame
-        })
-    });
-    // Every frame but the stack's own pages went to a table, which stays
-    // when the stack goes.
+/// as `PageTables::map_stack` does. Returns `None` if the stacks' addresses
+/// or the frames run out.
+pub fn map_stack(size: usize) -> Option<Stack> {
     #[cfg(test)]
-    STACK_TABLE_FRAMES.fetch_sub(size.div_ceil(4096), Ordering::Relaxed);
+    let (mut taken, mut freed) = (0, 0);
+    let stack = with(|kernel| {
+        kernel.tables.map_stack(
+            size,
+            &mut || {
+                let frame = frames::alloc();
+                #[cfg(test)]
+                {
+                    taken += usize::from(frame.is_some());
+                }
+                frame
+            },
+            &mut |frame| {
+                #[cfg(test)]
+                {
+                    freed += 1;
+                }
+                frames::free(frame);
+            },
+        )
+    });
+    // Every frame taken that the stack neither holds nor gave back went to
+    // a table, which stays when the stack goes.
+    #[cfg(test)]
+    {
+        let held = if stack.is_some() {
+            size.div_ceil(4096)
+        } else {
+            0
+        };
+        STACK_TABLE_FRAMES.fetch_add(taken - freed - held, Ordering::Relaxed);
+    }
     stack
 }
 
@@ -169,7 +216,7 @@ mod tests {
     use core::ptr;
     use core::sync::atomic::AtomicU64;
 
-    use thisos_hal::{Access, AddressSpace as _, MapErrorKind, Probe, Protection, Trap};
+    use thisos_hal::{Access, MapErrorKind, Probe, Protection, Trap};
 
     use super::*;
     use crate::memory::MemoryObject;
@@ -311,7 +358,7 @@ mod tests {
     }
 
     fn space() -> AddressSpace {
-        let Some(space) = new_space() else {
+        let Some(space) = with(|kernel| kernel.tables.new_space(&mut frames::alloc)) else {
             panic!("no free frame for a space");
         };
         space

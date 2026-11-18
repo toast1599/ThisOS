@@ -738,6 +738,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "thisos-ustar"
+version = "0.0.0"
+
+[[package]]
 name = "ttf-parser"
 version = "0.25.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -987,6 +991,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tar",
+ "thisos-ustar",
  "ureq",
 ]
 

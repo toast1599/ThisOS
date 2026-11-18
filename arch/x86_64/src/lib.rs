@@ -182,6 +182,14 @@ impl Platform for X86_64 {
         paging::fill_frame(phys_offset(), frame, offset, bytes);
     }
 
+    fn read_frame(frame: &Frame, offset: usize, buf: &mut [u8]) {
+        paging::read_frame(phys_offset(), frame, offset, buf);
+    }
+
+    fn write_frame(frame: &Frame, offset: usize, bytes: &[u8]) {
+        paging::write_frame(phys_offset(), frame, offset, bytes);
+    }
+
     fn copy_from_user(addr: u64, buf: &mut [u8]) -> bool {
         paging::copy_from_user(phys_offset(), addr, buf)
     }

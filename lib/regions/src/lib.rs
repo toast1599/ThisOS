@@ -108,6 +108,12 @@ impl Uses {
         Ok(())
     }
 
+    /// Whether a mapping is executable, so that writing the object's bytes
+    /// from outside would get around W^X as a writable mapping would.
+    pub fn executable(&self) -> bool {
+        self.executable > 0
+    }
+
     /// Stops counting a mapping that [`Uses::add`] counted with
     /// `protection`.
     pub fn remove(&mut self, protection: Protection) {
@@ -189,10 +195,13 @@ mod tests {
         uses.remove(Protection::ReadWrite);
         assert_eq!(uses.add(Protection::ReadExecute), Err(Error::Conflict));
         uses.remove(Protection::ReadWrite);
+        assert!(!uses.executable());
         uses.add(Protection::ReadExecute).unwrap();
+        assert!(uses.executable());
         assert_eq!(uses.add(Protection::ReadWrite), Err(Error::Conflict));
         uses.add(Protection::ReadOnly).unwrap();
         uses.remove(Protection::ReadExecute);
+        assert!(!uses.executable());
         uses.add(Protection::ReadWrite).unwrap();
     }
 }

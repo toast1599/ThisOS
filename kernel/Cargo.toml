@@ -26,6 +26,7 @@ thisos-frames.workspace = true
 thisos-handles.workspace = true
 thisos-regions.workspace = true
 thisos-hal.workspace = true
+thisos-ustar.workspace = true
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 thisos-arch-x86_64.workspace = true
