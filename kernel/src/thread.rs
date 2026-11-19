@@ -436,18 +436,12 @@ pub fn tick() {
     }
     with(|scheduler| {
         let now = timer::ticks();
-        let mut i = 0;
-        while i < scheduler.blocked.len() {
-            if scheduler.blocked[i]
-                .deadline
-                .is_some_and(|deadline| deadline <= now)
-            {
-                let mut thread = scheduler.blocked.remove(i);
-                thread.wake = Some(Wake::TimedOut);
-                scheduler.ready.push_back(thread);
-            } else {
-                i += 1;
-            }
+        let due =
+            |thread: &mut Box<Thread>| thread.deadline.is_some_and(|deadline| deadline <= now);
+        // One pass, since removing each one shifts the rest every time.
+        for mut thread in scheduler.blocked.extract_if(.., due) {
+            thread.wake = Some(Wake::TimedOut);
+            scheduler.ready.push_back(thread);
         }
     });
     switch(Place::Ready);
@@ -803,6 +797,51 @@ mod tests {
         let start = timer::ticks();
         sleep(10);
         assert!(timer::ticks() >= start + 10);
+    }
+
+    // The outer two of three parked threads time out on the same tick,
+    // so that tick has to take them from either side of the middle one,
+    // which has no deadline and stays parked.
+    #[test_case]
+    fn a_tick_wakes_only_the_threads_whose_deadline_passed() {
+        static DEADLINE: AtomicU64 = AtomicU64::new(0);
+        static IDS: [AtomicU64; 3] = [const { AtomicU64::new(u64::MAX) }; 3];
+        static WAKES: spin::Mutex<[Option<Wake>; 3]> = spin::Mutex::new([None; 3]);
+        // Far more than three spawns and parks take under TCG.
+        DEADLINE.store(timer::ticks() + 50, Ordering::Relaxed);
+        for (i, id) in IDS.iter().enumerate() {
+            spawn(move || {
+                id.store(super::id(), Ordering::Relaxed);
+                let wake = if i == 1 {
+                    park()
+                } else {
+                    park_until(DEADLINE.load(Ordering::Relaxed))
+                };
+                WAKES.lock()[i] = Some(wake);
+            });
+        }
+        spin_until("all three threads to park", || {
+            IDS.iter().all(|id| is_blocked(id.load(Ordering::Relaxed)))
+        });
+        assert!(
+            timer::ticks() < DEADLINE.load(Ordering::Relaxed),
+            "the deadline passed before all three parked"
+        );
+        spin_until("the outer threads to time out", || {
+            let wakes = WAKES.lock();
+            wakes[0].is_some() && wakes[2].is_some()
+        });
+        assert!(is_blocked(IDS[1].load(Ordering::Relaxed)));
+        unpark(IDS[1].load(Ordering::Relaxed));
+        wait_for_exits();
+        assert_eq!(
+            *WAKES.lock(),
+            [
+                Some(Wake::TimedOut),
+                Some(Wake::Unparked),
+                Some(Wake::TimedOut)
+            ]
+        );
     }
 
     // Shows the double fault's stack switch works from a thread's stack as
