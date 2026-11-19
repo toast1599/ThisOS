@@ -11,7 +11,6 @@ extern crate alloc;
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
-use core::mem;
 
 use thisos_abi::{Error, MAX_QUEUED, Signals};
 
@@ -49,20 +48,6 @@ pub struct Message<T> {
     pub bytes: Vec<u8>,
     /// What moved out of the sender's handle table.
     pub handles: Vec<T>,
-}
-
-/// The ids of the waiters a change to a channel wakes: every waiter on
-/// each endpoint whose [`Signals`] gained one, which the change took off
-/// that endpoint's list.
-#[derive(Debug, Default, PartialEq, Eq)]
-#[must_use = "a waiter that isn't woken may wait for good"]
-pub struct Woken([Vec<u64>; 2]);
-
-impl Woken {
-    /// The ids, an id once for each time it was added.
-    pub fn ids(&self) -> impl Iterator<Item = u64> + '_ {
-        self.0.iter().flatten().copied()
-    }
 }
 
 /// A channel's two queues, each holding at most [`MAX_QUEUED`] messages.
@@ -129,20 +114,21 @@ impl<T> Channel<T> {
     }
 
     /// Takes the waiters off each side that has a signal now that it
-    /// lacked in `before`.
-    fn woken(&mut self, before: [Signals; 2]) -> Woken {
-        let mut woken = Woken::default();
+    /// lacked in `before`, and calls `wake` with each, an id once for each
+    /// time it was added. The lists keep their room, so the next wait
+    /// doesn't allocate it again.
+    fn wake(&mut self, before: [Signals; 2], mut wake: impl FnMut(u64)) {
         for side in [Side::First, Side::Second] {
             let i = side.index();
             if !before[i].contains(self.signals(side)) {
-                woken.0[i] = mem::take(&mut self.waiters[i]);
+                self.waiters[i].drain(..).for_each(&mut wake);
             }
         }
-        woken
     }
 
-    /// Queues the message `make` returns at `from`'s peer, and returns the
-    /// waiters that wakes. Calls `make` only once the message has a place,
+    /// Queues the message `make` returns at `from`'s peer, and calls
+    /// `wake` with the waiters that wakes. Calls `make` only once the
+    /// message has a place,
     /// so a send that fails with [`Error::PeerClosed`],
     /// [`Error::ShouldWait`] if [`MAX_QUEUED`] messages wait there, or
     /// [`Error::NoMemory`], never calls it. A failure from `make` sends
@@ -151,7 +137,8 @@ impl<T> Channel<T> {
         &mut self,
         from: Side,
         make: impl FnOnce() -> Result<Message<T>, Error>,
-    ) -> Result<Woken, Error> {
+        wake: impl FnMut(u64),
+    ) -> Result<(), Error> {
         let before = self.both_signals();
         let to = from.peer();
         if self.closed[to.index()] {
@@ -163,11 +150,13 @@ impl<T> Channel<T> {
         }
         queue.try_reserve(1).map_err(|_| Error::NoMemory)?;
         queue.push_back(make()?);
-        Ok(self.woken(before))
+        self.wake(before, wake);
+        Ok(())
     }
 
-    /// Hands the oldest message waiting at `at` to `take`, and returns what
-    /// it returns and the waiters that wakes. A failed `take` hands the
+    /// Hands the oldest message waiting at `at` to `take`, returns what it
+    /// returns, and calls `wake` with the waiters that wakes. A failed
+    /// `take` hands the
     /// message back, and it stays the oldest. Fails with
     /// [`Error::ShouldWait`] if no message waits, or [`Error::PeerClosed`]
     /// if none waits and the peer is closed.
@@ -175,7 +164,8 @@ impl<T> Channel<T> {
         &mut self,
         at: Side,
         take: impl FnOnce(Message<T>) -> Result<R, (Error, Message<T>)>,
-    ) -> Result<(R, Woken), Error> {
+        wake: impl FnMut(u64),
+    ) -> Result<R, Error> {
         let before = self.both_signals();
         let Some(message) = self.queues[at.index()].pop_front() else {
             return Err(if self.closed[at.peer().index()] {
@@ -185,7 +175,10 @@ impl<T> Channel<T> {
             });
         };
         match take(message) {
-            Ok(taken) => Ok((taken, self.woken(before))),
+            Ok(taken) => {
+                self.wake(before, wake);
+                Ok(taken)
+            }
             Err((e, message)) => {
                 // Popping left its place free.
                 self.queues[at.index()].push_front(message);
@@ -194,14 +187,15 @@ impl<T> Channel<T> {
         }
     }
 
-    /// Closes `side`, and returns the waiters that wakes. The messages
+    /// Closes `side`, and calls `wake` with the waiters that wakes. The
+    /// messages
     /// waiting there stay until [`Channel::discard`] takes them, and
     /// messages it sent stay for its peer to receive. Closing it again
     /// wakes nobody.
-    pub fn close(&mut self, side: Side) -> Woken {
+    pub fn close(&mut self, side: Side, wake: impl FnMut(u64)) {
         let before = self.both_signals();
         self.closed[side.index()] = true;
-        self.woken(before)
+        self.wake(before, wake);
     }
 
     /// Takes the oldest message waiting at `side`, which must be closed,
@@ -233,12 +227,29 @@ mod tests {
     /// Sends a message of `byte` and `handles`, and returns the ids it
     /// woke.
     fn send(channel: &mut Channel<char>, from: Side, byte: u8, handles: &[char]) -> Vec<u64> {
-        let woken = channel.send(from, || Ok(message(byte, handles))).unwrap();
-        woken.ids().collect()
+        let mut woken = Vec::new();
+        channel
+            .send(from, || Ok(message(byte, handles)), |id| woken.push(id))
+            .unwrap();
+        woken
     }
 
     fn receive(channel: &mut Channel<char>, at: Side) -> Result<Message<char>, Error> {
-        channel.receive(at, Ok).map(|(message, _)| message)
+        channel.receive(at, Ok, |_| {})
+    }
+
+    /// Receives a message at `at`, and returns the ids it woke.
+    fn receive_waking(channel: &mut Channel<char>, at: Side) -> Vec<u64> {
+        let mut woken = Vec::new();
+        channel.receive(at, Ok, |id| woken.push(id)).unwrap();
+        woken
+    }
+
+    /// Closes `side`, and returns the ids it woke.
+    fn close(channel: &mut Channel<char>, side: Side) -> Vec<u64> {
+        let mut woken = Vec::new();
+        channel.close(side, |id| woken.push(id));
+        woken
     }
 
     fn fill(channel: &mut Channel<char>, from: Side) {
@@ -263,7 +274,11 @@ mod tests {
     fn a_full_queue_fails_without_making_the_message() {
         let mut channel = Channel::new();
         fill(&mut channel, Side::First);
-        let refused = channel.send(Side::First, || panic!("made a message for a full queue"));
+        let refused = channel.send(
+            Side::First,
+            || panic!("made a message for a full queue"),
+            |_| {},
+        );
         assert_eq!(refused, Err(Error::ShouldWait));
         // The other direction has its own room.
         send(&mut channel, Side::Second, 0, &[]);
@@ -274,7 +289,7 @@ mod tests {
     #[test]
     fn a_failed_make_sends_nothing() {
         let mut channel = Channel::new();
-        let sent = channel.send(Side::First, || Err(Error::AccessDenied));
+        let sent = channel.send(Side::First, || Err(Error::AccessDenied), |_| {});
         assert_eq!(sent, Err(Error::AccessDenied));
         assert_eq!(receive(&mut channel, Side::Second), Err(Error::ShouldWait));
     }
@@ -284,7 +299,11 @@ mod tests {
         let mut channel = Channel::new();
         send(&mut channel, Side::First, 1, &['a']);
         send(&mut channel, Side::First, 2, &[]);
-        let taken = channel.receive(Side::Second, |m| Err::<(), _>((Error::BadAddress, m)));
+        let taken = channel.receive(
+            Side::Second,
+            |m| Err::<(), _>((Error::BadAddress, m)),
+            |_| {},
+        );
         assert_eq!(taken, Err(Error::BadAddress));
         assert_eq!(receive(&mut channel, Side::Second), Ok(message(1, &['a'])));
     }
@@ -294,10 +313,14 @@ mod tests {
         let mut channel = Channel::new();
         send(&mut channel, Side::First, 1, &[]);
         send(&mut channel, Side::Second, 2, &['b']);
-        assert_eq!(channel.close(Side::First), Woken::default());
+        assert_eq!(close(&mut channel, Side::First), []);
         assert_eq!(channel.discard(Side::First), Some(message(2, &['b'])));
         assert_eq!(channel.discard(Side::First), None);
-        let refused = channel.send(Side::Second, || panic!("made a message for a closed peer"));
+        let refused = channel.send(
+            Side::Second,
+            || panic!("made a message for a closed peer"),
+            |_| {},
+        );
         assert_eq!(refused, Err(Error::PeerClosed));
         assert_eq!(receive(&mut channel, Side::Second), Ok(message(1, &[])));
         assert_eq!(receive(&mut channel, Side::Second), Err(Error::PeerClosed));
@@ -318,7 +341,7 @@ mod tests {
             channel.signals(Side::First),
             Signals::READABLE | Signals::WRITABLE
         );
-        drop(channel.close(Side::First));
+        close(&mut channel, Side::First);
         assert_eq!(
             channel.signals(Side::Second),
             Signals::READABLE | Signals::PEER_CLOSED
@@ -337,21 +360,31 @@ mod tests {
         assert_eq!(send(&mut channel, Side::First, 0, &[]), Vec::<u64>::new());
         // Second losing a message gains it nothing, nor First while its
         // peer's queue had room.
-        let (_, woken) = channel.receive(Side::Second, Ok).unwrap();
-        assert_eq!(woken, Woken::default());
+        assert_eq!(receive_waking(&mut channel, Side::Second), []);
         // First gains WRITABLE when its full peer's queue frees a place.
         let mut channel = Channel::new();
         fill(&mut channel, Side::First);
         channel.add_waiter(Side::First, 3).unwrap();
-        let (_, woken) = channel.receive(Side::Second, Ok).unwrap();
-        assert_eq!(woken.ids().collect::<Vec<_>>(), [3]);
+        assert_eq!(receive_waking(&mut channel, Side::Second), [3]);
         // A close wakes the peer, which gains PEER_CLOSED.
         channel.add_waiter(Side::Second, 4).unwrap();
         channel.add_waiter(Side::Second, 5).unwrap();
-        let woken = channel.close(Side::First);
-        let mut ids: Vec<_> = woken.ids().collect();
+        let mut ids = close(&mut channel, Side::First);
         ids.sort_unstable();
         assert_eq!(ids, [4, 5]);
+    }
+
+    // A list taken by a wake would make every wait allocate it again.
+    #[test]
+    fn a_wake_keeps_the_waiter_list() {
+        let mut channel = Channel::new();
+        for id in 0..4 {
+            channel.add_waiter(Side::Second, id).unwrap();
+        }
+        let capacity = channel.waiters[1].capacity();
+        assert_eq!(send(&mut channel, Side::First, 0, &[]), [0, 1, 2, 3]);
+        assert_eq!(channel.waiters[1], Vec::<u64>::new());
+        assert_eq!(channel.waiters[1].capacity(), capacity);
     }
 
     #[test]

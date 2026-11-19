@@ -1,14 +1,14 @@
 //! Channels: two endpoints sharing one [`Channel`] under one lock, so a
 //! send and its peer's close never race. An endpoint closes when the last
 //! hold on it goes: its one handle, or the message carrying it. A change
-//! that gives an endpoint a signal unparks the threads waiting on it, once
-//! the lock is released.
+//! that gives an endpoint a signal unparks the threads waiting on it under
+//! the lock, so the waiter lists keep their room.
 
 use alloc::sync::Arc;
 
 use spin::Mutex;
 use thisos_abi::{Error, Rights, Signals};
-use thisos_channels::{Channel, Message, Side, Woken};
+use thisos_channels::{Channel, Message, Side};
 
 use crate::process::Object;
 use crate::thread;
@@ -23,7 +23,7 @@ pub struct Endpoint {
     side: Side,
     /// Taken with interrupts on, and never by a trap handler: sending and
     /// receiving allocate, and take a process's handle-table lock inside
-    /// it.
+    /// it, and unparking takes the scheduler's.
     channel: Arc<Mutex<Channel<Carried>>>,
     /// The next endpoint on the stack of closed ones a drop drains, while
     /// this one is on it.
@@ -67,9 +67,7 @@ impl Endpoint {
         &self,
         make: impl FnOnce() -> Result<Message<Carried>, Error>,
     ) -> Result<(), Error> {
-        let woken = self.channel.lock().send(self.side, make)?;
-        wake(&woken);
-        Ok(())
+        self.channel.lock().send(self.side, make, thread::unpark)
     }
 
     /// Hands the oldest message waiting here to `take`; see
@@ -79,9 +77,7 @@ impl Endpoint {
         &self,
         take: impl FnOnce(Message<Carried>) -> Result<R, (Error, Message<Carried>)>,
     ) -> Result<R, Error> {
-        let (taken, woken) = self.channel.lock().receive(self.side, take)?;
-        wake(&woken);
-        Ok(taken)
+        self.channel.lock().receive(self.side, take, thread::unpark)
     }
 
     /// Adds the thread `id` to this endpoint's waiters, and returns its
@@ -97,14 +93,6 @@ impl Endpoint {
     }
 }
 
-/// Unparks the threads in `woken`. Their lists drop with it, after the
-/// channel's lock.
-fn wake(woken: &Woken) {
-    for id in woken.ids() {
-        thread::unpark(id);
-    }
-}
-
 impl Drop for Endpoint {
     /// Closes this side and drops what waited here. Endpoints in those
     /// messages that nothing else holds close too, and go on a stack
@@ -112,8 +100,7 @@ impl Drop for Endpoint {
     /// same loop. So a chain of endpoints each queued at the last drops at
     /// a constant stack depth, and nothing allocates.
     fn drop(&mut self) {
-        let woken = self.channel.lock().close(self.side);
-        wake(&woken);
+        self.channel.lock().close(self.side, thread::unpark);
         let mut stack = drain(&self.channel, self.side, None);
         while let Some(top) = stack {
             let Some(mut endpoint) = Arc::into_inner(top) else {
@@ -142,8 +129,7 @@ fn drain(
             if let Object::Channel(mut held) = object
                 && let Some(endpoint) = Arc::get_mut(&mut held)
             {
-                let woken = endpoint.channel.lock().close(endpoint.side);
-                wake(&woken);
+                endpoint.channel.lock().close(endpoint.side, thread::unpark);
                 endpoint.next = stack;
                 stack = Some(held);
             }
