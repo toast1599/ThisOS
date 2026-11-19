@@ -76,7 +76,8 @@ pub trait Test: Sync {
 }
 
 /// A `#[test_case]` const for a test that passes by panicking with a
-/// message that contains `message`. A panic ends the boot, so each runs on
+/// message that contains `message`, with no tick arriving while the panic
+/// handler runs. A panic ends the boot, so each runs on
 /// a boot of its own: the first after every other test, and each later one
 /// alone.
 pub struct ExpectPanic {
@@ -189,9 +190,9 @@ pub fn fail() -> ! {
 }
 
 /// Ends the run after a panic's report: with success when the running test
-/// expects a panic whose message contains what it names, and its `after`
-/// check holds if it has one, which also makes it the last, and with
-/// failure otherwise.
+/// expects a panic whose message contains what it names, its `after` check
+/// holds if it has one, and no tick arrives, which also makes it the last,
+/// and with failure otherwise.
 pub fn panicked(message: &dyn fmt::Display) -> ! {
     let passed = RUN.try_lock().is_some_and(|mut run| {
         let Some(run) = run.as_mut() else {
@@ -203,13 +204,28 @@ pub fn panicked(message: &dyn fmt::Display) -> ! {
         let passed = test
             .expected_panic()
             .is_some_and(|expected| contains(message, expected))
-            && test.after_panic().is_none_or(|after| after());
+            && test.after_panic().is_none_or(|after| after())
+            && quiet();
         if passed {
             run.current = run.tests.len();
         }
         passed
     });
     finish(passed)
+}
+
+/// Whether no tick arrives within [`MAX_SPINS`] spins, as none should
+/// while the panic handler runs. Says so if one does.
+fn quiet() -> bool {
+    let start = timer::ticks();
+    let ticked = (0..MAX_SPINS).any(|_| {
+        spin_loop();
+        timer::ticks() != start
+    });
+    if ticked {
+        logger::panic(format_args!("a tick arrived during the panic"), &"");
+    }
+    !ticked
 }
 
 /// Whether `message`, as far as its first 256 bytes, contains `part`.

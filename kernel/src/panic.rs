@@ -1,6 +1,8 @@
 //! The panic handler: reports the panic with a backtrace to both log sinks,
 //! then halts. In a test build it ends the test run with failure instead.
-//! Traps the kernel can't handle end the same way.
+//! Traps the kernel can't handle end the same way. Both run with
+//! interrupts off from their first instruction, so no other thread runs
+//! during the report, nor panics and halts before it is out.
 
 use core::fmt;
 use core::panic::PanicInfo;
@@ -14,21 +16,23 @@ static PANICKING: AtomicBool = AtomicBool::new(false);
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    enter();
-    let mut backtrace = Backtrace::new();
-    // Walked once, so both sinks show the same frames.
-    backtrace.end = Arch::backtrace(|address| backtrace.frames.push(address));
-    match info.location() {
-        Some(location) => logger::panic(
-            format_args!("PANIC at {location}: {}", info.message()),
-            &backtrace,
-        ),
-        None => logger::panic(format_args!("PANIC: {}", info.message()), &backtrace),
-    }
-    #[cfg(test)]
-    crate::testing::panicked(&info.message());
-    #[cfg(not(test))]
-    Arch::halt();
+    Arch::without_interrupts(|| {
+        enter();
+        let mut backtrace = Backtrace::new();
+        // Walked once, so both sinks show the same frames.
+        backtrace.end = Arch::backtrace(|address| backtrace.frames.push(address));
+        match info.location() {
+            Some(location) => logger::panic(
+                format_args!("PANIC at {location}: {}", info.message()),
+                &backtrace,
+            ),
+            None => logger::panic(format_args!("PANIC: {}", info.message()), &backtrace),
+        }
+        #[cfg(test)]
+        crate::testing::panicked(&info.message());
+        #[cfg(not(test))]
+        Arch::halt();
+    })
 }
 
 /// Reports `trap` as a panic, with the registers in `frame` and a backtrace
@@ -41,14 +45,16 @@ pub fn trap(trap: Trap, frame: &<Arch as Platform>::TrapFrame) -> ! {
 
 /// As [`trap`], with `head` in place of the trap's name.
 pub fn trapped(head: fmt::Arguments, frame: &<Arch as Platform>::TrapFrame) -> ! {
-    enter();
-    let mut backtrace = Backtrace::new();
-    backtrace.end = frame.backtrace(|address| backtrace.frames.push(address));
-    logger::panic(
-        format_args!("PANIC: {head}"),
-        &format_args!("{frame}{backtrace}"),
-    );
-    end()
+    Arch::without_interrupts(|| {
+        enter();
+        let mut backtrace = Backtrace::new();
+        backtrace.end = frame.backtrace(|address| backtrace.frames.push(address));
+        logger::panic(
+            format_args!("PANIC: {head}"),
+            &format_args!("{frame}{backtrace}"),
+        );
+        end()
+    })
 }
 
 fn enter() {
@@ -141,6 +147,17 @@ mod tests {
     use thisos_hal::{BacktraceEnd, Cpu};
 
     use crate::Arch;
+    use crate::testing::ExpectPanic;
+
+    // Interrupts are on here, so the runner's check that no tick arrives
+    // during the panic finds whether the handler turned them off.
+    #[test_case]
+    const A_PANIC_TURNS_INTERRUPTS_OFF: ExpectPanic = ExpectPanic {
+        name: "thisos_kernel::panic::tests::a_panic_turns_interrupts_off",
+        run: || panic!("panicked with interrupts on"),
+        message: "panicked with interrupts on",
+        after: None,
+    };
 
     #[test_case]
     fn backtrace_reaches_the_entry() {
