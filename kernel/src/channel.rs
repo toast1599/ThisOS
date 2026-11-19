@@ -25,6 +25,9 @@ pub struct Endpoint {
     /// receiving allocate, and take a process's handle-table lock inside
     /// it.
     channel: Arc<Mutex<Channel<Carried>>>,
+    /// The next endpoint on the stack of closed ones a drop drains, while
+    /// this one is on it.
+    next: Option<Arc<Endpoint>>,
 }
 
 /// A new channel's two endpoints. Fails with [`Error::NoMemory`].
@@ -33,10 +36,12 @@ pub fn create() -> Result<(Endpoint, Endpoint), Error> {
     let first = Endpoint {
         side: Side::First,
         channel: Arc::clone(&channel),
+        next: None,
     };
     let second = Endpoint {
         side: Side::Second,
         channel,
+        next: None,
     };
     Ok((first, second))
 }
@@ -102,22 +107,45 @@ fn wake(woken: &Woken) {
 
 impl Drop for Endpoint {
     /// Closes this side and drops what waited here. Endpoints in those
-    /// messages that nothing else holds close too, and what waited at them
-    /// joins the same queue, so a chain of endpoints each queued at the
-    /// last drops in a loop, not by recursing once per link.
+    /// messages that nothing else holds close too, and go on a stack
+    /// linked through the Arcs that held them, whose messages drop in the
+    /// same loop. So a chain of endpoints each queued at the last drops at
+    /// a constant stack depth, and nothing allocates.
     fn drop(&mut self) {
-        let (mut queued, woken) = self.channel.lock().close(self.side);
+        let woken = self.channel.lock().close(self.side);
         wake(&woken);
-        while let Some(message) = queued.pop_front() {
-            for (object, _) in message.handles {
-                if let Object::Channel(endpoint) = object
-                    && let Some(endpoint) = Arc::into_inner(endpoint)
-                {
-                    let (mut more, woken) = endpoint.channel.lock().close(endpoint.side);
-                    wake(&woken);
-                    queued.append(&mut more);
-                    // Its own drop now finds nothing queued.
-                }
+        let mut stack = drain(&self.channel, self.side, None);
+        while let Some(top) = stack {
+            let Some(mut endpoint) = Arc::into_inner(top) else {
+                panic!("an endpoint on the drop stack has another holder");
+            };
+            stack = drain(&endpoint.channel, endpoint.side, endpoint.next.take());
+            // Its own drop now finds nothing queued.
+        }
+    }
+}
+
+/// Drops the messages waiting at the closed `side` of `channel`, and
+/// returns `stack` with the endpoints in them that nothing else held
+/// pushed on, closed. Takes one message at a time, so that its objects
+/// drop after the channel's lock.
+fn drain(
+    channel: &Mutex<Channel<Carried>>,
+    side: Side,
+    mut stack: Option<Arc<Endpoint>>,
+) -> Option<Arc<Endpoint>> {
+    loop {
+        let Some(message) = channel.lock().discard(side) else {
+            return stack;
+        };
+        for (object, _) in message.handles {
+            if let Object::Channel(mut held) = object
+                && let Some(endpoint) = Arc::get_mut(&mut held)
+            {
+                let woken = endpoint.channel.lock().close(endpoint.side);
+                wake(&woken);
+                endpoint.next = stack;
+                stack = Some(held);
             }
         }
     }
@@ -128,6 +156,7 @@ mod tests {
     use alloc::vec;
     use alloc::vec::Vec;
 
+    use thisos_abi::MAX_QUEUED;
     use thisos_hal::Platform;
 
     use super::*;
@@ -171,6 +200,30 @@ mod tests {
         let filler = fill_heap();
         assert!(matches!(create(), Err(Error::NoMemory)));
         drop(filler);
+        assert_eq!(Arch::heap_stats().allocated, allocated);
+    }
+
+    #[test_case]
+    fn a_full_heap_drops_queued_endpoints() {
+        let allocated = Arch::heap_stats().allocated;
+        let (a, b) = pair();
+        let (c, d) = pair();
+        for _ in 0..MAX_QUEUED {
+            let empty = || {
+                Ok(Message {
+                    bytes: Vec::new(),
+                    handles: Vec::new(),
+                })
+            };
+            assert!(c.send(empty).is_ok());
+        }
+        assert!(a.send(|| Ok(carry(d))).is_ok());
+        drop(a);
+        let filler = fill_heap();
+        // b's close reaches d, and d's close drops what c sent.
+        drop(b);
+        drop(filler);
+        drop(c);
         assert_eq!(Arch::heap_stats().allocated, allocated);
     }
 

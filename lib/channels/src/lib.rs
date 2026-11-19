@@ -194,15 +194,20 @@ impl<T> Channel<T> {
         }
     }
 
-    /// Closes `side`, and returns the messages that waited there, which
-    /// nothing can receive now, and the waiters that wakes. Messages it
-    /// sent stay for its peer to receive. Closing it again returns
-    /// nothing.
-    pub fn close(&mut self, side: Side) -> (VecDeque<Message<T>>, Woken) {
+    /// Closes `side`, and returns the waiters that wakes. The messages
+    /// waiting there stay until [`Channel::discard`] takes them, and
+    /// messages it sent stay for its peer to receive. Closing it again
+    /// wakes nobody.
+    pub fn close(&mut self, side: Side) -> Woken {
         let before = self.both_signals();
         self.closed[side.index()] = true;
-        let queued = mem::take(&mut self.queues[side.index()]);
-        (queued, self.woken(before))
+        self.woken(before)
+    }
+
+    /// Takes the oldest message waiting at `side`, which must be closed,
+    /// so that taking it wakes nobody.
+    pub fn discard(&mut self, side: Side) -> Option<Message<T>> {
+        self.queues[side.index()].pop_front()
     }
 }
 
@@ -289,9 +294,9 @@ mod tests {
         let mut channel = Channel::new();
         send(&mut channel, Side::First, 1, &[]);
         send(&mut channel, Side::Second, 2, &['b']);
-        let (dropped, _) = channel.close(Side::First);
-        assert_eq!(dropped, [message(2, &['b'])]);
-        assert!(channel.close(Side::First).0.is_empty());
+        assert_eq!(channel.close(Side::First), Woken::default());
+        assert_eq!(channel.discard(Side::First), Some(message(2, &['b'])));
+        assert_eq!(channel.discard(Side::First), None);
         let refused = channel.send(Side::Second, || panic!("made a message for a closed peer"));
         assert_eq!(refused, Err(Error::PeerClosed));
         assert_eq!(receive(&mut channel, Side::Second), Ok(message(1, &[])));
@@ -343,7 +348,7 @@ mod tests {
         // A close wakes the peer, which gains PEER_CLOSED.
         channel.add_waiter(Side::Second, 4).unwrap();
         channel.add_waiter(Side::Second, 5).unwrap();
-        let (_, woken) = channel.close(Side::First);
+        let woken = channel.close(Side::First);
         let mut ids: Vec<_> = woken.ids().collect();
         ids.sort_unstable();
         assert_eq!(ids, [4, 5]);
