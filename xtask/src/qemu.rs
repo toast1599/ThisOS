@@ -11,17 +11,24 @@ use ovmf_prebuilt::{FileType, Prebuilt, Source};
 
 use crate::build::{self, Arch, Kernel};
 use crate::cmd::exec;
+use crate::ramdisk;
 
 const OVMF: Source = Source::EDK2_STABLE202605_R1;
 
-/// How long a test binary may run before QEMU is killed. TCG on a CI
-/// runner boots OVMF in well under this.
+/// How long one boot of a test binary may run before QEMU is killed. TCG
+/// on a CI runner boots OVMF in well under this.
 const TEST_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// The status QEMU exits with when the kernel reports success: through
-/// isa-debug-exit, (0x10 << 1) | 1, and through semihosting the same number,
-/// so that one constant covers both.
+/// The statuses QEMU exits with when the kernel reports success, and
+/// success with another panic-expecting test to boot for: through
+/// isa-debug-exit, (0x10 << 1) | 1 and (0x12 << 1) | 1, and through
+/// semihosting the same numbers, so that one constant covers both.
 const TEST_SUCCESS: i32 = 33;
+const TEST_SUCCESS_WITH_MORE: i32 = 37;
+
+/// The ramdisk file that tells a test kernel which panic-expecting test to
+/// run, by its place among them from 0.
+const PANIC_TEST_FILE: &str = "panic-test";
 
 /// Builds, then boots the image in QEMU with a window and serial on the
 /// terminal.
@@ -37,10 +44,48 @@ pub fn run(arch: Arch, release: bool, gdb: bool) -> Result<()> {
 
 /// Boots a kernel test ELF headless, with the file at `ramdisk` as the
 /// loader's ramdisk, as cargo's runner, and fails unless the kernel reports
-/// success before the timeout.
+/// success before the timeout. A kernel test runs one panic-expecting test
+/// per boot, so while the kernel reports another to run, this boots it
+/// again with a copy of the ramdisk that names the next.
 pub fn test(arch: Arch, ramdisk: Option<&Path>, elf: &Path) -> Result<()> {
+    let mut panic_test = 0;
+    while boot_test(arch, ramdisk, elf, panic_test)? {
+        panic_test += 1;
+        eprintln!(
+            "booting {} again for panic test {panic_test}",
+            elf.display()
+        );
+    }
+    Ok(())
+}
+
+/// Boots a kernel test ELF to run panic-expecting test `panic_test`, and
+/// returns whether the kernel reports another to run.
+fn boot_test(arch: Arch, ramdisk: Option<&Path>, elf: &Path, panic_test: u32) -> Result<bool> {
+    let ramdisk = match (ramdisk, panic_test) {
+        (ramdisk, 0) => ramdisk.map(Path::to_path_buf),
+        (Some(ramdisk), _) => {
+            let archive =
+                fs::read(ramdisk).with_context(|| format!("reading {}", ramdisk.display()))?;
+            let copy = with_extension(elf, "ramdisk.tar");
+            let out =
+                fs::File::create(&copy).with_context(|| format!("creating {}", copy.display()))?;
+            ramdisk::with_file(
+                &archive,
+                PANIC_TEST_FILE,
+                panic_test.to_string().as_bytes(),
+                out,
+            )?;
+            Some(copy)
+        }
+        (None, _) => bail!(
+            "{} has another panic test to run, but {} images carry no ramdisk to name it in",
+            elf.display(),
+            arch.name()
+        ),
+    };
     let image = with_extension(elf, "img");
-    arch.write_image(elf, ramdisk, None, &image)?;
+    arch.write_image(elf, ramdisk.as_deref(), None, &image)?;
 
     let mut qemu = qemu(arch, &image, &with_extension(elf, "vars.fd"))?;
     qemu.args(["-display", "none"]);
@@ -72,13 +117,15 @@ pub fn test(arch: Arch, ramdisk: Option<&Path>, elf: &Path) -> Result<()> {
         }
         thread::sleep(Duration::from_millis(100));
     };
-    if status.code() != Some(TEST_SUCCESS) {
-        bail!(
-            "{} failed: QEMU exited with {status}, and only {TEST_SUCCESS} is a pass",
+    match status.code() {
+        Some(TEST_SUCCESS) => Ok(false),
+        Some(TEST_SUCCESS_WITH_MORE) => Ok(true),
+        _ => bail!(
+            "{} failed: QEMU exited with {status}, and only {TEST_SUCCESS} and \
+             {TEST_SUCCESS_WITH_MORE} are passes",
             elf.display()
-        );
+        ),
     }
-    Ok(())
 }
 
 /// A QEMU command that boots `image` under OVMF, with serial on standard

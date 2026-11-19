@@ -188,6 +188,31 @@ pub enum Probe {
     ExecuteUser,
 }
 
+/// How a QEMU test boot ends, which [`Platform::exit_qemu`] reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TestEnd {
+    /// Its tests passed.
+    Passed,
+    /// A test failed.
+    Failed,
+    /// Its tests passed, and another panic-expecting test follows the one
+    /// it ran, for the next boot.
+    PassedWithMore,
+}
+
+impl TestEnd {
+    /// The status QEMU exits with: 33, 35 or 37. None is 0, because
+    /// x86_64's `-no-reboot` turns a triple fault into status 0.
+    #[must_use]
+    pub const fn status(self) -> u8 {
+        match self {
+            TestEnd::Passed => 33,
+            TestEnd::Failed => 35,
+            TestEnd::PassedWithMore => 37,
+        }
+    }
+}
+
 /// User code the architecture writes with [`Platform::write_user_program`],
 /// for tests that need code in user mode before anything loads programs.
 /// Each fits in its first page and runs from anywhere. The architecture
@@ -452,10 +477,10 @@ pub trait Platform {
     /// Writes `program` at the start of `frame`. For tests.
     fn write_user_program(frame: &mut Frame, program: UserProgram);
 
-    /// Ends a QEMU test run through QEMU's debug exit device, reporting
-    /// whether the tests passed. It touches the device only when it runs
-    /// under a hypervisor; on real hardware it only halts.
-    fn exit_qemu(success: bool) -> !;
+    /// Ends a QEMU test boot through QEMU's debug exit device, reporting
+    /// how it ended. It touches the device only when it runs under a
+    /// hypervisor; on real hardware it only halts.
+    fn exit_qemu(end: TestEnd) -> !;
 }
 
 /// The kernel's own page tables: the upper half every address space

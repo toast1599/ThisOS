@@ -32,7 +32,7 @@ use aarch64_cpu::asm::{barrier, wfi};
 use aarch64_cpu::registers::{DAIF, ReadWriteable, Readable, Writeable};
 use thisos_frames::Frame;
 use thisos_hal::{
-    BacktraceEnd, Cpu, Framebuffer, HeapStats, Platform, Probe, Stack, TimerFrequencies,
+    BacktraceEnd, Cpu, Framebuffer, HeapStats, Platform, Probe, Stack, TestEnd, TimerFrequencies,
     TimerFrequency, Translation, UserProgram,
 };
 
@@ -248,15 +248,15 @@ impl Platform for Aarch64 {
     }
 
     // Through semihosting's SYS_EXIT_EXTENDED, which QEMU turns into its
-    // exit status: 33 and 35, as x86_64's debug exit device gives. Without
+    // exit status, the same as x86_64's debug exit device gives. Without
     // -semihosting-config the hlt is undefined, and the panic path its trap
     // takes calls this again, which then only halts.
-    fn exit_qemu(success: bool) -> ! {
+    fn exit_qemu(end: TestEnd) -> ! {
         static EXITING: AtomicBool = AtomicBool::new(false);
         if devices::qemu_virt() && !EXITING.swap(true, Ordering::Relaxed) {
             const SYS_EXIT_EXTENDED: u64 = 0x20;
             const APPLICATION_EXIT: u64 = 0x2_0026;
-            let block = [APPLICATION_EXIT, if success { 33 } else { 35 }];
+            let block = [APPLICATION_EXIT, u64::from(end.status())];
             // SAFETY: Under QEMU with semihosting, the call reads the two
             // words at x1 and ends the process; without it, the hlt traps as
             // an undefined instruction, and EXITING keeps it from running

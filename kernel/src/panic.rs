@@ -6,7 +6,7 @@ use core::fmt;
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use thisos_hal::{BacktraceEnd, Cpu, MAX_FRAMES, Platform, Trap, TrapFrame};
+use thisos_hal::{BacktraceEnd, Cpu, MAX_FRAMES, Platform, TestEnd, Trap, TrapFrame};
 
 use crate::{Arch, logger};
 
@@ -68,7 +68,7 @@ fn end() -> ! {
 
 fn stop() -> ! {
     if cfg!(test) {
-        Arch::exit_qemu(false);
+        Arch::exit_qemu(TestEnd::Failed);
     }
     Arch::halt()
 }

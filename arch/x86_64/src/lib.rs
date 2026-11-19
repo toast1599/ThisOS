@@ -36,7 +36,7 @@ use bootloader_api::info::{FrameBuffer, PixelFormat};
 use once::Once;
 use thisos_frames::Frame;
 use thisos_hal::{
-    BacktraceEnd, BootInfo, Cpu, Framebuffer, HeapStats, Platform, Probe, Serial, Stack,
+    BacktraceEnd, BootInfo, Cpu, Framebuffer, HeapStats, Platform, Probe, Serial, Stack, TestEnd,
     TimerFrequencies, TimerFrequency, Translation, TrapHandler, UserProgram,
 };
 use uart_16550::backend::PioBackend;
@@ -244,13 +244,12 @@ impl Platform for X86_64 {
         tty.ok().map(Com1)
     }
 
-    fn exit_qemu(success: bool) -> ! {
+    fn exit_qemu(end: TestEnd) -> ! {
         // What 0xf4 decodes to on the laptop's chipset is unknown, so real
         // hardware never sees the write.
         if under_hypervisor() {
-            // QEMU exits with status (value << 1) | 1: 33 and 35. Success
-            // isn't 0 because -no-reboot turns a triple fault into status 0.
-            let value: u32 = if success { 0x10 } else { 0x11 };
+            // QEMU exits with status (value << 1) | 1.
+            let value = u32::from(end.status() >> 1);
             let mut port = Port::new(DEBUG_EXIT_PORT);
             // SAFETY: Under QEMU, 0xf4 is the isa-debug-exit device xtask
             // adds for test runs, and the write ends the process. Port I/O

@@ -1,10 +1,10 @@
 //! The ramdisk: a ustar archive of the user programs, which `thisos-ustar`
 //! reads in the kernel and in init.
 
-use std::io::Write;
+use std::io::{Read, Write};
 
 use anyhow::{Context, Result};
-use tar::{Builder, EntryType, Header};
+use tar::{Archive, Builder, EntryType, Header};
 
 /// The packages of the programs the ramdisk carries. Each is filed under
 /// its name without the `thisos-` prefix.
@@ -46,6 +46,34 @@ pub fn write(files: &[(&str, &[u8])], out: impl Write) -> Result<()> {
         .context("writing the ramdisk")
 }
 
+/// Writes the files of the archive `archive` and then `name` with `bytes`
+/// to `out`, as [`write`] does.
+pub fn with_file(archive: &[u8], name: &str, bytes: &[u8], out: impl Write) -> Result<()> {
+    let mut files = Vec::new();
+    for entry in Archive::new(archive)
+        .entries()
+        .context("reading the ramdisk")?
+    {
+        let mut entry = entry.context("reading the ramdisk")?;
+        let path = entry.path().context("reading a ramdisk name")?;
+        let path = path
+            .to_str()
+            .with_context(|| format!("the ramdisk name {} isn't UTF-8", path.display()))?
+            .to_owned();
+        let mut contents = Vec::new();
+        entry
+            .read_to_end(&mut contents)
+            .with_context(|| format!("reading {path} from the ramdisk"))?;
+        files.push((path, contents));
+    }
+    let mut all: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(path, contents)| (path.as_str(), contents.as_slice()))
+        .collect();
+    all.push((name, bytes));
+    write(&all, out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -65,5 +93,18 @@ mod tests {
             );
         }
         assert_eq!(thisos_ustar::find(&archive, "missing"), Ok(None));
+    }
+
+    #[test]
+    fn a_copy_with_a_file_keeps_the_others() {
+        let files: [(&str, &[u8]); 2] = [("init", b"\x7fELF init"), ("empty", b"")];
+        let mut archive = Vec::new();
+        write(&files, &mut archive).unwrap();
+        let mut copy = Vec::new();
+        with_file(&archive, "panic-test", b"1", &mut copy).unwrap();
+        for (name, bytes) in files {
+            assert_eq!(thisos_ustar::find(&copy, name), Ok(Some(bytes)), "{name}");
+        }
+        assert_eq!(thisos_ustar::find(&copy, "panic-test"), Ok(Some(&b"1"[..])));
     }
 }

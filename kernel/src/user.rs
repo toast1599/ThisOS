@@ -99,6 +99,17 @@ fn ramdisk() -> Option<(&'static [u8], Arc<MemoryObject>)> {
     Some((ramdisk.archive, Arc::clone(&ramdisk.object)))
 }
 
+/// The file `name` in the ramdisk, if there is a ramdisk and it holds one.
+/// Panics if the archive isn't one the kernel reads.
+#[cfg(test)]
+pub fn find_in_ramdisk(name: &str) -> Option<&'static [u8]> {
+    let archive = RAMDISK.lock().as_ref()?.archive;
+    match thisos_ustar::find(archive, name) {
+        Ok(file) => file,
+        Err(e) => panic!("the ramdisk isn't an archive the kernel reads: {e:?}"),
+    }
+}
+
 /// The file `name` in the ramdisk's `archive`. Panics if there is none, or
 /// the archive isn't one the kernel reads, since xtask builds both.
 fn ramdisk_file(archive: &'static [u8], name: &str) -> &'static [u8] {

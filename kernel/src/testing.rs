@@ -7,12 +7,12 @@
 use alloc::vec::Vec;
 use core::fmt::{self, Write};
 use core::hint::spin_loop;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use spin::Mutex;
-use thisos_hal::{Cpu, Platform, Probe, Trap, TrapFrame};
+use thisos_hal::{Cpu, Platform, Probe, TestEnd, Trap, TrapFrame};
 
-use crate::{Arch, logger, panic, timer};
+use crate::{Arch, logger, panic, timer, user};
 
 /// The tests and the index of the one running, or of none once all passed,
 /// for the panic handler's summary. `None` until the tests start.
@@ -22,11 +22,23 @@ static RUN: Mutex<Option<Run>> = Mutex::new(None);
 struct Run {
     tests: &'static [&'static dyn Test],
     current: usize,
-    /// The test that expects a panic, which runs after all the others.
+    /// The test that expects a panic that this boot runs, after all the
+    /// others.
     last: Option<usize>,
+    /// Whether this boot runs that test alone, as every boot but the first
+    /// does.
+    alone: bool,
     /// The tick the running test started at.
     started: u64,
 }
+
+/// The ramdisk file that holds which test that expects a panic a boot
+/// runs, by its place among them from 0, in decimal. xtask adds it to
+/// every boot's ramdisk but the first's.
+const PANIC_TEST_FILE: &str = "panic-test";
+
+/// How many tests this boot has started.
+static STARTED: AtomicUsize = AtomicUsize::new(0);
 
 /// How long a test may run, in seconds, before the watchdog stops it.
 const LIMIT: u64 = 10;
@@ -64,8 +76,9 @@ pub trait Test: Sync {
 }
 
 /// A `#[test_case]` const for a test that passes by panicking with a
-/// message that contains `message`. A panic ends the run, so the runner
-/// runs it after every other test, and allows only one.
+/// message that contains `message`. A panic ends the boot, so each runs on
+/// a boot of its own: the first after every other test, and each later one
+/// alone.
 pub struct ExpectPanic {
     /// The test's path, as a function's would read.
     pub name: &'static str,
@@ -106,29 +119,33 @@ impl<T: Fn() + Sync> Test for T {
     }
 }
 
-/// Runs the tests in order, the one that expects a panic last, then reports
-/// success. A failing test panics, and the panic handler calls
-/// [`panicked`].
+/// Runs the tests in order, then reports success. Of the tests that expect
+/// a panic it runs one, last: the one [`PANIC_TEST_FILE`] names, or the
+/// first, and for any but the first it runs no other test. A failing test
+/// panics, and the panic handler calls [`panicked`].
 pub fn run(tests: &'static [&'static dyn Test]) -> ! {
-    let mut panics = (0..tests.len()).filter(|&i| {
-        tests
-            .get(i)
-            .is_some_and(|test| test.expected_panic().is_some())
-    });
-    let last = panics.next();
+    let selected = panic_test();
+    let last = (0..tests.len())
+        .filter(|&i| expects_panic(tests, i))
+        .nth(selected);
     assert!(
-        panics.next().is_none(),
-        "at most one test may expect a panic, since a panic ends the run"
+        selected == 0 || last.is_some(),
+        "there is no panic test {selected}"
     );
-    let order = (0..tests.len()).filter(|&i| Some(i) != last).chain(last);
+    let alone = selected > 0;
+    let order = (0..tests.len())
+        .filter(|&i| !alone && !expects_panic(tests, i))
+        .chain(last);
     for (current, test) in order.filter_map(|i| Some((i, *tests.get(i)?))) {
         *RUN.lock() = Some(Run {
             tests,
             current,
             last,
+            alone,
             started: timer::ticks(),
         });
         log::info!("test {}", test.name());
+        STARTED.fetch_add(1, Ordering::Relaxed);
         test.run();
         assert!(
             Some(current) != last,
@@ -140,10 +157,30 @@ pub fn run(tests: &'static [&'static dyn Test]) -> ! {
         tests,
         current: tests.len(),
         last,
+        alone,
         started: timer::ticks(),
     });
     log::info!("{} tests passed", tests.len());
     finish(true)
+}
+
+/// Which test that expects a panic [`PANIC_TEST_FILE`] names, or 0 if the
+/// ramdisk has no such file.
+fn panic_test() -> usize {
+    let Some(file) = user::find_in_ramdisk(PANIC_TEST_FILE) else {
+        return 0;
+    };
+    let Some(selected) = str::from_utf8(file).ok().and_then(|s| s.parse().ok()) else {
+        panic!("the ramdisk's {PANIC_TEST_FILE} isn't a number");
+    };
+    selected
+}
+
+/// Whether test `i` expects a panic.
+fn expects_panic(tests: &[&dyn Test], i: usize) -> bool {
+    tests
+        .get(i)
+        .is_some_and(|test| test.expected_panic().is_some())
 }
 
 /// Names the failed test after its panic report, then reports failure.
@@ -326,8 +363,15 @@ fn finish(pass: bool) -> ! {
         }
         let summary = Summary { run, pass };
         logger::test_summary(&summary, &Brief(&summary), pass);
+        if pass && run.is_some_and(|run| run.more()) {
+            Arch::exit_qemu(TestEnd::PassedWithMore);
+        }
     }
-    Arch::exit_qemu(pass)
+    Arch::exit_qemu(if pass {
+        TestEnd::Passed
+    } else {
+        TestEnd::Failed
+    })
 }
 
 struct Summary {
@@ -388,18 +432,37 @@ impl fmt::Display for Brief<'_> {
 }
 
 impl Run {
-    /// What the summary says of test `i`. The tests ran in order, except the
-    /// one that expects a panic, which ran last.
+    /// What the summary says of test `i`.
     fn result(&self, i: usize) -> &'static str {
-        if self.current == self.tests.len() {
-            "ok"
-        } else if i == self.current {
-            "FAILED"
-        } else if Some(self.current) == self.last || (i < self.current && Some(i) != self.last) {
-            "ok"
-        } else {
-            "not run"
+        if i == self.current {
+            return "FAILED";
         }
+        let Some(place) = self.place(i) else {
+            return "not run";
+        };
+        let passed = self.current == self.tests.len()
+            || self
+                .place(self.current)
+                .is_some_and(|current| place < current);
+        if passed { "ok" } else { "not run" }
+    }
+
+    /// Where test `i` comes in this boot's order, if the boot runs it.
+    fn place(&self, i: usize) -> Option<usize> {
+        if Some(i) == self.last {
+            Some(self.tests.len())
+        } else if self.alone || expects_panic(self.tests, i) {
+            None
+        } else {
+            Some(i)
+        }
+    }
+
+    /// Whether another test that expects a panic follows the one this
+    /// boot runs.
+    fn more(&self) -> bool {
+        self.last
+            .is_some_and(|last| (last + 1..self.tests.len()).any(|i| expects_panic(self.tests, i)))
     }
 }
 
@@ -409,7 +472,9 @@ mod tests {
 
     use thisos_hal::Probe;
 
-    use super::{Brief, ExpectPanic, Run, Summary, Test};
+    use core::sync::atomic::Ordering;
+
+    use super::{Brief, ExpectPanic, Run, STARTED, Summary, Test};
 
     fn brief(run: Option<Run>, pass: bool) -> alloc::string::String {
         format!("{}", Brief(&Summary { run, pass }))
@@ -433,6 +498,7 @@ mod tests {
             tests: &TESTS,
             current,
             last: Some(3),
+            alone: false,
             started: 0,
         };
         let second = TESTS[1].name();
@@ -453,7 +519,22 @@ mod tests {
             brief(None, false),
             "summary: panic before the tests started\n"
         );
+        let alone = Run {
+            alone: true,
+            ..run(4)
+        };
+        assert_eq!(brief(Some(alone), true), "summary: 1 ok, 3 not run\n");
     }
+
+    // The logger's panic test comes first in the test list, so this one
+    // runs on a boot of its own, where it is the only test.
+    #[test_case]
+    const A_LATER_PANIC_TEST_RUNS_ALONE: ExpectPanic = ExpectPanic {
+        name: "thisos_kernel::testing::tests::a_later_panic_test_runs_alone",
+        run: || panic!("the second panic test"),
+        message: "the second panic test",
+        after: Some(|| STARTED.load(Ordering::Relaxed) == 1),
+    };
 
     // The watchdog's own report ends the run, so this stands in a 1 s
     // timeout for its 10 s one and checks the timer stops the probe.
