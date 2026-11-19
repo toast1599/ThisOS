@@ -868,14 +868,20 @@ mod tests {
     /// free came back: those of its space and pages, and those of its
     /// threads' stacks. Kernel-space tables the stacks needed, which
     /// [`paging::stack_table_frames`] counted from `tables`, stay, so those
-    /// are taken off. Meanwhile it checks that this thread, a kernel
-    /// thread, runs on the kernel's tables every time ticks switch back to
-    /// it.
+    /// are taken off. It blocks while it waits, so that a program that
+    /// passes the CPU back and forth, as ping and pong do, doesn't wait out
+    /// this thread's slice each time, and checks that this thread, a kernel
+    /// thread, runs on the kernel's tables when it wakes.
     fn finish(process: &Arc<Process>, before: usize, tables: usize, code: u64) -> End {
-        spin_until("the user process to end", || {
-            assert_eq!(Arch::translate_active(code), None, "user code's page");
-            process.signals().contains(Signals::ENDED)
-        });
+        // 9 s, under the watchdog's 10.
+        let items = [(Waitable::Process(Arc::clone(process)), Signals::ENDED)];
+        match wait::wait(&items, &mut [Signals::NONE], wait::deadline(9_000_000_000)) {
+            Ok(_) => {}
+            Err(Error::TimedOut) => panic!("the user process didn't end within 9 s"),
+            Err(e) => panic!("waiting for the user process to end failed: {e:?}"),
+        }
+        drop(items);
+        assert_eq!(Arch::translate_active(code), None, "user code's page");
         thread::wait_for_exits();
         let tables = paging::stack_table_frames() - tables;
         assert_eq!(frames::free_frames(), before - tables, "frames leaked");
@@ -902,12 +908,12 @@ mod tests {
     }
 
     #[test_case]
-    fn init_starts_hello_and_fault_and_reports_their_ends() {
+    fn init_starts_its_programs_and_reports_their_ends() {
         take_written();
         assert_eq!(run_program("init"), End::Exited(0));
         assert_eq!(
             take_written(),
-            "init: hello exited with status 0x5, fault was killed"
+            "init: hello exited with status 0x5, fault was killed, ping and pong exited with status 0x0"
         );
     }
 

@@ -186,12 +186,6 @@ impl Process {
         }
     }
 
-    /// The process's signals.
-    #[cfg(test)]
-    pub fn signals(&self) -> Signals {
-        signals(&self.life.lock())
-    }
-
     /// Adds `id` to the threads waiting for the process to end, and returns
     /// its signals. Fails with [`Error::NoMemory`].
     pub fn add_waiter(&self, id: u64) -> Result<Signals, Error> {

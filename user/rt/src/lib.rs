@@ -98,6 +98,41 @@ pub fn write(text: &str) -> Result<(), Error> {
     }
 }
 
+/// Makes a syscall that does next to nothing, close(0), which fails with
+/// [`Error::BadHandle`] since 0 is never a handle: the baseline a timing
+/// of other syscalls is set against. Panics if the kernel answers
+/// otherwise.
+pub fn null_syscall() {
+    match syscall(Syscall::Close, [0]) {
+        Err(Error::BadHandle) => {}
+        other => panic!("close(0) answered {other:?}"),
+    }
+}
+
+/// The CPU's time-stamp counter, which counts at [`tsc_hz`]. Reading it
+/// doesn't wait for earlier instructions to finish, which shifts a reading
+/// by tens of cycles at most.
+pub fn cycles() -> u64 {
+    // SAFETY: RDTSC reads a counter into registers and touches no memory.
+    // The kernel leaves CR4.TSD clear, so it works in ring 3; were it set,
+    // RDTSC would raise #GP, and the kernel would end the process.
+    unsafe { core::arch::x86_64::_rdtsc() }
+}
+
+/// How fast [`cycles`] counts: the crystal frequency in ECX of CPUID leaf
+/// 0x15 times the ratio EBX / EAX, or `None` where the leaf doesn't give
+/// all three, as under QEMU without KVM.
+pub fn tsc_hz() -> Option<u64> {
+    if core::arch::x86_64::__cpuid(0).eax < 0x15 {
+        return None;
+    }
+    let leaf = core::arch::x86_64::__cpuid(0x15);
+    if leaf.eax == 0 || leaf.ebx == 0 || leaf.ecx == 0 {
+        return None;
+    }
+    Some(u64::from(leaf.ecx) * u64::from(leaf.ebx) / u64::from(leaf.eax))
+}
+
 /// Makes the write syscall with `bytes`, and returns its error code.
 fn write_bytes(bytes: &[u8]) -> u64 {
     let error;
@@ -409,10 +444,28 @@ impl Handle<Channel> {
 
     /// Receives the oldest message waiting here: its bytes replace what
     /// `bytes` held, and its handles are returned. Needs [`Rights::READ`].
-    /// `bytes` grows to [`MAX_MESSAGE_BYTES`] for the call, so a loop that
-    /// reuses it allocates once, and is left empty on failure.
+    /// `bytes` grows to [`MAX_MESSAGE_BYTES`] for the call, zeroing what
+    /// grows, and is left empty on failure; a loop that receives many
+    /// messages calls [`receive_into`](Self::receive_into) instead.
     pub fn receive(&self, bytes: &mut Vec<u8>) -> Result<Vec<Handle<Unknown>>, Error> {
         bytes.resize(MAX_MESSAGE_BYTES, 0);
+        match self.receive_into(bytes) {
+            Ok((len, handles)) => {
+                bytes.truncate(len);
+                Ok(handles)
+            }
+            Err(e) => {
+                bytes.clear();
+                Err(e)
+            }
+        }
+    }
+
+    /// Receives the oldest message waiting here into the start of `bytes`,
+    /// and returns its length and its handles. Needs [`Rights::READ`].
+    /// Fails with [`Error::BufferTooSmall`], leaving the message queued,
+    /// when `bytes` is shorter than the message.
+    pub fn receive_into(&self, bytes: &mut [u8]) -> Result<(usize, Vec<Handle<Unknown>>), Error> {
         let mut values = [0u32; MAX_MESSAGE_HANDLES];
         let code;
         let value;
@@ -434,18 +487,20 @@ impl Handle<Channel> {
                 options(nostack),
             );
         }
-        let value = result(code, value).inspect_err(|_| bytes.clear())?;
+        let value = result(code, value)?;
         let (Ok(len), Ok(count)) = (
             usize::try_from(value & 0xffff_ffff),
             usize::try_from(value >> 32),
         ) else {
             unreachable!("x86_64 addresses are 64 bits");
         };
-        bytes.truncate(len);
         let Some(values) = values.get(..count) else {
             panic!("the kernel received {count} handles, more than a message holds");
         };
-        Ok(values.iter().map(|&value| Handle::new(value)).collect())
+        Ok((
+            len,
+            values.iter().map(|&value| Handle::new(value)).collect(),
+        ))
     }
 }
 

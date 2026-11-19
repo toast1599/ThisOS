@@ -221,6 +221,20 @@ name = "thisos-logring"
 version = "0.0.0"
 
 [[package]]
+name = "thisos-ping"
+version = "0.0.0"
+dependencies = [
+ "thisos-rt",
+]
+
+[[package]]
+name = "thisos-pong"
+version = "0.0.0"
+dependencies = [
+ "thisos-rt",
+]
+
+[[package]]
 name = "thisos-regions"
 version = "0.0.0"
 dependencies = [

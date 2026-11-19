@@ -8,10 +8,12 @@ use tar::{Builder, EntryType, Header};
 
 /// The packages of the programs the ramdisk carries. Each is filed under
 /// its name without the `thisos-` prefix.
-pub const PROGRAMS: [&str; 4] = [
+pub const PROGRAMS: [&str; 6] = [
     "thisos-init",
     "thisos-hello",
     "thisos-fault",
+    "thisos-ping",
+    "thisos-pong",
     "thisos-checks",
 ];
 
