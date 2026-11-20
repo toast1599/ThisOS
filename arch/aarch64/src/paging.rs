@@ -5,7 +5,6 @@
 //! on one entry, as on x86_64. The walker writes no entries today, since
 //! `TCR_EL1.HA` and HD stay off, but it would if they were ever turned on.
 
-use core::arch::asm;
 use core::marker::PhantomData;
 use core::ops::{Deref, Range};
 use core::ptr;
@@ -19,7 +18,7 @@ use thisos_hal::{MapError, MapErrorKind, Protection, Translation};
 use thisos_regions::{InsertError, Regions};
 
 use crate::heap::{self, Heap};
-use crate::{ptr_at, to_u64};
+use crate::{ptr_at, sysreg, to_u64};
 
 // Descriptor bits, for the 4 KiB granule.
 const VALID: u64 = 1 << 0;
@@ -394,41 +393,9 @@ impl Entry<'_> {
     }
 }
 
-/// Runs `tlbi <op>` on every CPU once the table stores before it are done,
-/// and waits until the entries are gone. With a page address, the
-/// instruction gets the page's number.
-macro_rules! tlbi {
-    ($op:literal) => {
-        // SAFETY: TLB maintenance only makes the CPUs walk the tables
-        // again; it reads and writes no memory the kernel uses.
-        unsafe {
-            asm!(
-                "dsb ishst",
-                concat!("tlbi ", $op),
-                "dsb ish",
-                "isb",
-                options(nostack, preserves_flags),
-            )
-        }
-    };
-    ($op:literal, $page:expr) => {
-        // SAFETY: As above.
-        unsafe {
-            asm!(
-                "dsb ishst",
-                concat!("tlbi ", $op, ", {}"),
-                "dsb ish",
-                "isb",
-                in(reg) ($page >> 12) & ((1 << 44) - 1),
-                options(nostack, preserves_flags),
-            )
-        }
-    };
-}
-
 /// Drops the global entry for kernel page `page` from every TLB.
 fn flush_kernel_page(page: u64) {
-    tlbi!("vaae1is", page);
+    sysreg::tlbi_vaae1is(page);
 }
 
 /// Drops every TLB entry of ASID 0, which every user space uses, and
@@ -437,12 +404,12 @@ fn flush_kernel_page(page: u64) {
 /// old values.
 fn flush_user() {
     barrier::isb(barrier::SY);
-    tlbi!("aside1is, xzr");
+    sysreg::tlbi_aside1is();
 }
 
 /// Drops the entry for user page `page`, in ASID 0, from every TLB.
 fn flush_user_page(page: u64) {
-    tlbi!("vae1is", page);
+    sysreg::tlbi_vae1is(page);
 }
 
 /// Turns TTBR0's walks off, so that the lower half is empty, and drops
@@ -634,7 +601,7 @@ pub unsafe fn take(
     let mair = MAIR_EL1.get() & !(0xffff << 16);
     // SAFETY: Limine's tables use attributes 0 and 1 alone, so changing 2
     // and 3 changes no live mapping.
-    unsafe { write_mair(mair | (MAIR_NON_CACHEABLE << 16) | (MAIR_DEVICE << 24)) };
+    unsafe { sysreg::write_mair(mair | (MAIR_NON_CACHEABLE << 16) | (MAIR_DEVICE << 24)) };
     // SAFETY: The new tables map every upper-half address to the same frame
     // as Limine's, with the same attributes apart from the global bit,
     // EL0 access, execute permissions and the framebuffer's cacheability,
@@ -653,7 +620,7 @@ pub unsafe fn take(
     // SAFETY: PAN only stops EL1 reaching EL0 pages, of which there are
     // none yet; the kernel never reaches one but through user copies, which
     // will clear PSTATE.PAN for it.
-    unsafe { enable_pan() };
+    unsafe { sysreg::enable_pan() };
     Some(KernelPageTables {
         tables,
         space,
@@ -678,83 +645,27 @@ unsafe fn load_kernel(level_0: u64) {
     // is only certain to see them after a dsb.
     barrier::dsb(ISHST);
     // SAFETY: The caller guarantees the table maps what the kernel reaches.
-    unsafe { write_ttbr1(level_0) };
+    unsafe { sysreg::write_ttbr1(level_0) };
     barrier::isb(barrier::SY);
     // QEMU models no TLB conflicts; hardware that does could raise one
     // between the switch and this flush for an address whose old and new
     // entries differ in the global bit, which needs the switch made from
     // tables that map the switching code alone.
-    tlbi!("vmalle1is");
-}
-
-/// Points `TTBR0_EL1` at the level 0 table at `table`, with ASID 0.
-///
-/// # Safety
-///
-/// While TTBR0's walks are on, the table must map nothing but frames it
-/// holds, so that the lower half reaches no memory the kernel uses
-/// otherwise.
-unsafe fn write_ttbr0(table: u64) {
-    // SAFETY: The caller guarantees what the table maps.
-    unsafe { asm!("msr ttbr0_el1, {}", in(reg) table, options(nostack, preserves_flags)) };
-}
-
-/// Points `TTBR1_EL1` at the level 0 table at `table`.
-///
-/// # Safety
-///
-/// The table must map everything the kernel reaches, as the kernel expects
-/// to reach it, executable where the kernel executes.
-unsafe fn write_ttbr1(table: u64) {
-    // SAFETY: The caller guarantees what the table maps.
-    unsafe { asm!("msr ttbr1_el1, {}", in(reg) table, options(nostack, preserves_flags)) };
+    sysreg::tlbi_vmalle1is();
 }
 
 /// Turns TTBR0's walks on or off with `TCR_EL1.EPD0` (bit 7).
 ///
 /// # Safety
 ///
-/// Turning them on needs TTBR0 to hold a table that `write_ttbr0`'s
+/// Turning them on needs TTBR0 to hold a table that `sysreg::write_ttbr0`'s
 /// contract covers.
 unsafe fn set_ttbr0_walks(on: bool) {
     let tcr = TCR_EL1.get();
     let tcr = if on { tcr & !(1 << 7) } else { tcr | (1 << 7) };
-    // SAFETY: Only EPD0 changes, as the caller allows.
-    unsafe { asm!("msr tcr_el1, {}", in(reg) tcr, options(nostack, preserves_flags)) };
-}
-
-/// Writes `value` to `MAIR_EL1`.
-///
-/// # Safety
-///
-/// Every attribute index a live mapping uses must keep its memory type, or
-/// its TLB entries must be dropped before anything reaches it again.
-unsafe fn write_mair(value: u64) {
-    // SAFETY: The caller guarantees no live mapping changes type.
-    unsafe { asm!("msr mair_el1, {}", in(reg) value, options(nostack, preserves_flags)) };
-}
-
-/// Sets PSTATE.PAN, and makes every exception taken to EL1 set it too.
-///
-/// # Safety
-///
-/// Nothing at EL1 may be using EL0 pages without clearing PAN itself.
-unsafe fn enable_pan() {
-    // SAFETY: Clearing SCTLR_EL1.SPAN (bit 23) only changes what an
-    // exception does to PSTATE.PAN, and setting PAN only stops EL1 reaching
-    // EL0 pages, which the caller guarantees nothing does.
-    unsafe {
-        asm!(
-            "mrs {tmp}, sctlr_el1",
-            "bic {tmp}, {tmp}, #(1 << 23)",
-            "msr sctlr_el1, {tmp}",
-            ".arch_extension pan",
-            "msr pan, #1",
-            "isb",
-            tmp = out(reg) _,
-            options(nostack, preserves_flags),
-        );
-    }
+    // SAFETY: Only EPD0 changes, and the caller guarantees TTBR0's table
+    // when it turns the walks on.
+    unsafe { sysreg::write_tcr(tcr) };
 }
 
 /// The first address that level 0 entry `index` of the upper half maps.
@@ -1060,7 +971,7 @@ impl<O: Deref<Target = [Frame]> + Send + Sync> thisos_hal::AddressSpace<O> for U
     fn activate(&self) {
         // SAFETY: Only map maps in the space, with frames its mappings'
         // objects hold until the pages are gone.
-        unsafe { write_ttbr0(self.tables.level_0) };
+        unsafe { sysreg::write_ttbr0(self.tables.level_0) };
         // Without it the TCR write could take effect first, and walks
         // would start from the TTBR0 a destroyed space left.
         barrier::isb(barrier::SY);
@@ -1114,20 +1025,7 @@ pub fn write_return(phys_offset: u64, frame: &mut Frame) {
     // the frames it maps, so neither maps this one: nothing maps it but the
     // physical-memory mapping, and no Rust reference to its memory exists.
     unsafe { word.write_volatile(0xd65f_03c0) };
-    // SAFETY: Cleaning the data cache line to the point of unification and
-    // invalidating the instruction cache change no memory, only which copy
-    // of it an instruction fetch sees.
-    unsafe {
-        asm!(
-            "dc cvau, {}",
-            "dsb ish",
-            "ic ialluis",
-            "dsb ish",
-            "isb",
-            in(reg) word,
-            options(nostack, preserves_flags),
-        );
-    }
+    sysreg::sync_icache(to_u64(word.addr()));
 }
 
 /// Writes back and drops every data cache line that holds part of the
@@ -1139,16 +1037,13 @@ pub fn write_return(phys_offset: u64, frame: &mut Frame) {
 ///
 /// `range` must be mapped.
 unsafe fn clean(range: Range<u64>) {
-    let ctr: u64;
-    // SAFETY: Reading CTR_EL0 into a register changes nothing.
-    unsafe { asm!("mrs {}, ctr_el0", out(reg) ctr, options(nomem, nostack, preserves_flags)) };
     // DminLine, bits 19:16, is the smallest data cache line in words.
-    let line = 4 << ((ctr >> 16) & 0xf);
+    let line = 4 << ((sysreg::read_ctr() >> 16) & 0xf);
     let mut addr = range.start & !(line - 1);
     while addr < range.end {
-        // SAFETY: Cleaning and invalidating a line writes back what the
-        // cache holds of a mapped address, and changes no memory's value.
-        unsafe { asm!("dc civac, {}", in(reg) addr, options(nostack, preserves_flags)) };
+        // SAFETY: The caller guarantees range is mapped, and the line
+        // holding addr overlaps it, so lies in the same pages.
+        unsafe { sysreg::dc_civac(addr) };
         addr += line;
     }
     barrier::dsb(ISH);

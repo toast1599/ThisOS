@@ -2,7 +2,6 @@
 //! interface's system registers. Only the virtual timer's interrupt is
 //! enabled; every other private and shared interrupt stays off.
 
-use core::arch::asm;
 use core::hint::spin_loop;
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -10,7 +9,7 @@ use aarch64_cpu::asm::barrier;
 use aarch64_cpu::registers::{MPIDR_EL1, Readable};
 
 use crate::devices::{DISTRIBUTOR_SIZE, Devices, REDISTRIBUTOR_SIZE};
-use crate::ptr_at;
+use crate::{ptr_at, sysreg};
 
 // Distributor registers.
 const GICD_CTLR: u64 = 0x0;
@@ -166,55 +165,19 @@ pub fn init(phys_offset: u64, devices: &Devices) {
     redistributor.write(priority, priorities | (PRIORITY << shift));
     redistributor.write(GICR_ISENABLER0, timer);
 
-    // SAFETY: Setting ICC_SRE_EL1.SRE (S3_0_C12_C12_5, bit 0) only switches
-    // the CPU interface to the system registers that the rest of this
-    // module uses.
-    unsafe {
-        asm!(
-            "mrs {tmp}, S3_0_C12_C12_5",
-            "orr {tmp}, {tmp}, #1",
-            "msr S3_0_C12_C12_5, {tmp}",
-            "isb",
-            tmp = out(reg) _,
-            options(nostack, preserves_flags),
-        );
-    }
-    let sre: u64;
-    // SAFETY: Reading ICC_SRE_EL1 changes nothing.
-    unsafe {
-        asm!("mrs {}, S3_0_C12_C12_5", out(reg) sre, options(nomem, nostack, preserves_flags));
-    }
-    assert!(sre & 1 != 0, "EL2 keeps the GIC's system registers off");
-    // SAFETY: ICC_PMR_EL1 (S3_0_C4_C6_0) at 0xff lets every priority
-    // through; interrupts stay masked in DAIF until the kernel turns them
-    // on.
-    unsafe {
-        asm!("msr S3_0_C4_C6_0, {}", in(reg) 0xff_u64, options(nomem, nostack, preserves_flags));
-    }
-    // SAFETY: ICC_BPR1_EL1 (S3_0_C12_C12_3) at 0 only decides which
-    // priorities preempt each other, and the kernel never nests interrupts.
-    unsafe {
-        asm!(
-            "msr S3_0_C12_C12_3, xzr",
-            options(nomem, nostack, preserves_flags)
-        );
-    }
-    // SAFETY: Clearing ICC_CTLR_EL1.EOImode (S3_0_C12_C12_4, bit 1) makes a
-    // write to EOIR deactivate the interrupt too, as end expects.
-    unsafe {
-        asm!(
-            "mrs {tmp}, S3_0_C12_C12_4",
-            "bic {tmp}, {tmp}, #2",
-            "msr S3_0_C12_C12_4, {tmp}",
-            tmp = out(reg) _,
-            options(nostack, preserves_flags),
-        );
-    }
-    // SAFETY: Setting ICC_IGRPEN1_EL1 (S3_0_C12_C12_7) lets group 1
-    // interrupts reach this CPU, still masked in DAIF.
-    unsafe {
-        asm!("msr S3_0_C12_C12_7, {}", in(reg) 1_u64, options(nomem, nostack, preserves_flags));
-    }
+    sysreg::enable_icc_sre();
+    assert!(
+        sysreg::read_icc_sre() & 1 != 0,
+        "EL2 keeps the GIC's system registers off"
+    );
+    // SAFETY: 0xff lets every priority through; interrupts stay masked in
+    // DAIF until the kernel turns them on.
+    unsafe { sysreg::write_icc_pmr(0xff) };
+    sysreg::clear_icc_bpr1();
+    // end expects a write to EOIR to deactivate the interrupt too.
+    sysreg::clear_icc_eoimode();
+    // SAFETY: Group 1 interrupts reach this CPU still masked in DAIF.
+    unsafe { sysreg::enable_icc_group_1() };
     barrier::isb(barrier::SY);
 }
 
@@ -241,18 +204,13 @@ pub struct Acknowledged {
 /// returns the special interrupt ID that the CPU interface gave instead,
 /// such as 1023 when nothing is pending.
 pub fn acknowledge(group: Group) -> Result<Acknowledged, u32> {
-    let iar: u64;
-    match group {
-        // SAFETY: Reading ICC_IAR0_EL1 (S3_0_C12_C8_0) marks the interrupt
-        // it returns active, which the caller ends through Acknowledged.
-        Group::Zero => unsafe {
-            asm!("mrs {}, S3_0_C12_C8_0", out(reg) iar, options(nostack, preserves_flags));
-        },
-        // SAFETY: As for ICC_IAR0_EL1, with ICC_IAR1_EL1 (S3_0_C12_C12_0).
-        Group::One => unsafe {
-            asm!("mrs {}, S3_0_C12_C12_0", out(reg) iar, options(nostack, preserves_flags));
-        },
-    }
+    let iar = match group {
+        // SAFETY: The caller ends the interrupt through Acknowledged, whose
+        // end writes EOIR0 for group 0.
+        Group::Zero => unsafe { sysreg::read_icc_iar0() },
+        // SAFETY: As for group 0, with EOIR1.
+        Group::One => unsafe { sysreg::read_icc_iar1() },
+    };
     // The ID is the low 24 bits.
     let [a, b, c, ..] = iar.to_le_bytes();
     let intid = u32::from_le_bytes([a, b, c, 0]);
@@ -272,16 +230,11 @@ impl Acknowledged {
     pub fn end(self) {
         let intid = u64::from(self.intid);
         match self.group {
-            // SAFETY: Writing ICC_EOIR0_EL1 (S3_0_C12_C8_1) ends the
-            // interrupt acknowledge returned, which is still active.
-            Group::Zero => unsafe {
-                asm!("msr S3_0_C12_C8_1, {}", in(reg) intid, options(nostack, preserves_flags));
-            },
-            // SAFETY: As for ICC_EOIR0_EL1, with ICC_EOIR1_EL1
-            // (S3_0_C12_C12_1).
-            Group::One => unsafe {
-                asm!("msr S3_0_C12_C12_1, {}", in(reg) intid, options(nostack, preserves_flags));
-            },
+            // SAFETY: acknowledge read intid from IAR0, and self, which
+            // only acknowledge makes and this consumes, kept it active.
+            Group::Zero => unsafe { sysreg::write_icc_eoir0(intid) },
+            // SAFETY: As for group 0, from IAR1.
+            Group::One => unsafe { sysreg::write_icc_eoir1(intid) },
         }
     }
 }

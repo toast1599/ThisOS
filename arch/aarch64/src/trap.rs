@@ -2,7 +2,7 @@
 //! [`TrapFrame`] and call the kernel's handler, and the overflow stack they
 //! move to when the trapped code's stack has no room for the frame.
 
-use core::arch::{asm, global_asm};
+use core::arch::global_asm;
 use core::cell::UnsafeCell;
 use core::fmt;
 use core::mem::offset_of;
@@ -14,7 +14,7 @@ use thisos_hal::{Access, BacktraceEnd, Cpu, Trap, TrapHandler};
 use crate::gic::{self, Acknowledged, Group};
 use crate::once::Once;
 use crate::paging::STACK_SIZE;
-use crate::{Aarch64, backtrace, catch, not_ported, paging, timer, to_u64};
+use crate::{Aarch64, backtrace, catch, not_ported, paging, sysreg, timer, to_u64};
 
 // The vector table: 16 entries of 0x80 bytes, for a synchronous exception,
 // an IRQ, an FIQ and an SError, taken from EL1 on SP_EL0, from EL1 on
@@ -454,16 +454,8 @@ pub unsafe fn init(handler: TrapHandler<Aarch64>) {
     OVERFLOW_TOP.store(to_u64(top.addr()), Ordering::Relaxed);
     // SAFETY: thisos_vectors is the vector table above, 2 KiB aligned in
     // .text, which every page table the kernel runs on maps executable.
-    // Its stubs save and restore every register they change, and the isb
-    // makes the CPU take the next trap through it.
-    unsafe {
-        asm!(
-            "msr vbar_el1, {}",
-            "isb",
-            in(reg) &raw const thisos_vectors,
-            options(nostack, preserves_flags),
-        );
-    }
+    // Its stubs save and restore every register they change.
+    unsafe { sysreg::write_vbar(&raw const thisos_vectors) };
 }
 
 /// The overflow stack `move_stack` put in place, which it keeps for good.
