@@ -3,6 +3,7 @@
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::ops::Range;
 use core::{fmt, str};
 
 use spin::Mutex;
@@ -716,45 +717,42 @@ fn write(buf: u64, len: u64) -> Result<u64, Error> {
 }
 
 /// Copies `bytes` to `addr` in user space, as [`Platform::copy_to_user`]
-/// does, one page at a time with interrupts off, as [`copy_from_user`]
-/// does.
+/// does, a page at a time; see [`by_page`].
 fn copy_to_user(addr: u64, bytes: &[u8]) -> bool {
-    let mut addr = addr;
-    let mut rest = bytes;
-    while !rest.is_empty() {
-        let in_page = 4096 - addr % 4096;
-        let len = rest
-            .len()
-            .min(usize::try_from(in_page).unwrap_or(usize::MAX));
-        let (chunk, after) = rest.split_at(len);
-        if !Arch::without_interrupts(|| Arch::copy_to_user(addr, chunk)) {
-            return false;
-        }
-        // The page was user space, so the next one's address fits.
-        addr += in_page;
-        rest = after;
-    }
-    true
+    by_page(addr, bytes.len(), |addr, range| {
+        bytes
+            .get(range)
+            .is_some_and(|chunk| Arch::copy_to_user(addr, chunk))
+    })
 }
 
 /// Copies the bytes at `addr` in user space into `bytes`, as
-/// [`Platform::copy_from_user`] does, one page at a time with interrupts
-/// off, so that nothing unmaps a page while it is read.
+/// [`Platform::copy_from_user`] does, a page at a time; see [`by_page`].
 fn copy_from_user(addr: u64, bytes: &mut [u8]) -> bool {
+    by_page(addr, bytes.len(), |addr, range| {
+        bytes
+            .get_mut(range)
+            .is_some_and(|chunk| Arch::copy_from_user(addr, chunk))
+    })
+}
+
+/// Splits the `len` bytes at `addr` in user space at page boundaries and
+/// runs `copy` with each piece's address and its range in the `len`
+/// bytes, in order, until it returns false. Runs each with interrupts off,
+/// so that nothing unmaps the page while it is copied. Returns whether
+/// every `copy` returned true.
+fn by_page(addr: u64, len: usize, mut copy: impl FnMut(u64, Range<usize>) -> bool) -> bool {
     let mut addr = addr;
-    let mut rest = bytes;
-    while !rest.is_empty() {
+    let mut done = 0;
+    while done < len {
         let in_page = 4096 - addr % 4096;
-        let len = rest
-            .len()
-            .min(usize::try_from(in_page).unwrap_or(usize::MAX));
-        let (chunk, after) = rest.split_at_mut(len);
-        if !Arch::without_interrupts(|| Arch::copy_from_user(addr, chunk)) {
+        let end = len.min(done.saturating_add(usize::try_from(in_page).unwrap_or(usize::MAX)));
+        if !Arch::without_interrupts(|| copy(addr, done..end)) {
             return false;
         }
         // The page was user space, so the next one's address fits.
         addr += in_page;
-        rest = after;
+        done = end;
     }
     true
 }

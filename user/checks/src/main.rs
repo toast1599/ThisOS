@@ -74,6 +74,15 @@ fn memory_copies() {
     let mut buf = [0xff; 6];
     ok(object.read(4093, &mut buf));
     assert_eq!(&buf, b"\0abcd\0", "a copy across frames");
+    let mut stack = [0; 8192];
+    let start = stack.as_ptr().addr();
+    let edge = (start + 3).next_multiple_of(4096) - start;
+    let across = &mut stack[edge - 3..edge + 3];
+    across.copy_from_slice(b"ghijkl");
+    ok(object.write(100, across));
+    across.fill(0);
+    ok(object.read(100, across));
+    assert_eq!(&*across, b"ghijkl", "copies across stack pages");
     ok(object.read(8192, &mut []));
     assert_eq!(object.write(8190, b"abc"), Err(Error::OutOfRange));
     assert_eq!(object.read(8193, &mut []), Err(Error::OutOfRange));
