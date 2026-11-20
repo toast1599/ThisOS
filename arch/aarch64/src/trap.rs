@@ -355,7 +355,6 @@ extern "C" fn trap_entry(frame: &mut TrapFrame) {
     if frame.overflowed() && on_overflow_stack(frame.sp) {
         Aarch64::halt();
     }
-    let mut acknowledged = None;
     let trap = if frame.overflowed() {
         Trap::DoubleFault
     } else {
@@ -364,7 +363,13 @@ extern "C" fn trap_entry(frame: &mut TrapFrame) {
             kind @ (IRQ | FIQ) => {
                 let group = if kind == IRQ { Group::One } else { Group::Zero };
                 let (trap, interrupt) = interrupt(group);
-                acknowledged = interrupt;
+                // Before the handler, as on x86_64, because a tick's handler
+                // may switch to a thread that runs for many ticks before it
+                // returns here. Interrupts stay masked until the handler, or
+                // the thread it switches to, unmasks them.
+                if let Some(interrupt) = interrupt {
+                    interrupt.end();
+                }
                 trap
             }
             _ => Trap::Other {
@@ -374,14 +379,6 @@ extern "C" fn trap_entry(frame: &mut TrapFrame) {
         }
     };
     handler(trap, frame);
-    // After the handler, so that the next tick can't come while this one is
-    // still handled. An abandoned handler ends it too. x86_64 sends its EOI
-    // before the handler instead, because a tick's handler may switch to a
-    // thread that runs for many ticks before it returns here; porting threads
-    // has to move this call the same way.
-    if let Some(interrupt) = acknowledged {
-        interrupt.end();
-    }
     let resumes = if frame.overflowed() {
         // An overflow the handler abandoned resumes in the catch, from
         // registers it saved itself, not from the state the overflow left.
@@ -395,9 +392,10 @@ extern "C" fn trap_entry(frame: &mut TrapFrame) {
 }
 
 /// Acknowledges the interrupt in `group` that the CPU took, and returns
-/// the trap it is, with the interrupt to end after the handler: none for a
+/// the trap it is, with the interrupt to end before the handler: none for a
 /// special interrupt ID, such as 1023 for one that went away. The timer's
-/// next tick is set up first, which lowers its interrupt.
+/// next tick is set up first, which lowers its interrupt, so ending it
+/// early doesn't raise it again.
 fn interrupt(group: Group) -> (Trap, Option<Acknowledged>) {
     match gic::acknowledge(group) {
         Ok(interrupt) if matches!(group, Group::One) && timer::is_timer(interrupt.intid()) => {

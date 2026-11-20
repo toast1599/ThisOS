@@ -11,8 +11,8 @@
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
 // paging's tests run on the host, under Miri too. The crate's assembly
-// doesn't assemble there, so test builds have only paging and the heap it
-// maps.
+// doesn't assemble there, so test builds have only paging, the heap it
+// maps and the Once it records the stacks' window in.
 #[cfg(test)]
 extern crate std;
 
@@ -23,6 +23,8 @@ mod boot;
 #[cfg(not(test))]
 mod catch;
 #[cfg(not(test))]
+mod context;
+#[cfg(not(test))]
 mod devices;
 #[cfg(not(test))]
 mod framebuffer;
@@ -31,7 +33,6 @@ mod gic;
 mod heap;
 #[cfg(not(test))]
 mod memory;
-#[cfg(not(test))]
 mod once;
 mod paging;
 #[cfg(not(test))]
@@ -63,6 +64,8 @@ use thisos_hal::{
 };
 
 #[cfg(not(test))]
+pub use context::Context;
+#[cfg(not(test))]
 pub use framebuffer::FramebufferPixels;
 #[cfg(not(test))]
 pub use memory::MemoryMap;
@@ -70,7 +73,7 @@ pub use paging::{KernelPageTables, UserSpace};
 #[cfg(not(test))]
 pub use trap::TrapFrame;
 #[cfg(not(test))]
-pub use unported::{NoContext, NoSerial};
+pub use unported::NoSerial;
 
 /// The aarch64 architecture, as the kernel sees it through `thisos-hal`.
 #[cfg(not(test))]
@@ -115,8 +118,14 @@ impl Cpu for Aarch64 {
         DAIF.modify(DAIF::I::Unmasked);
     }
 
+    // Masked, so that an interrupt between the caller's check and the wfi
+    // still ends it: a pending interrupt ends wfi whether or not it is
+    // masked. The isb takes it before this returns.
     fn wait_for_interrupt() {
-        not_ported("Cpu::wait_for_interrupt")
+        DAIF.modify(DAIF::I::Masked);
+        wfi();
+        DAIF.modify(DAIF::I::Unmasked);
+        barrier::isb(barrier::SY);
     }
 
     fn without_interrupts<R>(f: impl FnOnce() -> R) -> R {
@@ -149,7 +158,7 @@ impl Platform for Aarch64 {
     type TrapFrame = TrapFrame;
     type MemoryMap = MemoryMap;
     type PageTables = KernelPageTables;
-    type Context = NoContext;
+    type Context = Context;
 
     fn take_page_tables(alloc: &mut dyn FnMut() -> Option<Frame>) -> Option<KernelPageTables> {
         // SAFETY: boot_info recorded where Limine mapped all physical memory
@@ -170,7 +179,7 @@ impl Platform for Aarch64 {
     }
 
     fn activate_kernel_tables() {
-        not_ported("Platform::activate_kernel_tables")
+        paging::activate_kernel();
     }
 
     fn move_trap_stacks(stack: &mut dyn FnMut(usize) -> Stack<Self>) {
@@ -181,16 +190,16 @@ impl Platform for Aarch64 {
         trap::stacks()
     }
 
-    fn new_context(_: Stack<Self>, _: fn(NoContext) -> !) -> NoContext {
-        not_ported("Platform::new_context")
+    fn new_context(stack: Stack<Self>, entry: fn(Context) -> !) -> Context {
+        context::new(stack, entry)
     }
 
-    fn into_stack(_: NoContext) -> Option<Stack<Self>> {
-        not_ported("Platform::into_stack")
+    fn into_stack(context: Context) -> Option<Stack<Self>> {
+        context::into_stack(context)
     }
 
-    fn switch(_: NoContext) -> NoContext {
-        not_ported("Platform::switch")
+    fn switch(to: Context) -> Context {
+        context::switch(to)
     }
 
     fn guard_page() -> u64 {

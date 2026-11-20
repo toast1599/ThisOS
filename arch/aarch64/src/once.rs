@@ -1,5 +1,5 @@
 //! A static that is written once, then shared for the rest of the kernel's
-//! life: the kernel's trap handler.
+//! life, such as the kernel's trap handler.
 
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;

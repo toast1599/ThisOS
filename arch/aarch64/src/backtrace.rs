@@ -1,4 +1,4 @@
-//! Walking the frame records on the kernel stack. The kernel is built with
+//! Walking the frame records on the running thread's stack. The kernel is built with
 //! frame pointers, so each function's prologue stores its caller's x29 and
 //! its own return address, x30, as a pair and points x29 at it.
 
@@ -13,14 +13,27 @@ use crate::ptr_at;
 static STACK_START: AtomicU64 = AtomicU64::new(0);
 static STACK_END: AtomicU64 = AtomicU64::new(0);
 
-/// Records the kernel stack's addresses. The kernel is linked where it
+/// Records the boot stack's addresses. The kernel is linked where it
 /// runs, so return addresses are link addresses already.
 pub fn init(stack: Range<u64>) {
+    set_stack(stack);
+}
+
+/// The running thread's stack.
+pub fn stack() -> Range<u64> {
+    STACK_START.load(Ordering::Relaxed)..STACK_END.load(Ordering::Relaxed)
+}
+
+/// Makes `stack` the one walks stay inside and the guard page is under,
+/// for the thread a switch is about to run.
+pub fn set_stack(stack: Range<u64>) {
     STACK_START.store(stack.start, Ordering::Relaxed);
     STACK_END.store(stack.end, Ordering::Relaxed);
 }
 
-/// The lowest address of the kernel stack.
+/// The lowest address of the running thread's stack. The boot stack, and
+/// `map_stack` for the other threads, leave the page below it unmapped, as
+/// a guard page.
 pub fn stack_bottom() -> u64 {
     STACK_START.load(Ordering::Relaxed)
 }
@@ -42,9 +55,10 @@ impl Frame {
 
     fn caller(&self) -> u64 {
         // SAFETY: new checked that the word lies 8-byte aligned inside the
-        // kernel stack, which stays mapped for the kernel's life. It is a
-        // volatile read because the stack below the caller's frames changes
-        // under the compiler's feet as the walk's own calls run.
+        // running thread's stack, which is mapped in full while the thread
+        // runs, and which only this core uses. It is a volatile read because
+        // the stack below the caller's frames changes under the compiler's
+        // feet as the walk's own calls run.
         unsafe { ptr_at::<u64>(self.0).read_volatile() }
     }
 

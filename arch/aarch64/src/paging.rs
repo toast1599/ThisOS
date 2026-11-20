@@ -17,6 +17,7 @@ use thisos_hal::{MapError, MapErrorKind, Protection, Translation};
 use thisos_regions::{InsertError, Regions};
 
 use crate::heap::{self, Heap};
+use crate::once::Once;
 use crate::{ptr_at, to_u64};
 
 /// The CPU state the tables depend on: the translation registers, PAN, the
@@ -473,6 +474,27 @@ fn empty_lower_half() {
     flush_user();
 }
 
+/// Makes the CPU use the kernel's own tables, unless it does already; see
+/// `Platform::activate_kernel_tables`.
+#[cfg_attr(
+    test,
+    expect(
+        dead_code,
+        reason = "only Platform::activate_kernel_tables calls it, which host tests don't build"
+    )
+)]
+pub(crate) fn activate_kernel() {
+    assert!(
+        STACKS.get().is_some(),
+        "the kernel's page tables aren't taken yet"
+    );
+    // TTBR1 holds the kernel's tables from take on, so only the lower half
+    // differs.
+    if ttbr0_walks() {
+        empty_lower_half();
+    }
+}
+
 /// Whether TTBR0's walks are on, so that the lower half is mapped through
 /// TTBR0's table.
 fn ttbr0_walks() -> bool {
@@ -497,8 +519,13 @@ pub struct KernelPageTables {
 /// vectors can tell an overflow by one bit of SP.
 pub(crate) const STACK_SIZE: usize = 64 << 10;
 
+/// The stacks' window, which `take` records for `Stack::of_suspended` and
+/// `activate_kernel`.
+static STACKS: Once<Range<u64>> = Once::new();
+
 /// A kernel stack: whole pages of the stacks' window, mapped writable for
-/// one owner, with an unmapped page below. Only `map_stack` makes one.
+/// one owner, with an unmapped page below. Only `map_stack` makes one, and
+/// `Stack::of_suspended` makes it again from the context that took it.
 #[derive(Debug)]
 pub struct Stack {
     range: Range<u64>,
@@ -507,6 +534,35 @@ pub struct Stack {
 impl Stack {
     pub(crate) fn range(&self) -> Range<u64> {
         self.range.clone()
+    }
+
+    #[cfg_attr(
+        test,
+        expect(
+            dead_code,
+            reason = "only Platform::new_context calls it, which host tests don't build"
+        )
+    )]
+    pub(crate) fn into_range(self) -> Range<u64> {
+        self.range
+    }
+
+    /// The stack a suspended thread's context holds, `range`, or `None`
+    /// if it is outside the stacks' window: the boot thread's, which is in
+    /// the kernel's image. Only a context, which holds what it was made
+    /// with, may call this, and only as it is consumed.
+    #[cfg_attr(
+        test,
+        expect(
+            dead_code,
+            reason = "only Platform::into_stack calls it, which host tests don't build"
+        )
+    )]
+    pub(crate) fn of_suspended(range: Range<u64>) -> Option<Stack> {
+        let Some(window) = STACKS.get() else {
+            panic!("a context before the kernel's page tables");
+        };
+        (window.start <= range.start && range.end <= window.end).then_some(Stack { range })
     }
 }
 
@@ -681,7 +737,7 @@ pub unsafe fn take(
         // map_stack and map stay inside the stacks' window and
         // kernel_space, which start above it.
         heap: unsafe { Heap::new(space_start(space)) },
-        stacks: stack_window(space).start,
+        stacks: STACKS.init(stack_window(space)).start,
     })
 }
 
