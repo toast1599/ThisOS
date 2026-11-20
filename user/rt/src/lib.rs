@@ -11,10 +11,11 @@ extern crate alloc;
 #[cfg(not(test))]
 mod heap;
 
+#[cfg_attr(target_arch = "x86_64", path = "arch/x86_64.rs")]
+#[cfg_attr(target_arch = "aarch64", path = "arch/aarch64.rs")]
+mod arch;
+
 use alloc::vec::Vec;
-use core::arch::asm;
-#[cfg(not(test))]
-use core::arch::naked_asm;
 use core::fmt::{self, Write as _};
 use core::marker::PhantomData;
 use core::mem;
@@ -57,35 +58,12 @@ unsafe extern "Rust" {
     safe fn __thisos_main(arg: u64) -> u64;
 }
 
-/// Where the kernel starts the program, with a 16-byte aligned stack, its
-/// argument in RDI, and every other register zeroed, RBP included, which
-/// ends a backtrace's frame chain here. The call makes the stack aligned as
-/// the System V ABI wants it at a function's entry, and leaves RDI as
-/// `start`'s argument.
-#[cfg(not(test))]
-#[unsafe(naked)]
-#[unsafe(no_mangle)]
-extern "C" fn _start() -> ! {
-    naked_asm!("call {start}", "ud2", start = sym start)
-}
+pub use arch::{ELF_MACHINE, cycles, cycles_hz, exit};
 
+/// The first Rust code, which the architecture's `_start` calls.
 #[cfg(not(test))]
 extern "C" fn start(arg: u64) -> ! {
     exit(__thisos_main(arg))
-}
-
-/// Ends the calling process with `status`.
-pub fn exit(status: u64) -> ! {
-    // SAFETY: By ADR 0007, exit reads only its number and argument
-    // registers, touches no user memory and never returns.
-    unsafe {
-        asm!(
-            "syscall",
-            in("rax") const { Syscall::Exit.number() },
-            in("rdi") status,
-            options(noreturn, nostack),
-        );
-    }
 }
 
 /// Logs `text` in the kernel's log, one record per line, without a newline
@@ -109,48 +87,16 @@ pub fn null_syscall() {
     }
 }
 
-/// The CPU's time-stamp counter, which counts at [`tsc_hz`]. Reading it
-/// doesn't wait for earlier instructions to finish, which shifts a reading
-/// by tens of cycles at most.
-pub fn cycles() -> u64 {
-    // SAFETY: RDTSC reads a counter into registers and touches no memory.
-    // The kernel leaves CR4.TSD clear, so it works in ring 3; were it set,
-    // RDTSC would raise #GP, and the kernel would end the process.
-    unsafe { core::arch::x86_64::_rdtsc() }
-}
-
-/// How fast [`cycles`] counts: the crystal frequency in ECX of CPUID leaf
-/// 0x15 times the ratio EBX / EAX, or `None` where the leaf doesn't give
-/// all three, as under QEMU without KVM.
-pub fn tsc_hz() -> Option<u64> {
-    if core::arch::x86_64::__cpuid(0).eax < 0x15 {
-        return None;
-    }
-    let leaf = core::arch::x86_64::__cpuid(0x15);
-    if leaf.eax == 0 || leaf.ebx == 0 || leaf.ecx == 0 {
-        return None;
-    }
-    Some(u64::from(leaf.ecx) * u64::from(leaf.ebx) / u64::from(leaf.eax))
-}
-
 /// Makes the write syscall with `bytes`, and returns its error code.
 fn write_bytes(bytes: &[u8]) -> u64 {
-    let error;
     // SAFETY: By ADR 0007, write reads the bytes.len() bytes at
-    // bytes.as_ptr(), which bytes holds, writes no user memory, and changes
-    // only RAX, RDX, RCX and R11.
-    unsafe {
-        asm!(
-            "syscall",
-            inlateout("rax") Syscall::Write.number() => error,
-            in("rdi") bytes.as_ptr(),
-            in("rsi") bytes.len(),
-            lateout("rdx") _,
-            lateout("rcx") _,
-            lateout("r11") _,
-            options(nostack, readonly),
-        );
-    }
+    // bytes.as_ptr(), which bytes holds, and writes no user memory.
+    let (error, _) = unsafe {
+        arch::syscall_reads(
+            Syscall::Write.number(),
+            [address(bytes.as_ptr()), length(bytes.len()), 0, 0, 0, 0],
+        )
+    };
     error
 }
 
@@ -270,7 +216,7 @@ impl Handle<Process> {
         rights: Rights,
     ) -> Result<(), Error> {
         let (Ok(offset), Ok(len)) = (u64::try_from(offset), u64::try_from(len)) else {
-            unreachable!("x86_64 addresses are 64 bits");
+            unreachable!("ThisOS's addresses are 64 bits");
         };
         syscall(
             Syscall::MapInto,
@@ -324,7 +270,7 @@ impl Handle<Memory> {
     /// with every right.
     pub fn create(size: usize) -> Result<Handle<Memory>, Error> {
         let Ok(size) = u64::try_from(size) else {
-            unreachable!("x86_64 addresses are 64 bits");
+            unreachable!("ThisOS's addresses are 64 bits");
         };
         let value = syscall(Syscall::MemoryCreate, [size])?;
         Ok(Handle::from_kernel(value))
@@ -335,25 +281,23 @@ impl Handle<Memory> {
     /// the object's end.
     pub fn read(&self, offset: usize, buf: &mut [u8]) -> Result<(), Error> {
         let Ok(offset) = u64::try_from(offset) else {
-            unreachable!("x86_64 addresses are 64 bits");
+            unreachable!("ThisOS's addresses are 64 bits");
         };
-        let code;
         // SAFETY: By ADR 0007, memory-read writes at most buf.len() bytes
-        // at buf.as_mut_ptr(), which buf holds, reads no user memory, and
-        // changes only RAX, RDX, RCX and R11.
-        unsafe {
-            asm!(
-                "syscall",
-                inlateout("rax") Syscall::MemoryRead.number() => code,
-                in("rdi") u64::from(self.value),
-                in("rsi") offset,
-                inlateout("rdx") buf.as_mut_ptr() => _,
-                in("r10") buf.len(),
-                lateout("rcx") _,
-                lateout("r11") _,
-                options(nostack),
-            );
-        }
+        // at buf.as_mut_ptr(), which buf holds, and reads no user memory.
+        let (code, _) = unsafe {
+            arch::syscall_writes(
+                Syscall::MemoryRead.number(),
+                [
+                    u64::from(self.value),
+                    offset,
+                    address(buf.as_mut_ptr()),
+                    length(buf.len()),
+                    0,
+                    0,
+                ],
+            )
+        };
         result(code, 0).map(|_| ())
     }
 
@@ -363,25 +307,23 @@ impl Handle<Memory> {
     /// mapped executable anywhere.
     pub fn write(&self, offset: usize, bytes: &[u8]) -> Result<(), Error> {
         let Ok(offset) = u64::try_from(offset) else {
-            unreachable!("x86_64 addresses are 64 bits");
+            unreachable!("ThisOS's addresses are 64 bits");
         };
-        let code;
         // SAFETY: By ADR 0007, memory-write reads the bytes.len() bytes at
-        // bytes.as_ptr(), which bytes holds, writes no user memory, and
-        // changes only RAX, RDX, RCX and R11.
-        unsafe {
-            asm!(
-                "syscall",
-                inlateout("rax") Syscall::MemoryWrite.number() => code,
-                in("rdi") u64::from(self.value),
-                in("rsi") offset,
-                inlateout("rdx") bytes.as_ptr() => _,
-                in("r10") bytes.len(),
-                lateout("rcx") _,
-                lateout("r11") _,
-                options(nostack, readonly),
-            );
-        }
+        // bytes.as_ptr(), which bytes holds, and writes no user memory.
+        let (code, _) = unsafe {
+            arch::syscall_reads(
+                Syscall::MemoryWrite.number(),
+                [
+                    u64::from(self.value),
+                    offset,
+                    address(bytes.as_ptr()),
+                    length(bytes.len()),
+                    0,
+                    0,
+                ],
+            )
+        };
         result(code, 0).map(|_| ())
     }
 }
@@ -411,25 +353,22 @@ impl Handle<Channel> {
         for (value, handle) in values.iter_mut().zip(&handles) {
             *value = handle.value;
         }
-        let code;
         // SAFETY: By ADR 0007, send reads the bytes.len() bytes at
         // bytes.as_ptr() and the handles.len() u32s at values, which those
-        // hold, writes no user memory, and changes only RAX, RDX, RCX and
-        // R11.
-        unsafe {
-            asm!(
-                "syscall",
-                inlateout("rax") Syscall::Send.number() => code,
-                in("rdi") u64::from(self.value),
-                in("rsi") bytes.as_ptr(),
-                inlateout("rdx") bytes.len() => _,
-                in("r10") values.as_ptr(),
-                in("r8") handles.len(),
-                lateout("rcx") _,
-                lateout("r11") _,
-                options(nostack, readonly),
-            );
-        }
+        // hold, and writes no user memory.
+        let (code, _) = unsafe {
+            arch::syscall_reads(
+                Syscall::Send.number(),
+                [
+                    u64::from(self.value),
+                    address(bytes.as_ptr()),
+                    length(bytes.len()),
+                    address(values.as_ptr()),
+                    length(handles.len()),
+                    0,
+                ],
+            )
+        };
         match result(code, 0) {
             Ok(_) => {
                 // They moved to the receiver, so they no longer close here.
@@ -467,32 +406,28 @@ impl Handle<Channel> {
     /// when `bytes` is shorter than the message.
     pub fn receive_into(&self, bytes: &mut [u8]) -> Result<(usize, Vec<Handle<Unknown>>), Error> {
         let mut values = [0u32; MAX_MESSAGE_HANDLES];
-        let code;
-        let value;
         // SAFETY: By ADR 0007, receive writes at most bytes.len() bytes at
         // bytes.as_mut_ptr() and at most MAX_MESSAGE_HANDLES u32s at
-        // values, which those hold, reads no user memory, and changes only
-        // RAX, RDX, RCX and R11.
-        unsafe {
-            asm!(
-                "syscall",
-                inlateout("rax") Syscall::Receive.number() => code,
-                in("rdi") u64::from(self.value),
-                in("rsi") bytes.as_mut_ptr(),
-                inlateout("rdx") bytes.len() => value,
-                in("r10") values.as_mut_ptr(),
-                in("r8") MAX_MESSAGE_HANDLES,
-                lateout("rcx") _,
-                lateout("r11") _,
-                options(nostack),
-            );
-        }
+        // values, which those hold, and reads no user memory.
+        let (code, value) = unsafe {
+            arch::syscall_writes(
+                Syscall::Receive.number(),
+                [
+                    u64::from(self.value),
+                    address(bytes.as_mut_ptr()),
+                    length(bytes.len()),
+                    address(values.as_mut_ptr()),
+                    length(MAX_MESSAGE_HANDLES),
+                    0,
+                ],
+            )
+        };
         let value = result(code, value)?;
         let (Ok(len), Ok(count)) = (
             usize::try_from(value & 0xffff_ffff),
             usize::try_from(value >> 32),
         ) else {
-            unreachable!("x86_64 addresses are 64 bits");
+            unreachable!("ThisOS's addresses are 64 bits");
         };
         let Some(values) = values.get(..count) else {
             panic!("the kernel received {count} handles, more than a message holds");
@@ -575,23 +510,21 @@ pub fn wait(items: &mut [WaitItem<'_>], timeout: Option<Duration>) -> Result<usi
     let timeout = timeout.map_or(u64::MAX, |timeout| {
         u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX)
     });
-    let code;
-    let value;
     // SAFETY: By ADR 0007, wait reads and writes at most items.len() items
-    // of three u32s at raw, which raw holds, and changes only RAX, RDX, RCX
-    // and R11.
-    unsafe {
-        asm!(
-            "syscall",
-            inlateout("rax") Syscall::Wait.number() => code,
-            in("rdi") raw.as_mut_ptr(),
-            in("rsi") items.len(),
-            inlateout("rdx") timeout => value,
-            lateout("rcx") _,
-            lateout("r11") _,
-            options(nostack),
-        );
-    }
+    // of three u32s at raw, which raw holds.
+    let (code, value) = unsafe {
+        arch::syscall_writes(
+            Syscall::Wait.number(),
+            [
+                address(raw.as_mut_ptr()),
+                length(items.len()),
+                timeout,
+                0,
+                0,
+                0,
+            ],
+        )
+    };
     let ready = result(code, value)?;
     for (item, raw) in items.iter_mut().zip(&raw) {
         let Some(observed) = Signals::from_bits(raw[2]) else {
@@ -603,7 +536,7 @@ pub fn wait(items: &mut [WaitItem<'_>], timeout: Option<Duration>) -> Result<usi
         item.observed = observed;
     }
     let Ok(ready) = usize::try_from(ready) else {
-        unreachable!("x86_64 addresses are 64 bits");
+        unreachable!("ThisOS's addresses are 64 bits");
     };
     Ok(ready)
 }
@@ -615,25 +548,8 @@ fn syscall<const N: usize>(number: Syscall, args: [u64; N]) -> Result<u64, Error
     const { assert!(N <= 6, "a syscall takes at most six arguments") };
     let mut all = [0; 6];
     all[..N].copy_from_slice(&args);
-    let code;
-    let value;
-    // SAFETY: By ADR 0007, a syscall changes only RAX, RDX, RCX and R11,
-    // and the caller passes one that touches no user memory.
-    unsafe {
-        asm!(
-            "syscall",
-            inlateout("rax") number.number() => code,
-            in("rdi") all[0],
-            in("rsi") all[1],
-            inlateout("rdx") all[2] => value,
-            in("r10") all[3],
-            in("r8") all[4],
-            in("r9") all[5],
-            lateout("rcx") _,
-            lateout("r11") _,
-            options(nostack, nomem),
-        );
-    }
+    // SAFETY: The caller passes a syscall that touches no user memory.
+    let (code, value) = unsafe { arch::syscall_nomem(number.number(), all) };
     result(code, value)
 }
 
@@ -642,26 +558,25 @@ fn syscall<const N: usize>(number: Syscall, args: [u64; N]) -> Result<u64, Error
 /// it makes memory appear.
 #[cfg_attr(test, expect(dead_code, reason = "only the heap maps memory"))]
 fn map_syscall(args: [u64; 5]) -> Result<u64, Error> {
-    let code;
-    let value;
-    // SAFETY: By ADR 0007, a syscall changes only RAX, RDX, RCX and R11.
-    // Map only adds pages where none were mapped, so no memory Rust
-    // reaches changes.
-    unsafe {
-        asm!(
-            "syscall",
-            inlateout("rax") Syscall::Map.number() => code,
-            in("rdi") args[0],
-            in("rsi") args[1],
-            inlateout("rdx") args[2] => value,
-            in("r10") args[3],
-            in("r8") args[4],
-            lateout("rcx") _,
-            lateout("r11") _,
-            options(nostack),
-        );
-    }
+    let mut all = [0; 6];
+    all[..5].copy_from_slice(&args);
+    // SAFETY: Map only adds pages where none were mapped, so no memory
+    // Rust reaches changes.
+    let (code, value) = unsafe { arch::syscall_writes(Syscall::Map.number(), all) };
     result(code, value)
+}
+
+/// `ptr`'s address, as a syscall argument.
+fn address<T>(ptr: *const T) -> u64 {
+    length(ptr.addr())
+}
+
+/// `len`, as a syscall argument.
+fn length(len: usize) -> u64 {
+    let Ok(len) = u64::try_from(len) else {
+        unreachable!("ThisOS's addresses are 64 bits");
+    };
+    len
 }
 
 fn result(code: u64, value: u64) -> Result<u64, Error> {

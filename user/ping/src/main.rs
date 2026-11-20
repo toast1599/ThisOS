@@ -4,7 +4,7 @@
 //! `pong`. It times a near-empty syscall, then round trips of several
 //! sizes, the last carrying a handle, and closes the channel, which ends
 //! `pong`. The results go to the creator as little-endian `u64`s: the
-//! TSC's frequency in Hz, or 0 where it isn't known; the syscall's min,
+//! cycle counter's frequency in Hz, or 0 where it isn't known; the syscall's min,
 //! median and max in cycles; and for each round trip its bytes, its
 //! handles, and its min, median and max.
 
@@ -36,7 +36,7 @@ fn main(creator: Handle<Channel>) -> u64 {
     let pong = receive_pong(&creator);
 
     let mut results = Vec::new();
-    results.push(thisos_rt::tsc_hz().unwrap_or(0));
+    results.push(thisos_rt::cycles_hz().unwrap_or(0));
     results.extend(time(|| {
         let started = cycles();
         thisos_rt::null_syscall();

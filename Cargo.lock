@@ -105,6 +105,7 @@ dependencies = [
  "limine",
  "spin",
  "talc",
+ "thisos-abi",
  "thisos-fdt",
  "thisos-frames",
  "thisos-hal",

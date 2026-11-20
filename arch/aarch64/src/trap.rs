@@ -2,19 +2,20 @@
 //! [`TrapFrame`] and call the kernel's handler, and the overflow stack they
 //! move to when the trapped code's stack has no room for the frame.
 
-use core::arch::global_asm;
+use core::arch::{asm, global_asm};
 use core::cell::UnsafeCell;
 use core::fmt;
 use core::mem::offset_of;
 use core::ops::{Range, RangeInclusive};
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use aarch64_cpu::registers::{DAIF, ReadWriteable};
 use thisos_hal::{Access, BacktraceEnd, Cpu, Trap, TrapHandler};
 
 use crate::gic::{self, Acknowledged, Group};
 use crate::once::Once;
 use crate::paging::STACK_SIZE;
-use crate::{Aarch64, backtrace, catch, not_ported, paging, sysreg, timer, to_u64};
+use crate::{Aarch64, backtrace, catch, paging, sysreg, timer, to_u64};
 
 // The vector table: 16 entries of 0x80 bytes, for a synchronous exception,
 // an IRQ, an FIQ and an SError, taken from EL1 on SP_EL0, from EL1 on
@@ -32,8 +33,10 @@ use crate::{Aarch64, backtrace, catch, not_ported, paging, sysreg, timer, to_u64
 // x0 in the EL0 thread registers, which the trapped code never gets back
 // since an overflow never resumes, moves to the overflow stack, and adds
 // OVERFLOWED to its entry number. The common path saves the rest of the
-// frame, with the trapped SP that x1 brings, calls trap_entry, and
-// restores everything but SP, which it gets back by dropping the frame.
+// frame, with the trapped SP that x1 brings and SP_EL0, calls trap_entry,
+// and restores everything but SP, which it gets back by dropping the
+// frame. SP_EL0 is user code's stack pointer, and goes with the frame
+// because a tick may switch to another user thread inside the handler.
 global_asm!(
     ".pushsection .text.thisos_vectors, \"ax\", %progbits",
     ".balign 2048",
@@ -93,12 +96,15 @@ global_asm!(
     "mrs x2, esr_el1",
     "mrs x3, far_el1",
     "stp x2, x3, [sp, #0x110]",
-    "str x0, [sp, #0x120]",
+    "mrs x2, sp_el0",
+    "stp x0, x2, [sp, #0x120]",
     "mov x0, sp",
     "bl {entry}",
     "ldp x2, x3, [sp, #0x100]",
     "msr elr_el1, x2",
     "msr spsr_el1, x3",
+    "ldr x2, [sp, #0x128]",
+    "msr sp_el0, x2",
     "ldp x2, x3, [sp, #0x10]",
     "ldp x4, x5, [sp, #0x20]",
     "ldp x6, x7, [sp, #0x30]",
@@ -130,7 +136,8 @@ unsafe extern "C" {
 }
 
 /// The registers when the CPU trapped, as the vector table's stubs save
-/// them. For a trap from EL0, `sp` is still the kernel's.
+/// them. For a trap from EL0, `sp` is the kernel's, and `sp_el0` the
+/// trapped code's.
 #[repr(C)]
 #[derive(Debug)]
 pub struct TrapFrame {
@@ -143,7 +150,7 @@ pub struct TrapFrame {
     /// The vector table entry the CPU took, from 0 to 15, plus
     /// [`OVERFLOWED`] when it found the stack overflowed.
     entry: u64,
-    _align: u64,
+    sp_el0: u64,
 }
 
 const FRAME_SIZE: usize = size_of::<TrapFrame>();
@@ -154,6 +161,7 @@ const _: () = assert!(
         && offset_of!(TrapFrame, elr) == 0x100
         && offset_of!(TrapFrame, esr) == 0x110
         && offset_of!(TrapFrame, entry) == 0x120
+        && offset_of!(TrapFrame, sp_el0) == 0x128
         && FRAME_SIZE % 16 == 0
 );
 
@@ -166,13 +174,14 @@ const SYNC: u64 = 0;
 const IRQ: u64 = 1;
 const FIQ: u64 = 2;
 
-/// The entries for traps from EL1 on `SP_EL1`, the only ones the kernel
-/// resumes from.
+/// The entries for traps from EL1 on `SP_EL1`, which the kernel resumes
+/// from.
 const EL1H_SYNC: u64 = 4;
 const EL1H_IRQ: u64 = 5;
 
-/// The synchronous entries for traps from EL0.
+/// The entries for traps from EL0, which the kernel resumes from too.
 const EL0_SYNC: u64 = 8;
+const EL0_IRQ: u64 = 9;
 const EL0_AARCH32_SYNC: u64 = 12;
 
 const ENTRY_NAMES: [&str; 16] = [
@@ -205,7 +214,11 @@ impl thisos_hal::TrapFrame for TrapFrame {
     }
 
     fn sp(&self) -> u64 {
-        self.sp
+        if self.taken_from_el0() {
+            self.sp_el0
+        } else {
+            self.sp
+        }
     }
 
     // The synchronous entries from EL0 take exceptions user code's own
@@ -214,12 +227,16 @@ impl thisos_hal::TrapFrame for TrapFrame {
         matches!(self.entry(), EL0_SYNC | EL0_AARCH32_SYNC)
     }
 
+    // ADR 0010: the number in x8, the arguments in x0 to x5.
     fn syscall(&self) -> (u64, [u64; 6]) {
-        not_ported("TrapFrame::syscall")
+        let x = &self.x;
+        (x[8], [x[0], x[1], x[2], x[3], x[4], x[5]])
     }
 
-    fn set_syscall_result(&mut self, _: u64, _: u64) {
-        not_ported("TrapFrame::set_syscall_result")
+    // ADR 0010: the error in x0, the value in x1.
+    fn set_syscall_result(&mut self, error: u64, value: u64) {
+        self.x[0] = error;
+        self.x[1] = value;
     }
 
     fn backtrace(&self, mut f: impl FnMut(u64)) -> BacktraceEnd {
@@ -248,6 +265,11 @@ impl TrapFrame {
     fn overflowed(&self) -> bool {
         self.entry & OVERFLOWED != 0
     }
+
+    /// Whether the CPU took the trap from EL0, by any of its four entries.
+    fn taken_from_el0(&self) -> bool {
+        (EL0_SYNC..EL0_SYNC + 8).contains(&self.entry())
+    }
 }
 
 impl fmt::Display for TrapFrame {
@@ -266,9 +288,14 @@ impl fmt::Display for TrapFrame {
             write!(f, ", ESR {:#x}, FAR {:#x}", self.esr, self.far)?;
         }
         writeln!(f, ":")?;
-        let mut registers = [("", 0); 34];
-        registers[..3].copy_from_slice(&[("pc", self.elr), ("sp", self.sp), ("spsr", self.spsr)]);
-        for (slot, register) in registers[3..]
+        let mut registers = [("", 0); 35];
+        registers[..4].copy_from_slice(&[
+            ("pc", self.elr),
+            ("sp", self.sp),
+            ("spsr", self.spsr),
+            ("sp0", self.sp_el0),
+        ]);
+        for (slot, register) in registers[4..]
             .iter_mut()
             .zip(X_NAMES.into_iter().zip(self.x))
         {
@@ -296,7 +323,10 @@ const EC_INSTRUCTION_ABORT_EL0: u8 = 0x20;
 const EC_INSTRUCTION_ABORT_EL1: u8 = 0x21;
 const EC_DATA_ABORT_EL0: u8 = 0x24;
 const EC_DATA_ABORT_EL1: u8 = 0x25;
+const EC_SVC64: u8 = 0x15;
 const EC_BRK: u8 = 0x3c;
+/// The immediate of an `svc`, in its `ESR_EL1` syndrome.
+const SVC_IMMEDIATE: u64 = 0xffff;
 
 // ESR_EL1 syndrome bits of an abort.
 /// FAR doesn't hold the faulting address.
@@ -323,6 +353,8 @@ fn sync(frame: &mut TrapFrame) -> Trap {
         access,
     };
     match class(frame.esr) {
+        // Only svc #0 is a syscall, so that the other immediates stay free.
+        EC_SVC64 if frame.entry() == EL0_SYNC && frame.esr & SVC_IMMEDIATE == 0 => Trap::Syscall,
         EC_BRK => {
             frame.elr = frame.elr.wrapping_add(4);
             Trap::Breakpoint
@@ -379,12 +411,16 @@ extern "C" fn trap_entry(frame: &mut TrapFrame) {
         }
     };
     handler(trap, frame);
+    // A syscall runs with interrupts on, and one taken from here on would
+    // overwrite ELR_EL1 and SPSR_EL1 once the stub has restored them. The
+    // eret puts the trapped code's mask back.
+    DAIF.modify(DAIF::I::Masked);
     let resumes = if frame.overflowed() {
         // An overflow the handler abandoned resumes in the catch, from
         // registers it saved itself, not from the state the overflow left.
         catch::abandoned(frame)
     } else {
-        matches!(frame.entry(), EL1H_SYNC | EL1H_IRQ)
+        matches!(frame.entry(), EL1H_SYNC | EL1H_IRQ | EL0_SYNC | EL0_IRQ)
     };
     if !resumes {
         Aarch64::halt();
@@ -414,6 +450,39 @@ fn interrupt(group: Group) -> (Trap, Option<Acknowledged>) {
 }
 
 static HANDLER: Once<TrapHandler<Aarch64>> = Once::new();
+
+/// Enters the IRQ entry for EL1 on `SP_EL1` as the CPU would, with
+/// interrupts masked; see `Platform::raise_spurious`. With nothing
+/// pending, the GIC answers the acknowledge with 1023, and the kernel
+/// sees `Trap::Spurious`. A tick that is pending then is taken instead.
+pub fn raise_spurious() {
+    // SAFETY: The entry saves every register in a frame on this stack, and
+    // its eret comes back to 1: with them, with SPSR_EL1's EL1h, the
+    // interrupt masks and PAN as they were here. Interrupts are masked
+    // before ELR_EL1 and SPSR_EL1 are written, so nothing overwrites them
+    // before the entry saves them. The flags may change.
+    unsafe {
+        asm!(
+            "mrs x9, daif",
+            "msr daifset, #2",
+            ".arch_extension pan",
+            "mrs x10, pan",
+            "orr x9, x9, x10",
+            "mov x10, #{el1h}",
+            "orr x9, x9, x10",
+            "msr spsr_el1, x9",
+            "adr x10, 1f",
+            "msr elr_el1, x10",
+            "b {vectors} + {entry}",
+            "1:",
+            el1h = const SPSR_EL1H,
+            vectors = sym thisos_vectors,
+            entry = const EL1H_IRQ * 0x80,
+            out("x9") _,
+            out("x10") _,
+        );
+    }
+}
 
 /// The top of the stack the vector table's stubs move to when they find
 /// the stack overflowed, which they read without a lock.

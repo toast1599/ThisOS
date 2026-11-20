@@ -18,12 +18,20 @@ thisos_rt::entry!(main);
 /// Where the children's code goes, lld's default base, as for programs.
 const CODE: u64 = 0x20_0000;
 
-/// x86_64 code that exits with its argument, the handle it started with:
-/// `xor eax, eax; syscall`.
+/// Code that exits with its argument, the handle it started with, through
+/// syscall 0: `xor eax, eax; syscall` on x86_64.
+#[cfg(target_arch = "x86_64")]
 const EXIT_WITH_ARG: &[u8] = &[0x31, 0xc0, 0x0f, 0x05];
+/// `mov x8, #0; svc #0` on aarch64.
+#[cfg(target_arch = "aarch64")]
+const EXIT_WITH_ARG: &[u8] = &[0x08, 0x00, 0x80, 0xd2, 0x01, 0x00, 0x00, 0xd4];
 
-/// x86_64 code that raises an invalid-opcode exception: `ud2`.
+/// Code that raises an undefined-instruction exception: `ud2` on x86_64.
+#[cfg(target_arch = "x86_64")]
 const INVALID: &[u8] = &[0x0f, 0x0b];
+/// `udf #0` on aarch64.
+#[cfg(target_arch = "aarch64")]
+const INVALID: &[u8] = &[0x00, 0x00, 0x00, 0x00];
 
 /// The handle a new process's one handle gets: the first slot of an empty
 /// table, at generation 1.

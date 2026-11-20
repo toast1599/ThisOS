@@ -10,7 +10,7 @@ Milestone 3 (user mode) is done: kernel threads with guarded stacks, preempted r
 
 Milestone 4 (handles and IPC) is done: blocking in the scheduler; a handle table per process, with rights, duplicate and restrict; memory objects that user code maps, with W^X held across every mapping of an object; channels carrying bytes and handles; a wait call on several objects; the page-table code's raw-pointer walks under Miri on the host; syscalls that build a process from user space, with a ramdisk of several programs; and a log that a kernel thread draws from a ring once the kernel is up, so that code that logs doesn't wait for the serial port with interrupts off. `init` loads `hello`, `fault`, `ping` and `pong` from the ramdisk and reports how each ended. `ping` and `pong` talk over a channel, and on the test laptop a 16-byte round trip between them takes 1.7 µs ([ADR 0003](docs/adr/0003-ipc-channels.md)). Next is porting milestone 3 to aarch64, then milestone 5 (user-space drivers).
 
-aarch64 runs in QEMU only, behind x86_64 ([ADR 0006](docs/adr/0006-aarch64-behind-x86_64.md)). It has milestone 2's parity and boots as far as creating the idle thread.
+aarch64 runs in QEMU only, behind x86_64 ([ADR 0006](docs/adr/0006-aarch64-behind-x86_64.md)). It has milestone 4's parity, but for a serial port, and passes the same QEMU tests.
 
 - [docs/design.md](docs/design.md) describes the system and its milestones.
 - [docs/adr/](docs/adr/) holds the decisions that are hard to reverse.

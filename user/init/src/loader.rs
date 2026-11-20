@@ -52,7 +52,7 @@ pub fn start<T>(
     handle: Handle<T>,
 ) -> Result<Handle<Process>, Error> {
     let file = read(ramdisk, name)?;
-    let elf = Elf::new(&file).map_err(Error::Elf)?;
+    let elf = Elf::new(&file, thisos_rt::ELF_MACHINE).map_err(Error::Elf)?;
     let process = Handle::<Process>::create()?;
     for segment in elf.segments() {
         let pages = segment.page_range();
@@ -107,7 +107,7 @@ fn read(ramdisk: &Handle<Memory>, name: &str) -> Result<Vec<u8>, Error> {
 
 fn size(bytes: u64) -> usize {
     let Ok(size) = usize::try_from(bytes) else {
-        unreachable!("x86_64 addresses are 64 bits");
+        unreachable!("ThisOS's addresses are 64 bits");
     };
     size
 }

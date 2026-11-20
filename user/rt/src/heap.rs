@@ -97,7 +97,7 @@ fn map_new(addr: u64, len: usize) -> Result<(), ()> {
 )]
 fn base() -> *mut u8 {
     let Ok(base) = usize::try_from(BASE) else {
-        unreachable!("x86_64 addresses are 64 bits");
+        unreachable!("ThisOS's addresses are 64 bits");
     };
     core::ptr::with_exposed_provenance_mut(base)
 }

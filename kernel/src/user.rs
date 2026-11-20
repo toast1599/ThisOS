@@ -199,7 +199,7 @@ fn start_program(file: &[u8], ramdisk: Arc<MemoryObject>) -> Result<Arc<Process>
 /// stack at the end of user space. Each segment and the stack are a memory
 /// object of their own.
 fn load(file: &[u8]) -> Result<Program, LoadError> {
-    let elf = Elf::new(file).map_err(LoadError::Elf)?;
+    let elf = Elf::new(file, Arch::ELF_MACHINE).map_err(LoadError::Elf)?;
     let space = paging::new_space().ok_or(LoadError::NoMemory)?;
     // On failure the space drops, and destroys itself.
     let stack_top = map_program(&elf, &space)?;
@@ -231,7 +231,6 @@ fn map_program(elf: &Elf, space: &Space) -> Result<u64, LoadError> {
     }
     let top = space.user_space().end;
     // User-space loaders put stacks there too.
-    #[cfg(target_arch = "x86_64")]
     assert_eq!(
         top,
         thisos_abi::USER_SPACE_END,
@@ -859,7 +858,7 @@ mod tests {
             panic!("no ramdisk");
         };
         let file = ramdisk_file(archive, name);
-        let entry = match Elf::new(file) {
+        let entry = match Elf::new(file, Arch::ELF_MACHINE) {
             Ok(elf) => elf.entry(),
             Err(e) => panic!("{name} isn't an executable: {e:?}"),
         };
@@ -1134,17 +1133,25 @@ mod tests {
         );
     }
 
-    // The exception arrives on the stack every user thread's debug
-    // exceptions share. ICEBP raises it as a trap, after the instruction,
-    // so the CPU reports the byte after it.
+    // On x86_64 the exception arrives on the stack every user thread's
+    // debug exceptions share. ICEBP raises it as a trap, after the
+    // instruction, so the CPU reports the byte after it. aarch64's is a
+    // brk, which the arch crate reports as a breakpoint after it, as it
+    // does the kernel's own.
     #[test_case]
     fn a_debug_exception_kills_the_thread() {
         let (end, code) = run(UserProgram::Debug, |_, _| 0);
-        let trap = Trap::Other {
-            vector: 1,
-            error: 0,
-        };
-        assert_eq!(end, End::Killed { trap, ip: code + 1 });
+        #[cfg(target_arch = "x86_64")]
+        let (trap, ip) = (
+            Trap::Other {
+                vector: 1,
+                error: 0,
+            },
+            code + 1,
+        );
+        #[cfg(target_arch = "aarch64")]
+        let (trap, ip) = (Trap::Breakpoint, code + 4);
+        assert_eq!(end, End::Killed { trap, ip });
     }
 
     // The kernel saves no SIMD state, so user code may not use it.

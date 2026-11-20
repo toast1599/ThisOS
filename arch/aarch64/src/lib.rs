@@ -43,6 +43,8 @@ mod timer;
 mod trap;
 #[cfg(not(test))]
 mod unported;
+#[cfg(not(test))]
+mod user;
 
 #[cfg(not(test))]
 use core::arch::asm;
@@ -146,8 +148,8 @@ impl Cpu for Aarch64 {
         // PSTATE.PAN reads back in bit 22.
         sysreg::read_pan() & (1 << 22) != 0
     }
-    fn enter_user(_: u64, _: u64, _: u64) -> ! {
-        not_ported("Cpu::enter_user")
+    fn enter_user(ip: u64, sp: u64, arg: u64) -> ! {
+        user::enter_user(ip, sp, arg)
     }
 }
 
@@ -159,6 +161,8 @@ impl Platform for Aarch64 {
     type MemoryMap = MemoryMap;
     type PageTables = KernelPageTables;
     type Context = Context;
+
+    const ELF_MACHINE: u16 = 183;
 
     fn take_page_tables(alloc: &mut dyn FnMut() -> Option<Frame>) -> Option<KernelPageTables> {
         // SAFETY: boot_info recorded where Limine mapped all physical memory
@@ -246,24 +250,24 @@ impl Platform for Aarch64 {
         paging::translate_active(boot::phys_offset(), addr)
     }
 
-    fn fill_frame(_: &mut Frame, _: usize, _: &[u8]) {
-        not_ported("Platform::fill_frame")
+    fn fill_frame(frame: &mut Frame, offset: usize, bytes: &[u8]) {
+        paging::fill_frame(boot::phys_offset(), frame, offset, bytes);
     }
 
-    fn read_frame(_: &Frame, _: usize, _: &mut [u8]) {
-        not_ported("Platform::read_frame")
+    fn read_frame(frame: &Frame, offset: usize, buf: &mut [u8]) {
+        paging::read_frame(boot::phys_offset(), frame, offset, buf);
     }
 
-    fn write_frame(_: &Frame, _: usize, _: &[u8]) {
-        not_ported("Platform::write_frame")
+    fn write_frame(frame: &Frame, offset: usize, bytes: &[u8]) {
+        paging::write_frame(boot::phys_offset(), frame, offset, bytes);
     }
 
-    fn copy_from_user(_: u64, _: &mut [u8]) -> bool {
-        not_ported("Platform::copy_from_user")
+    fn copy_from_user(addr: u64, buf: &mut [u8]) -> bool {
+        paging::copy_from_user(boot::phys_offset(), addr, buf)
     }
 
-    fn copy_to_user(_: u64, _: &[u8]) -> bool {
-        not_ported("Platform::copy_to_user")
+    fn copy_to_user(addr: u64, buf: &[u8]) -> bool {
+        paging::copy_to_user(boot::phys_offset(), addr, buf)
     }
 
     fn write_return(frame: &mut Frame) {
@@ -271,11 +275,11 @@ impl Platform for Aarch64 {
     }
 
     fn raise_spurious() {
-        not_ported("Platform::raise_spurious");
+        trap::raise_spurious();
     }
 
-    fn write_user_program(_: &mut Frame, _: UserProgram) {
-        not_ported("Platform::write_user_program")
+    fn write_user_program(frame: &mut Frame, program: UserProgram) {
+        user::write_program(boot::phys_offset(), frame, program);
     }
 
     // Through semihosting's SYS_EXIT_EXTENDED, which QEMU turns into its

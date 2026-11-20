@@ -110,6 +110,36 @@ pub(crate) unsafe fn dc_civac(addr: u64) {
     unsafe { asm!("dc civac, {}", in(reg) addr, options(nostack, preserves_flags)) };
 }
 
+/// Cleans the data cache line that holds `addr` to the point of
+/// unification, with `dc cvau`, and doesn't wait for it.
+///
+/// # Safety
+///
+/// `addr` must be mapped.
+pub(crate) unsafe fn dc_cvau(addr: u64) {
+    // SAFETY: Cleaning a line writes back what the cache holds of an
+    // address the caller guarantees is mapped, and changes no memory's
+    // value.
+    unsafe { asm!("dc cvau, {}", in(reg) addr, options(nostack, preserves_flags)) };
+}
+
+/// Waits for earlier cache maintenance, then invalidates the instruction
+/// caches of every CPU and waits for that, so that later instruction
+/// fetches see the cleaned lines.
+pub(crate) fn invalidate_icache() {
+    // SAFETY: Invalidating the instruction caches changes no memory, only
+    // which copy of it an instruction fetch sees.
+    unsafe {
+        asm!(
+            "dsb ish",
+            "ic ialluis",
+            "dsb ish",
+            "isb",
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
 /// Makes instruction fetches on every CPU see the stores to `addr`'s data
 /// cache line: cleans it to the point of unification and invalidates the
 /// instruction caches, waiting for both.

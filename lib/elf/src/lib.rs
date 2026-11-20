@@ -1,5 +1,5 @@
 //! A reader for the ELF files the kernel loads: little-endian 64-bit
-//! executables for x86_64, linked at a fixed address, which need no
+//! executables for one machine, linked at a fixed address, which need no
 //! relocations. [`Elf::new`] checks the header and every program header
 //! once, so reading the segments afterwards can't fail.
 
@@ -18,7 +18,11 @@ const CLASS_64: u8 = 2;
 const LITTLE_ENDIAN: u8 = 1;
 const VERSION: u8 = 1;
 const EXECUTABLE: u16 = 2;
-const X86_64: u16 = 62;
+
+/// `e_machine` for x86_64.
+pub const X86_64: u16 = 62;
+/// `e_machine` for aarch64.
+pub const AARCH64: u16 = 183;
 
 // Program header types.
 const LOAD: u32 = 1;
@@ -79,8 +83,9 @@ pub struct Elf<'a> {
 }
 
 impl<'a> Elf<'a> {
-    /// Checks `file`'s header and its program headers.
-    pub fn new(file: &'a [u8]) -> Result<Self, Error> {
+    /// Checks `file`'s header and its program headers, and that it is for
+    /// `machine`, such as [`X86_64`].
+    pub fn new(file: &'a [u8], machine: u16) -> Result<Self, Error> {
         let header = file.get(..HEADER_SIZE).ok_or(Error::Truncated)?;
         if !header.starts_with(MAGIC) {
             return Err(Error::BadMagic);
@@ -98,7 +103,7 @@ impl<'a> Elf<'a> {
         if field(16)? != EXECUTABLE {
             return Err(Error::Unsupported("type"));
         }
-        if field(18)? != X86_64 {
+        if field(18)? != machine {
             return Err(Error::Unsupported("machine"));
         }
         if usize::from(field(54)?) != PROGRAM_HEADER_SIZE {
@@ -369,7 +374,7 @@ mod tests {
     #[test]
     fn reads_an_executable_like_init() {
         let file = init();
-        let elf = Elf::new(&file).unwrap();
+        let elf = Elf::new(&file, X86_64).unwrap();
         assert_eq!(elf.entry(), 0x20_1208);
         let segments: Vec<_> = elf.segments().collect();
         assert_eq!(segments.len(), 3);
@@ -397,7 +402,7 @@ mod tests {
         // bytes, over four pages.
         let headers = [load(RX, 0x100, 0x40_0800, 0x1800, 0x3800)];
         let file = file(0x40_0800, &headers, 0x1900);
-        let elf = Elf::new(&file).unwrap();
+        let elf = Elf::new(&file, X86_64).unwrap();
         let pages: Vec<_> = elf.segments().next().unwrap().pages().collect();
         assert_eq!(
             pages,
@@ -433,7 +438,7 @@ mod tests {
             load(RW, 0x1000, 0x2000, 0, 0x100),
         ];
         let file = file(0x1000, &headers, 0x300);
-        let elf = Elf::new(&file).unwrap();
+        let elf = Elf::new(&file, X86_64).unwrap();
         let bss = elf.segments().nth(1).unwrap();
         assert_eq!(bss.data, &[]);
         assert_eq!(
@@ -449,11 +454,11 @@ mod tests {
     #[test]
     fn rejects_bad_headers() {
         let good = init();
-        assert_eq!(Elf::new(&good[..63]).err(), Some(Error::Truncated));
+        assert_eq!(Elf::new(&good[..63], X86_64).err(), Some(Error::Truncated));
         let changed = |at: usize, bytes: &[u8]| {
             let mut file = good.clone();
             file[at..at + bytes.len()].copy_from_slice(bytes);
-            Elf::new(&file).err()
+            Elf::new(&file, X86_64).err()
         };
         assert_eq!(changed(1, b"X"), Some(Error::BadMagic));
         assert_eq!(changed(4, &[1]), Some(Error::Unsupported("class")));
@@ -462,6 +467,9 @@ mod tests {
         // A position-independent executable.
         assert_eq!(changed(16, &[3]), Some(Error::Unsupported("type")));
         assert_eq!(changed(18, &[183]), Some(Error::Unsupported("machine")));
+        let mut aarch64 = good.clone();
+        aarch64[18..20].copy_from_slice(&AARCH64.to_le_bytes());
+        assert!(Elf::new(&aarch64, AARCH64).is_ok());
         assert_eq!(
             changed(54, &[64]),
             Some(Error::Unsupported("program header size"))
@@ -474,7 +482,8 @@ mod tests {
 
     #[test]
     fn rejects_bad_segments() {
-        let check = |headers: &[Header], entry| Elf::new(&file(entry, headers, 0x300)).err();
+        let check =
+            |headers: &[Header], entry| Elf::new(&file(entry, headers, 0x300), X86_64).err();
         let code = load(RX, 0, 0x1000, 0x10, 0x10);
         assert_eq!(check(&[code], 0x1000), None);
         assert_eq!(check(&[code], 0x1010), Some(Error::BadEntry(0x1010)));

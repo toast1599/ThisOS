@@ -5,7 +5,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
 use crate::cmd::{cargo, output};
@@ -62,21 +62,15 @@ impl Arch {
                     .create_uefi_image(path)
                     .with_context(|| format!("writing {}", path.display()))
             }
-            Arch::Aarch64 => {
-                ensure!(ramdisk.is_none(), "aarch64 images carry no ramdisk");
-                limine::write_image(elf, id, path)
-            }
+            Arch::Aarch64 => limine::write_image(elf, ramdisk, id, path),
         }
     }
 
     /// Builds what the kernel's images carry as the loader's ramdisk and
-    /// returns its path: on x86_64 a ustar archive of the programs in
-    /// [`ramdisk::PROGRAMS`], the same for every image, and nothing on
-    /// aarch64, which has no user mode yet (ADR 0006).
+    /// returns its path: a ustar archive of the programs in
+    /// [`ramdisk::PROGRAMS`], built for this architecture, the same for
+    /// every image.
     pub fn ramdisk(self, release: bool) -> Result<Option<PathBuf>> {
-        if self == Arch::Aarch64 {
-            return Ok(None);
-        }
         let mut cargo_build = cargo();
         cargo_build.arg("build");
         for package in ramdisk::PROGRAMS {
@@ -96,7 +90,7 @@ impl Arch {
             .iter()
             .map(|(name, bytes)| (*name, bytes.as_slice()))
             .collect();
-        let path = target_dir()?.join("thisos-ramdisk.tar");
+        let path = target_dir()?.join(format!("thisos{}-ramdisk.tar", self.suffix()));
         let file =
             fs::File::create(&path).with_context(|| format!("creating {}", path.display()))?;
         ramdisk::write(&files, io::BufWriter::new(file))?;

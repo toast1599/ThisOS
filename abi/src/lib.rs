@@ -26,12 +26,12 @@ pub const MAX_WAIT_ITEMS: usize = 64;
 pub const WAIT_ITEM_SIZE: usize = 12;
 
 /// The end of the addresses user code may map, where a loader puts a new
-/// program's stack: below the last page of the lower half, since SYSRET
-/// can't return past it (ADR 0007).
-#[cfg(target_arch = "x86_64")]
+/// program's stack: below the last page of x86_64's lower half, since
+/// SYSRET can't return past it (ADR 0007). aarch64's user space ends there
+/// too.
 pub const USER_SPACE_END: u64 = 0x7fff_ffff_f000;
 
-/// A syscall, by its number in RAX.
+/// A syscall, by its number in RAX on x86_64 and x8 on aarch64.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Syscall {
     /// Ends the calling process, with its first argument as the process's
@@ -245,11 +245,11 @@ impl TryFrom<u64> for Syscall {
     }
 }
 
-/// Why a syscall failed, by its code in RAX. A syscall that succeeds
+/// Why a syscall failed, by its code in RAX on x86_64 and x0 on aarch64. A syscall that succeeds
 /// returns 0 there.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
-    /// No syscall has the number in RAX.
+    /// No syscall has the number given.
     UnknownSyscall,
     /// A buffer isn't all in pages mapped for user code.
     BadAddress,

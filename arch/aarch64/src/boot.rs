@@ -6,8 +6,9 @@ use core::ops::Range;
 use core::ptr::addr_of;
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use aarch64_cpu::registers::{CNTKCTL_EL1, CPACR_EL1, ReadWriteable};
 use limine::BaseRevision;
-use limine::request::{DtbRequest, FramebufferRequest, HhdmRequest, MemmapRequest};
+use limine::request::{DtbRequest, FramebufferRequest, HhdmRequest, MemmapRequest, ModulesRequest};
 use thisos_fdt::{Fdt, HEADER_SIZE};
 use thisos_hal::{BootInfo, Framebuffer, MemoryKind, PixelFormat, TrapHandler};
 
@@ -25,6 +26,8 @@ static MEMORY_MAP: MemmapRequest = MemmapRequest::new();
 static FRAMEBUFFER: FramebufferRequest = FramebufferRequest::new();
 static HHDM: HhdmRequest = HhdmRequest::new();
 static DEVICE_TREE: DtbRequest = DtbRequest::new();
+/// The ramdisk, the one module xtask's Limine config loads.
+static MODULES: ModulesRequest = ModulesRequest::new();
 
 /// Where Limine mapped all physical memory, which `boot_info` records. Zero
 /// until then: Limine's mapping is in the upper half, never at 0.
@@ -121,6 +124,11 @@ pub unsafe fn boot_info(trap: TrapHandler<Aarch64>) -> BootInfo<Aarch64> {
     unsafe {
         trap::init(trap);
     }
+    // User code may not use FP or SIMD, whose registers the kernel doesn't
+    // save (ADR 0010), and the kernel's own target has none.
+    CPACR_EL1.modify(CPACR_EL1::FPEN::TrapEl0El1);
+    // User code reads the virtual counter, as x86_64's reads the TSC.
+    CNTKCTL_EL1.modify(CNTKCTL_EL1::EL0VCTEN::TrappedNone);
     assert!(
         BASE_REVISION.is_supported(),
         "Limine doesn't support base revision {}",
@@ -152,8 +160,11 @@ pub unsafe fn boot_info(trap: TrapHandler<Aarch64>) -> BootInfo<Aarch64> {
         framebuffer_write_combining: framebuffer.is_some(),
         framebuffer,
         memory,
-        // User mode isn't ported (ADR 0006), so nothing asks Limine for one.
-        ramdisk: None,
+        // Limine loads modules into memory it reports as executable and
+        // modules, which the frame allocator never hands out.
+        ramdisk: MODULES
+            .response()
+            .and_then(|response| response.modules().first().map(|file| file.data())),
     }
 }
 

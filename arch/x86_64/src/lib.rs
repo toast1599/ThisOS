@@ -127,6 +127,8 @@ impl Platform for X86_64 {
     type PageTables = KernelPageTables;
     type Context = Context;
 
+    const ELF_MACHINE: u16 = 62;
+
     fn take_page_tables(alloc: &mut dyn FnMut() -> Option<Frame>) -> Option<KernelPageTables> {
         // SAFETY: boot_info recorded where the loader mapped all physical
         // memory, and loaded the kernel's own descriptor tables before the

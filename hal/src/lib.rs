@@ -221,8 +221,9 @@ impl TestEnd {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UserProgram {
     /// Puts a value of its own in every general register a syscall keeps,
-    /// and on x86_64 sets the direction, alignment-check and nested-task
-    /// flags, which the kernel must not run with, makes a syscall with the
+    /// on x86_64 sets the direction, alignment-check and nested-task
+    /// flags, which the kernel must not run with, and on aarch64 the
+    /// condition flags, makes a syscall with the
     /// number `u64::MAX`, which no syscall has, then checks those registers
     /// and flags. It exits with the error code the syscall returned if they
     /// all kept their values and the syscall's value is 0, and with
@@ -235,8 +236,9 @@ pub enum UserProgram {
     Privileged,
     /// Runs an SSE instruction, or the architecture's equivalent.
     Simd,
-    /// Spins for 2^28 cycles of a counter user code can read, through many
-    /// timer ticks, then exits with status 0.
+    /// Spins for about a quarter second of a counter user code can read,
+    /// through many timer ticks, then exits with status 0: 2^28 cycles of
+    /// x86_64's TSC, or 2^24 of aarch64's 62.5 MHz virtual counter.
     Spin,
     /// Calls the write syscall with the buffer and the length in the two
     /// words at its argument, then exits with the error code it returned, or with
@@ -339,6 +341,9 @@ pub trait Platform {
 
     /// The kernel's own page tables.
     type PageTables: PageTables;
+
+    /// The `e_machine` of the ELF files user programs come in.
+    const ELF_MACHINE: u16;
 
     /// A suspended kernel thread: where it stopped and the stack it runs
     /// on. Resuming it consumes it, so no thread resumes twice, and

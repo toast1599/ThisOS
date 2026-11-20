@@ -23,4 +23,4 @@ Milestone 3 gives user code its first way into the kernel. design.md left the ca
 - A syscall that needs more than six arguments or more than one value passes them through memory, which needs user copies.
 - A user thread can't use floating point in hardware, or any library built for a target with SSE, until the kernel saves SIMD state per thread. That is due before milestone 7's `std`, and it gets a new record.
 - The page below `0x8000_0000_0000` can never be mapped.
-- aarch64's convention is decided when user mode is ported there ([0006](0006-aarch64-behind-x86_64.md)).
+- aarch64's convention is [0010](0010-syscall-abi-aarch64.md).

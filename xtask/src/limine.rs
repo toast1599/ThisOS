@@ -26,22 +26,40 @@ timeout: 0
     path: boot():/thisos-kernel
 ";
 
+/// The ramdisk's name on the partition, which Limine loads as a module.
+const RAMDISK: &str = "thisos-ramdisk.tar";
+
 /// Writes a GPT disk image to `path` with one EFI system partition holding
-/// Limine, its config, the kernel ELF at `elf` and, when there is one, the
-/// build ID.
-pub fn write_image(elf: &Path, id: Option<&str>, path: &Path) -> Result<()> {
+/// Limine, its config, the kernel ELF at `elf` and, when there are, the
+/// file at `ramdisk`, as a module Limine loads, and the build ID.
+pub fn write_image(
+    elf: &Path,
+    ramdisk: Option<&Path>,
+    id: Option<&str>,
+    path: &Path,
+) -> Result<()> {
     let efi = loader()?;
+    let mut config = CONFIG.to_owned();
+    if ramdisk.is_some() {
+        config.push_str(&format!("    module_path: boot():/{RAMDISK}\n"));
+    }
     let mut files = vec![
         (
             "EFI/BOOT/BOOTAA64.EFI",
             fs::read(&efi).with_context(|| format!("reading {}", efi.display()))?,
         ),
-        ("EFI/BOOT/limine.conf", CONFIG.as_bytes().to_vec()),
+        ("EFI/BOOT/limine.conf", config.into_bytes()),
         (
             "thisos-kernel",
             fs::read(elf).with_context(|| format!("reading {}", elf.display()))?,
         ),
     ];
+    if let Some(ramdisk) = ramdisk {
+        files.push((
+            RAMDISK,
+            fs::read(ramdisk).with_context(|| format!("reading {}", ramdisk.display()))?,
+        ));
+    }
     if let Some(id) = id {
         files.push((BUILD_FILE, format!("{id}\n").into_bytes()));
     }
