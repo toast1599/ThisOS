@@ -10,43 +10,74 @@
 #![no_std]
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
+// paging's tests run on the host, under Miri too. The crate's assembly
+// doesn't assemble there, so test builds have only paging and the heap it
+// maps.
+#[cfg(test)]
+extern crate std;
+
+#[cfg(not(test))]
 mod backtrace;
+#[cfg(not(test))]
 mod boot;
+#[cfg(not(test))]
 mod catch;
+#[cfg(not(test))]
 mod devices;
+#[cfg(not(test))]
 mod framebuffer;
+#[cfg(not(test))]
 mod gic;
 mod heap;
+#[cfg(not(test))]
 mod memory;
+#[cfg(not(test))]
 mod once;
 mod paging;
+#[cfg(not(test))]
 mod sysreg;
+#[cfg(not(test))]
 mod timer;
+#[cfg(not(test))]
 mod trap;
+#[cfg(not(test))]
 mod unported;
 
+#[cfg(not(test))]
 use core::arch::asm;
+#[cfg(not(test))]
 use core::ops::Range;
+#[cfg(not(test))]
 use core::sync::atomic::{AtomicBool, Ordering};
 
+#[cfg(not(test))]
 use aarch64_cpu::asm::{barrier, wfi};
+#[cfg(not(test))]
 use aarch64_cpu::registers::{DAIF, ReadWriteable, Readable, Writeable};
+#[cfg(not(test))]
 use thisos_frames::Frame;
+#[cfg(not(test))]
 use thisos_hal::{
     BacktraceEnd, Cpu, Framebuffer, HeapStats, Platform, Probe, Stack, TestEnd, TimerFrequencies,
     TimerFrequency, Translation, UserProgram,
 };
 
+#[cfg(not(test))]
 pub use framebuffer::FramebufferPixels;
+#[cfg(not(test))]
 pub use memory::MemoryMap;
 pub use paging::{KernelPageTables, UserSpace};
+#[cfg(not(test))]
 pub use trap::TrapFrame;
+#[cfg(not(test))]
 pub use unported::{NoContext, NoSerial};
 
 /// The aarch64 architecture, as the kernel sees it through `thisos-hal`.
+#[cfg(not(test))]
 #[derive(Debug)]
 pub struct Aarch64;
 
+#[cfg(not(test))]
 impl Cpu for Aarch64 {
     fn halt() -> ! {
         DAIF.write(DAIF::D::Masked + DAIF::A::Masked + DAIF::I::Masked + DAIF::F::Masked);
@@ -111,6 +142,7 @@ impl Cpu for Aarch64 {
     }
 }
 
+#[cfg(not(test))]
 impl Platform for Aarch64 {
     type Serial = NoSerial;
     type Pixels = FramebufferPixels;
@@ -266,6 +298,7 @@ impl Platform for Aarch64 {
 }
 
 /// Panics for a HAL call that has no aarch64 implementation yet.
+#[cfg(not(test))]
 #[track_caller]
 fn not_ported(call: &str) -> ! {
     panic!("{call} isn't ported to aarch64")
@@ -294,6 +327,7 @@ fn to_u64(addr: usize) -> u64 {
     addr
 }
 
+#[cfg(not(test))]
 #[doc(hidden)]
 pub use boot::boot_info;
 

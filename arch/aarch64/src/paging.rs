@@ -10,15 +10,67 @@ use core::ops::{Deref, Range};
 use core::ptr;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use aarch64_cpu::asm::barrier::{self, ISH, ISHST};
-use aarch64_cpu::registers::{ID_AA64MMFR1_EL1, MAIR_EL1, Readable, TCR_EL1, TTBR0_EL1, TTBR1_EL1};
+use aarch64_cpu::registers::{ID_AA64MMFR1_EL1, TCR_EL1};
 use spin::Mutex;
 use thisos_frames::Frame;
 use thisos_hal::{MapError, MapErrorKind, Protection, Translation};
 use thisos_regions::{InsertError, Regions};
 
 use crate::heap::{self, Heap};
-use crate::{ptr_at, sysreg, to_u64};
+use crate::{ptr_at, to_u64};
+
+/// The CPU state the tables depend on: the translation registers, PAN, the
+/// TLBs, the caches and the barriers that order the tables' stores for the
+/// walker. Host tests swap in `tests::cpu`, a fake per test thread.
+#[cfg(not(test))]
+mod cpu {
+    use aarch64_cpu::asm::barrier::{self, ISH, ISHST};
+    use aarch64_cpu::registers::{
+        ID_AA64MMFR1_EL1, MAIR_EL1, Readable, TCR_EL1, TTBR0_EL1, TTBR1_EL1,
+    };
+
+    pub(super) use crate::sysreg::{
+        dc_civac, enable_pan, read_ctr, sync_icache, tlbi_aside1is, tlbi_vaae1is, tlbi_vae1is,
+        tlbi_vmalle1is, write_mair, write_tcr, write_ttbr0, write_ttbr1,
+    };
+
+    pub fn mmfr1() -> u64 {
+        ID_AA64MMFR1_EL1.get()
+    }
+
+    pub fn tcr() -> u64 {
+        TCR_EL1.get()
+    }
+
+    pub fn mair() -> u64 {
+        MAIR_EL1.get()
+    }
+
+    /// The level 0 table TTBR0 points at.
+    pub fn ttbr0() -> u64 {
+        TTBR0_EL1.get_baddr()
+    }
+
+    /// The level 0 table TTBR1 points at.
+    pub fn ttbr1() -> u64 {
+        TTBR1_EL1.get_baddr()
+    }
+
+    pub fn dsb_ishst() {
+        barrier::dsb(ISHST);
+    }
+
+    pub fn dsb_ish() {
+        barrier::dsb(ISH);
+    }
+
+    pub fn isb() {
+        barrier::isb(barrier::SY);
+    }
+}
+
+#[cfg(test)]
+use tests::cpu;
 
 // Descriptor bits, for the 4 KiB granule.
 const VALID: u64 = 1 << 0;
@@ -258,8 +310,8 @@ impl PageTables {
         unsafe { leaf.store(phys | flags) };
         // An invalid entry is never in a TLB, so the new one needs no
         // flush, only to reach the walker before the page is used.
-        barrier::dsb(ISHST);
-        barrier::isb(barrier::SY);
+        cpu::dsb_ishst();
+        cpu::isb();
         Ok(())
     }
 
@@ -395,7 +447,7 @@ impl Entry<'_> {
 
 /// Drops the global entry for kernel page `page` from every TLB.
 fn flush_kernel_page(page: u64) {
-    sysreg::tlbi_vaae1is(page);
+    cpu::tlbi_vaae1is(page);
 }
 
 /// Drops every TLB entry of ASID 0, which every user space uses, and
@@ -403,13 +455,13 @@ fn flush_kernel_page(page: u64) {
 /// and TCR writes in effect first, so that no walk after the TLBI uses the
 /// old values.
 fn flush_user() {
-    barrier::isb(barrier::SY);
-    sysreg::tlbi_aside1is();
+    cpu::isb();
+    cpu::tlbi_aside1is();
 }
 
 /// Drops the entry for user page `page`, in ASID 0, from every TLB.
 fn flush_user_page(page: u64) {
-    sysreg::tlbi_vae1is(page);
+    cpu::tlbi_vae1is(page);
 }
 
 /// Turns TTBR0's walks off, so that the lower half is empty, and drops
@@ -424,7 +476,7 @@ fn empty_lower_half() {
 /// Whether TTBR0's walks are on, so that the lower half is mapped through
 /// TTBR0's table.
 fn ttbr0_walks() -> bool {
-    TCR_EL1.matches_all(TCR_EL1::EPD0::EnableTTBR0Walks)
+    TCR_EL1::EPD0::EnableTTBR0Walks.matches_all(cpu::tcr())
 }
 
 /// The page tables the kernel built and runs on. Only `take` makes one,
@@ -533,34 +585,34 @@ pub unsafe fn take(
         return None;
     }
     assert!(
-        ID_AA64MMFR1_EL1.read(ID_AA64MMFR1_EL1::PAN) != 0,
+        ID_AA64MMFR1_EL1::PAN.read(cpu::mmfr1()) != 0,
         "the CPU lacks PAN"
     );
-    let tcr = TCR_EL1.extract();
-    let t1sz = tcr.read(TCR_EL1::T1SZ);
+    let tcr = cpu::tcr();
+    let t1sz = TCR_EL1::T1SZ.read(tcr);
     assert!(t1sz == 16, "Limine set TCR_EL1.T1SZ to {t1sz}, not 16");
-    let tg1 = tcr.read(TCR_EL1::TG1);
+    let tg1 = TCR_EL1::TG1.read(tcr);
     assert!(
-        tcr.matches_all(TCR_EL1::TG1::KiB_4),
+        TCR_EL1::TG1::KiB_4.matches_all(tcr),
         "Limine set TCR_EL1.TG1 to {tg1:#b}, not 4 KiB"
     );
     // USER_SPACE and every user space's walk assume the same for TTBR0.
-    let t0sz = tcr.read(TCR_EL1::T0SZ);
+    let t0sz = TCR_EL1::T0SZ.read(tcr);
     assert!(t0sz == 16, "Limine set TCR_EL1.T0SZ to {t0sz}, not 16");
-    let tg0 = tcr.read(TCR_EL1::TG0);
+    let tg0 = TCR_EL1::TG0.read(tcr);
     assert!(
-        tcr.matches_all(TCR_EL1::TG0::KiB_4),
+        TCR_EL1::TG0::KiB_4.matches_all(tcr),
         "Limine set TCR_EL1.TG0 to {tg0:#b}, not 4 KiB"
     );
     // Either would let the walker write entries, which the software Access
     // flag and Entry, whose walker only reads, assume it never does.
     assert!(
-        tcr.read(TCR_EL1::HA) == 0 && tcr.read(TCR_EL1::HD) == 0,
+        TCR_EL1::HA.read(tcr) == 0 && TCR_EL1::HD.read(tcr) == 0,
         "Limine turned on TCR_EL1.HA or HD"
     );
     let loader = PageTables {
         phys_offset,
-        level_0: TTBR1_EL1.get_baddr(),
+        level_0: cpu::ttbr1(),
     };
     assert!(
         loader.translate(guard).is_none(),
@@ -598,10 +650,10 @@ pub unsafe fn take(
             panic!("mapping the device page {page:#x} failed: {kind:?}");
         }
     }
-    let mair = MAIR_EL1.get() & !(0xffff << 16);
+    let mair = cpu::mair() & !(0xffff << 16);
     // SAFETY: Limine's tables use attributes 0 and 1 alone, so changing 2
     // and 3 changes no live mapping.
-    unsafe { sysreg::write_mair(mair | (MAIR_NON_CACHEABLE << 16) | (MAIR_DEVICE << 24)) };
+    unsafe { cpu::write_mair(mair | (MAIR_NON_CACHEABLE << 16) | (MAIR_DEVICE << 24)) };
     // SAFETY: The new tables map every upper-half address to the same frame
     // as Limine's, with the same attributes apart from the global bit,
     // EL0 access, execute permissions and the framebuffer's cacheability,
@@ -620,7 +672,7 @@ pub unsafe fn take(
     // SAFETY: PAN only stops EL1 reaching EL0 pages, of which there are
     // none yet; the kernel never reaches one but through user copies, which
     // will clear PSTATE.PAN for it.
-    unsafe { sysreg::enable_pan() };
+    unsafe { cpu::enable_pan() };
     Some(KernelPageTables {
         tables,
         space,
@@ -643,29 +695,29 @@ pub unsafe fn take(
 unsafe fn load_kernel(level_0: u64) {
     // The Release stores that built the tables order them, but the walker
     // is only certain to see them after a dsb.
-    barrier::dsb(ISHST);
+    cpu::dsb_ishst();
     // SAFETY: The caller guarantees the table maps what the kernel reaches.
-    unsafe { sysreg::write_ttbr1(level_0) };
-    barrier::isb(barrier::SY);
+    unsafe { cpu::write_ttbr1(level_0) };
+    cpu::isb();
     // QEMU models no TLB conflicts; hardware that does could raise one
     // between the switch and this flush for an address whose old and new
     // entries differ in the global bit, which needs the switch made from
     // tables that map the switching code alone.
-    sysreg::tlbi_vmalle1is();
+    cpu::tlbi_vmalle1is();
 }
 
 /// Turns TTBR0's walks on or off with `TCR_EL1.EPD0` (bit 7).
 ///
 /// # Safety
 ///
-/// Turning them on needs TTBR0 to hold a table that `sysreg::write_ttbr0`'s
+/// Turning them on needs TTBR0 to hold a table that `cpu::write_ttbr0`'s
 /// contract covers.
 unsafe fn set_ttbr0_walks(on: bool) {
-    let tcr = TCR_EL1.get();
+    let tcr = cpu::tcr();
     let tcr = if on { tcr & !(1 << 7) } else { tcr | (1 << 7) };
     // SAFETY: Only EPD0 changes, and the caller guarantees TTBR0's table
     // when it turns the walks on.
-    unsafe { sysreg::write_tcr(tcr) };
+    unsafe { cpu::write_tcr(tcr) };
 }
 
 /// The first address that level 0 entry `index` of the upper half maps.
@@ -803,7 +855,7 @@ impl thisos_hal::PageTables for KernelPageTables {
         }
         let ttbr0 = PageTables {
             phys_offset: self.tables.phys_offset,
-            level_0: TTBR0_EL1.get_baddr(),
+            level_0: cpu::ttbr0(),
         };
         (0..512).any(|i| ttbr0.entry(ttbr0.level_0, i).load() & VALID != 0)
     }
@@ -844,7 +896,7 @@ pub struct UserSpace<O> {
 impl<O> UserSpace<O> {
     /// Whether the CPU translates the lower half through this space.
     fn active(&self) -> bool {
-        ttbr0_walks() && TTBR0_EL1.get_baddr() == self.tables.level_0
+        ttbr0_walks() && cpu::ttbr0() == self.tables.level_0
     }
 }
 
@@ -971,10 +1023,10 @@ impl<O: Deref<Target = [Frame]> + Send + Sync> thisos_hal::AddressSpace<O> for U
     fn activate(&self) {
         // SAFETY: Only map maps in the space, with frames its mappings'
         // objects hold until the pages are gone.
-        unsafe { sysreg::write_ttbr0(self.tables.level_0) };
+        unsafe { cpu::write_ttbr0(self.tables.level_0) };
         // Without it the TCR write could take effect first, and walks
         // would start from the TTBR0 a destroyed space left.
-        barrier::isb(barrier::SY);
+        cpu::isb();
         // SAFETY: TTBR0 holds this space's table, as above.
         unsafe { set_ttbr0_walks(true) };
         flush_user();
@@ -998,13 +1050,20 @@ impl<O: Deref<Target = [Frame]> + Send + Sync> thisos_hal::AddressSpace<O> for U
 }
 
 /// Where `addr` is mapped in the tables the CPU uses now.
+#[cfg_attr(
+    test,
+    expect(
+        dead_code,
+        reason = "only Platform::translate_active calls it, which host tests don't build"
+    )
+)]
 pub fn translate_active(phys_offset: u64, addr: u64) -> Option<Translation> {
     // Only reads entries, one atomic load each, so it can share the tables
     // with their owner.
     let level_0 = if addr >= UPPER_HALF {
-        TTBR1_EL1.get_baddr()
+        cpu::ttbr1()
     } else if addr < 1 << 48 && ttbr0_walks() {
-        TTBR0_EL1.get_baddr()
+        cpu::ttbr0()
     } else {
         return None;
     };
@@ -1017,6 +1076,13 @@ pub fn translate_active(phys_offset: u64, addr: u64) -> Option<Translation> {
 
 /// Writes `ret` at the start of `frame`, and makes instruction fetches see
 /// it.
+#[cfg_attr(
+    test,
+    expect(
+        dead_code,
+        reason = "only Platform::write_return calls it, which host tests don't build"
+    )
+)]
 pub fn write_return(phys_offset: u64, frame: &mut Frame) {
     // A physical address, reached through the physical-memory mapping.
     let word = ptr_at::<u32>(phys_offset + frame.start());
@@ -1025,7 +1091,7 @@ pub fn write_return(phys_offset: u64, frame: &mut Frame) {
     // the frames it maps, so neither maps this one: nothing maps it but the
     // physical-memory mapping, and no Rust reference to its memory exists.
     unsafe { word.write_volatile(0xd65f_03c0) };
-    sysreg::sync_icache(to_u64(word.addr()));
+    cpu::sync_icache(to_u64(word.addr()));
 }
 
 /// Writes back and drops every data cache line that holds part of the
@@ -1038,13 +1104,809 @@ pub fn write_return(phys_offset: u64, frame: &mut Frame) {
 /// `range` must be mapped.
 unsafe fn clean(range: Range<u64>) {
     // DminLine, bits 19:16, is the smallest data cache line in words.
-    let line = 4 << ((sysreg::read_ctr() >> 16) & 0xf);
+    let line = 4 << ((cpu::read_ctr() >> 16) & 0xf);
     let mut addr = range.start & !(line - 1);
     while addr < range.end {
         // SAFETY: The caller guarantees range is mapped, and the line
         // holding addr overlaps it, so lies in the same pages.
-        unsafe { sysreg::dc_civac(addr) };
+        unsafe { cpu::dc_civac(addr) };
         addr += line;
     }
-    barrier::dsb(ISH);
+    cpu::dsb_ish();
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::vec::Vec;
+    use std::{hint, thread, vec};
+
+    use thisos_frames::{FLOOR, Frames};
+    use thisos_hal::{AddressSpace as _, PageTables as _};
+
+    use self::cpu::Flush;
+    use super::*;
+
+    /// The CPU as the tables see it, faked per test thread: the registers
+    /// start as Limine leaves them, but with TTBR0 and TTBR1 at 0, where no
+    /// table is; TLB maintenance and cache cleaning are recorded, and
+    /// barriers do nothing.
+    pub mod cpu {
+        use core::cell::RefCell;
+        use std::vec::Vec;
+
+        use aarch64_cpu::registers::{ID_AA64MMFR1_EL1, TCR_EL1};
+
+        /// A TLB maintenance operation.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub enum Flush {
+            /// `tlbi vaae1is`: a page in every ASID, global entries too.
+            KernelPage(u64),
+            /// `tlbi vae1is`: a page in ASID 0.
+            UserPage(u64),
+            /// `tlbi aside1is`: all of ASID 0.
+            User,
+            /// `tlbi vmalle1is`: everything.
+            All,
+        }
+
+        /// `MAIR_EL1` before `take`: attribute 0 normal write-back and 1
+        /// device, as Limine uses them, and bytes in 2 and 3 that `take`
+        /// replaces.
+        pub const MAIR: u64 = 0x1122_3344_5566_04ff;
+
+        pub struct Fake {
+            pub tcr: u64,
+            pub mair: u64,
+            pub ttbr0: u64,
+            pub ttbr1: u64,
+            pub pan: bool,
+            pub flushes: Vec<Flush>,
+            /// The addresses `dc civac` was given.
+            pub cleaned: Vec<u64>,
+        }
+
+        std::thread_local! {
+            static FAKE: RefCell<Fake> = RefCell::new(Fake {
+                // 48-bit halves of 4 KiB pages, TTBR0's walks on.
+                tcr: (TCR_EL1::T0SZ.val(16)
+                    + TCR_EL1::T1SZ.val(16)
+                    + TCR_EL1::TG0::KiB_4
+                    + TCR_EL1::TG1::KiB_4)
+                    .value,
+                mair: MAIR,
+                ttbr0: 0,
+                ttbr1: 0,
+                pan: false,
+                flushes: Vec::new(),
+                cleaned: Vec::new(),
+            });
+        }
+
+        pub fn with<R>(f: impl FnOnce(&mut Fake) -> R) -> R {
+            FAKE.with_borrow_mut(f)
+        }
+
+        /// The flushes since the last call.
+        pub fn flushes() -> Vec<Flush> {
+            with(|cpu| core::mem::take(&mut cpu.flushes))
+        }
+
+        fn flush(op: Flush) {
+            with(|cpu| cpu.flushes.push(op));
+        }
+
+        pub fn mmfr1() -> u64 {
+            ID_AA64MMFR1_EL1::PAN.val(1).value
+        }
+
+        pub fn tcr() -> u64 {
+            with(|cpu| cpu.tcr)
+        }
+
+        pub fn mair() -> u64 {
+            with(|cpu| cpu.mair)
+        }
+
+        pub fn ttbr0() -> u64 {
+            with(|cpu| cpu.ttbr0)
+        }
+
+        pub fn ttbr1() -> u64 {
+            with(|cpu| cpu.ttbr1)
+        }
+
+        /// # Safety
+        ///
+        /// None; it is unsafe as the real one is.
+        pub unsafe fn write_ttbr0(table: u64) {
+            with(|cpu| cpu.ttbr0 = table);
+        }
+
+        /// # Safety
+        ///
+        /// None; it is unsafe as the real one is.
+        pub unsafe fn write_ttbr1(table: u64) {
+            with(|cpu| cpu.ttbr1 = table);
+        }
+
+        /// # Safety
+        ///
+        /// None; it is unsafe as the real one is.
+        pub unsafe fn write_tcr(value: u64) {
+            with(|cpu| cpu.tcr = value);
+        }
+
+        /// # Safety
+        ///
+        /// None; it is unsafe as the real one is.
+        pub unsafe fn write_mair(value: u64) {
+            with(|cpu| cpu.mair = value);
+        }
+
+        /// # Safety
+        ///
+        /// None; it is unsafe as the real one is.
+        pub unsafe fn enable_pan() {
+            with(|cpu| cpu.pan = true);
+        }
+
+        /// 64-byte data cache lines: `CTR_EL0.DminLine`, in words, is 16.
+        pub fn read_ctr() -> u64 {
+            4 << 16
+        }
+
+        /// # Safety
+        ///
+        /// None; it is unsafe as the real one is.
+        pub unsafe fn dc_civac(addr: u64) {
+            with(|cpu| cpu.cleaned.push(addr));
+        }
+
+        pub fn sync_icache(_: u64) {}
+
+        pub fn tlbi_vaae1is(page: u64) {
+            flush(Flush::KernelPage(page));
+        }
+
+        pub fn tlbi_vae1is(page: u64) {
+            flush(Flush::UserPage(page));
+        }
+
+        pub fn tlbi_aside1is() {
+            flush(Flush::User);
+        }
+
+        pub fn tlbi_vmalle1is() {
+            flush(Flush::All);
+        }
+
+        pub fn dsb_ishst() {}
+
+        pub fn dsb_ish() {}
+
+        pub fn isb() {}
+    }
+
+    /// Physical memory ends here; the frames from `FLOOR` up are free.
+    const END: u64 = 0x14_0000;
+    const PAGES: usize = 0x140;
+    const _: () = assert!(END == 4096 * 0x140);
+
+    #[derive(Clone)]
+    #[repr(C, align(4096))]
+    struct Phys([u8; 4096]);
+
+    /// A buffer standing in for physical memory from 0 to `END`, and the
+    /// frame allocator over it.
+    struct Memory {
+        frames: Frames<5>,
+        phys_offset: u64,
+        _buffer: Vec<Phys>,
+    }
+
+    impl Memory {
+        fn new() -> Self {
+            let mut buffer = vec![Phys([0; 4096]); PAGES];
+            // The tables reach the buffer only through this address, as the
+            // kernel reaches RAM through the physical-memory mapping, so the
+            // buffer's provenance has to be exposed.
+            let start = buffer.as_mut_ptr().expose_provenance();
+            let Ok(start) = u64::try_from(start) else {
+                panic!("a host address wider than 64 bits");
+            };
+            let mut frames = Frames::new();
+            assert_eq!(frames.add(FLOOR..END), 0);
+            Self {
+                frames,
+                phys_offset: start,
+                _buffer: buffer,
+            }
+        }
+
+        fn frame(&mut self) -> Frame {
+            let Some(frame) = self.frames.alloc() else {
+                panic!("the test's physical memory is used up");
+            };
+            frame
+        }
+
+        fn object(&mut self, pages: usize) -> Object {
+            Object(Arc::new((0..pages).map(|_| self.frame()).collect()))
+        }
+
+        fn free_object(&mut self, object: Object) {
+            let Some(frames) = Arc::into_inner(object.0) else {
+                panic!("an object is still shared");
+            };
+            for frame in frames {
+                self.frames.free(frame);
+            }
+        }
+    }
+
+    /// A memory object as the kernel's `Mapping` is: frames that mappings
+    /// share.
+    #[derive(Clone)]
+    struct Object(Arc<Vec<Frame>>);
+
+    impl Deref for Object {
+        type Target = [Frame];
+
+        fn deref(&self) -> &[Frame] {
+            &self.0
+        }
+    }
+
+    /// Kernel page tables as `take` leaves them, without Limine's upper
+    /// half: the reserved level 0 entry and its level 1 table.
+    fn kernel(memory: &mut Memory) -> KernelPageTables {
+        let space = 300;
+        let mut tables = PageTables {
+            phys_offset: memory.phys_offset,
+            level_0: 0,
+        };
+        tables.level_0 = tables.new_table(memory.frame());
+        let level_1 = tables.new_table(memory.frame());
+        // SAFETY: The tables aren't in use.
+        unsafe { tables.entry(tables.level_0, space).store(level_1 | TABLE) };
+        KernelPageTables {
+            tables,
+            space,
+            // SAFETY: Nothing is mapped in the space entry, and the test
+            // never grows the heap.
+            heap: unsafe { Heap::new(space_start(space)) },
+            stacks: stack_window(space).start,
+        }
+    }
+
+    fn new_space(kernel: &KernelPageTables, memory: &mut Memory) -> UserSpace<Object> {
+        let Some(space) = kernel.new_space(&mut || memory.frames.alloc()) else {
+            panic!("no frame for a level 0 table");
+        };
+        space
+    }
+
+    /// Destroys `space`, frees every frame it held, and checks that the
+    /// frame count is back to `free`.
+    fn destroy(space: UserSpace<Object>, memory: &mut Memory, free: usize) {
+        let mut objects = Vec::new();
+        space.destroy(&mut |object| objects.push(object), &mut |frame| {
+            memory.frames.free(frame);
+        });
+        for object in objects {
+            memory.free_object(object);
+        }
+        assert_eq!(memory.frames.free_frames(), free);
+    }
+
+    /// The level and value of the block or page descriptor that maps
+    /// `addr`, or `None` if nothing does.
+    fn descriptor(tables: &PageTables, addr: u64) -> Option<(u8, u64)> {
+        let mut table = tables.level_0;
+        for (level, index) in (0..4).zip(indices(addr)) {
+            let value = tables.entry(table, index).load();
+            if value & VALID == 0 {
+                return None;
+            }
+            if is_leaf(level, value) {
+                return Some((level, value));
+            }
+            table = value & ADDRESS;
+        }
+        None
+    }
+
+    #[test]
+    fn user_mappings_translate_and_unmap() {
+        let mut memory = Memory::new();
+        let kernel = kernel(&mut memory);
+        let free = memory.frames.free_frames();
+        let space = new_space(&kernel, &mut memory);
+        let data = memory.object(3);
+        let code = memory.object(1);
+        let (data_1, code_0) = (data[1].start(), code[0].start());
+        let mut alloc = || memory.frames.alloc();
+        let rw = space.map(
+            0x40_0000,
+            data.clone(),
+            0,
+            3,
+            Protection::ReadWrite,
+            &mut alloc,
+        );
+        let rx = space.map(0x40_3000, code, 0, 1, Protection::ReadExecute, &mut alloc);
+        let ro = space.map(0x80_0000, data, 1, 2, Protection::ReadOnly, &mut alloc);
+        assert!(rw.is_ok() && rx.is_ok() && ro.is_ok());
+        let translation = |phys, writable, executable| {
+            Some(Translation {
+                phys,
+                writable,
+                executable,
+                user: true,
+            })
+        };
+        assert_eq!(
+            space.translate(0x40_1234),
+            translation(data_1 + 0x234, true, false)
+        );
+        assert_eq!(
+            space.translate(0x40_3008),
+            translation(code_0 + 8, false, true)
+        );
+        assert_eq!(
+            space.translate(0x80_0010),
+            translation(data_1 + 0x10, false, false)
+        );
+        assert_eq!(space.translate(0x40_4000), None);
+        // EL1 may execute no user page.
+        let Some((_, leaf)) = descriptor(&space.tables, 0x40_3000) else {
+            panic!("the code page isn't mapped");
+        };
+        assert_eq!(leaf & (PXN | NOT_GLOBAL | EL0), PXN | NOT_GLOBAL | EL0);
+
+        let other = memory.object(1);
+        let Err(error) = space.map(0x40_2000, other, 0, 1, Protection::ReadOnly, &mut || {
+            memory.frames.alloc()
+        }) else {
+            panic!("an overlapping mapping was made");
+        };
+        assert_eq!(error.kind, MapErrorKind::Mapped);
+        memory.free_object(error.given);
+
+        let Some(data) = space.unmap(0x40_0000) else {
+            panic!("the mapping at 0x40_0000 is gone");
+        };
+        assert_eq!(space.translate(0x40_1234), None);
+        assert!(space.unmap(0x40_0000).is_none());
+        // The read-only mapping still shares the frames.
+        assert_eq!(
+            space.translate(0x80_0010),
+            translation(data_1 + 0x10, false, false)
+        );
+        drop(data);
+        assert_eq!(
+            cpu::flushes(),
+            Vec::<Flush>::new(),
+            "flushed an inactive space's pages"
+        );
+        destroy(space, &mut memory, free);
+    }
+
+    #[test]
+    fn failed_map_takes_its_pages_back() {
+        let mut memory = Memory::new();
+        let kernel = kernel(&mut memory);
+        let free = memory.frames.free_frames();
+        let space = new_space(&kernel, &mut memory);
+        let object = memory.object(3);
+        // The third page needs a second level 3 table, and the frames run
+        // out after the first one.
+        let mut budget = 3;
+        let mut alloc = || {
+            budget -= 1;
+            (budget >= 0).then(|| memory.frames.alloc()).flatten()
+        };
+        let Err(error) = space.map(0x1f_e000, object, 0, 3, Protection::ReadWrite, &mut alloc)
+        else {
+            panic!("mapped with too few frames");
+        };
+        assert_eq!(error.kind, MapErrorKind::NoFrames);
+        assert_eq!(space.translate(0x1f_e000), None);
+        assert_eq!(space.translate(0x1f_f000), None);
+        // The range is free again.
+        let mapped = space.map(
+            0x1f_e000,
+            error.given,
+            0,
+            3,
+            Protection::ReadWrite,
+            &mut || memory.frames.alloc(),
+        );
+        assert!(mapped.is_ok());
+        destroy(space, &mut memory, free);
+    }
+
+    #[test]
+    fn only_the_active_space_flushes() {
+        let mut memory = Memory::new();
+        let kernel = kernel(&mut memory);
+        let free = memory.frames.free_frames();
+        let space = new_space(&kernel, &mut memory);
+        let object = memory.object(2);
+        space.activate();
+        assert_eq!(cpu::flushes(), [Flush::User]);
+        assert!(!kernel.lower_half_mapped());
+        let mapped = space.map(0x40_0000, object, 0, 2, Protection::ReadOnly, &mut || {
+            memory.frames.alloc()
+        });
+        assert!(mapped.is_ok());
+        // An invalid entry is never in the TLB.
+        assert_eq!(cpu::flushes(), Vec::<Flush>::new());
+        assert!(kernel.lower_half_mapped());
+        let Some(object) = space.unmap(0x40_0000) else {
+            panic!("the mapping is gone");
+        };
+        assert_eq!(
+            cpu::flushes(),
+            [Flush::UserPage(0x40_0000), Flush::UserPage(0x40_1000)]
+        );
+
+        kernel.activate();
+        assert_eq!(cpu::flushes(), [Flush::User]);
+        let mapped = space.map(0x40_0000, object, 0, 2, Protection::ReadOnly, &mut || {
+            memory.frames.alloc()
+        });
+        assert!(mapped.is_ok());
+        assert!(!kernel.lower_half_mapped());
+        assert!(space.unmap(0x40_0000).is_some_and(|object| {
+            memory.free_object(object);
+            true
+        }));
+        assert_eq!(cpu::flushes(), Vec::<Flush>::new());
+
+        // Destroying the active space turns TTBR0's walks off.
+        space.activate();
+        assert_eq!(cpu::flushes(), [Flush::User]);
+        destroy(space, &mut memory, free);
+        assert_eq!(cpu::flushes(), [Flush::User]);
+        assert!(!ttbr0_walks());
+    }
+
+    #[test]
+    fn kernel_space_maps_in_every_space() {
+        let mut memory = Memory::new();
+        let mut kernel = kernel(&mut memory);
+        let space = new_space(&kernel, &mut memory);
+        let start = kernel.kernel_space().start;
+        for (page, kind) in [
+            (start + 8, MapErrorKind::Unaligned),
+            (start - 4096, MapErrorKind::OutsideKernelSpace),
+        ] {
+            let frame = memory.frame();
+            let Err(error) = kernel.map(page, frame, true, &mut || memory.frames.alloc()) else {
+                panic!("mapped {page:#x}");
+            };
+            assert_eq!(error.kind, kind);
+            memory.frames.free(error.given);
+        }
+
+        let frame = memory.frame();
+        let phys = frame.start();
+        let mapped = kernel.map(start, frame, true, &mut || memory.frames.alloc());
+        assert!(mapped.is_ok());
+        assert_eq!(cpu::flushes(), Vec::<Flush>::new());
+        let expected = Some(Translation {
+            phys: phys + 0x10,
+            writable: true,
+            executable: false,
+            user: false,
+        });
+        assert_eq!(kernel.translate(start + 0x10), expected);
+        // The space was made before the page was mapped, and shares the
+        // level 0 table's reserved entry.
+        assert_eq!(space.translate(start + 0x10), expected);
+        let Some((_, leaf)) = descriptor(&kernel.tables, start) else {
+            panic!("the page at {start:#x} isn't mapped");
+        };
+        assert_eq!(leaf & (NOT_GLOBAL | EL0 | UXN | PXN), UXN | PXN);
+        assert!(!kernel.lower_half_mapped());
+
+        let Some(frame) = kernel.unmap(start) else {
+            panic!("the page at {start:#x} is gone");
+        };
+        assert_eq!(frame.start(), phys);
+        assert_eq!(cpu::flushes(), [Flush::KernelPage(start)]);
+        assert!(kernel.unmap(start).is_none());
+        assert_eq!(space.translate(start + 0x10), None);
+        memory.frames.free(frame);
+    }
+
+    // A syscall can start a thread, so running out of frames for its stack
+    // fails the call rather than the kernel.
+    #[test]
+    fn a_stack_without_frames_gives_back_what_it_took() {
+        let mut memory = Memory::new();
+        let mut kernel = kernel(&mut memory);
+        let mut freed = Vec::new();
+        // The first stack adds the tables the window's first stacks share.
+        let Some(first) =
+            kernel.map_stack(STACK_SIZE, &mut || memory.frames.alloc(), &mut |frame| {
+                freed.push(frame);
+            })
+        else {
+            panic!("no first stack");
+        };
+        let free = memory.frames.free_frames();
+        let mut left = 2;
+        let failed = kernel.map_stack(
+            STACK_SIZE,
+            &mut || {
+                left -= 1;
+                if left < 0 {
+                    None
+                } else {
+                    memory.frames.alloc()
+                }
+            },
+            &mut |frame| freed.push(frame),
+        );
+        assert!(failed.is_none());
+        assert_eq!(freed.len(), 2);
+        for frame in freed.drain(..) {
+            memory.frames.free(frame);
+        }
+        assert_eq!(memory.frames.free_frames(), free);
+        let Some(next) =
+            kernel.map_stack(STACK_SIZE, &mut || memory.frames.alloc(), &mut |frame| {
+                freed.push(frame);
+            })
+        else {
+            panic!("no stack after the failed one");
+        };
+        // The failed stack's pages stay unmapped, below the next stack.
+        let failed = first.range().end + 4096..next.range().start - 4096;
+        assert!(!failed.is_empty());
+        assert!(
+            failed
+                .step_by(4096)
+                .all(|page| kernel.translate(page).is_none())
+        );
+    }
+
+    #[test]
+    fn stacks_are_guarded_aligned_and_apart_from_kernel_space() {
+        let mut memory = Memory::new();
+        let mut kernel = kernel(&mut memory);
+        let window = stack_window(kernel.space);
+        let free = memory.frames.free_frames();
+        let mut taken = 0_usize;
+        let mut alloc = || {
+            taken += 1;
+            memory.frames.alloc()
+        };
+        let stacks: Vec<Stack> = (0..3)
+            .map(|_| {
+                let Some(stack) = kernel.map_stack(STACK_SIZE, &mut alloc, &mut |_| {
+                    panic!("a stack freed a frame");
+                }) else {
+                    panic!("no stack");
+                };
+                stack
+            })
+            .collect();
+        let ranges: Vec<Range<u64>> = stacks.iter().map(Stack::range).collect();
+        for range in &ranges {
+            assert_eq!(usize::try_from(range.end - range.start), Ok(STACK_SIZE));
+            // The trap vectors' overflow check needs this.
+            assert_eq!(range.start % (2 * to_u64(STACK_SIZE)), 0, "{range:#x?}");
+            assert!(window.start <= range.start && range.end <= window.end);
+            assert_eq!(kernel.translate(range.start - 4096), None, "guard page");
+            for page in range.clone().step_by(4096) {
+                let Some(t) = kernel.translate(page) else {
+                    panic!("stack page {page:#x} isn't mapped");
+                };
+                assert!(t.writable && !t.executable && !t.user, "{page:#x}: {t:?}");
+            }
+        }
+
+        // map and unmap stay out of the window, guard pages included.
+        assert!(!kernel.kernel_space().contains(&(window.end - 1)));
+        for page in [ranges[0].start - 4096, ranges[1].start] {
+            let frame = memory.frame();
+            let Err(error) = kernel.map(page, frame, true, &mut || memory.frames.alloc()) else {
+                panic!("mapped {page:#x}");
+            };
+            assert_eq!(error.kind, MapErrorKind::OutsideKernelSpace);
+            memory.frames.free(error.given);
+            assert!(kernel.unmap(page).is_none(), "unmapped {page:#x}");
+        }
+
+        cpu::flushes();
+        let tables = taken - 3 * (STACK_SIZE / 4096);
+        for stack in stacks {
+            kernel.unmap_stack(stack, &mut |frame| memory.frames.free(frame));
+        }
+        assert_eq!(memory.frames.free_frames(), free - tables);
+        let unmapped: Vec<u64> = ranges
+            .iter()
+            .flat_map(|range| range.clone().step_by(4096))
+            .collect();
+        let flushed: Vec<Flush> = unmapped
+            .iter()
+            .map(|&page| Flush::KernelPage(page))
+            .collect();
+        assert_eq!(cpu::flushes(), flushed);
+        assert!(
+            unmapped
+                .iter()
+                .all(|&page| kernel.translate(page).is_none())
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "aarch64 maps only 65536")]
+    fn stacks_have_one_size() {
+        let mut memory = Memory::new();
+        let mut kernel = kernel(&mut memory);
+        kernel.map_stack(STACK_SIZE / 2, &mut || memory.frames.alloc(), &mut |_| {});
+    }
+
+    /// Where the fake Limine maps physical memory and the kernel's image,
+    /// level 0 entries 256 and 511, as Limine does.
+    const HHDM: u64 = 0xffff_8000_0000_0000;
+    const IMAGE: u64 = 0xffff_ffff_8000_0000;
+
+    // take runs once a process, so this is the only test that calls it.
+    #[test]
+    fn take_copies_limines_upper_half() {
+        let mut memory = Memory::new();
+        let phys_offset = memory.phys_offset;
+        let mut loader = PageTables {
+            phys_offset,
+            level_0: 0,
+        };
+        loader.level_0 = loader.new_table(memory.frame());
+        let [hhdm_1, hhdm_2, image_1, image_2, image_3] =
+            core::array::from_fn(|_| loader.new_table(memory.frame()));
+        let normal = VALID | INNER_SHAREABLE | ACCESSED;
+        let page = normal | TABLE_OR_PAGE;
+        let mut entries = vec![
+            (loader.level_0, 256, hhdm_1 | TABLE),
+            (hhdm_1, 0, hhdm_2 | TABLE),
+            (loader.level_0, 511, image_1 | TABLE),
+            (image_1, 510, image_2 | TABLE),
+            (image_2, 0, image_3 | TABLE),
+            // .text, the second page with bits the copy drops.
+            (image_3, 0, 0x10_0000 | page | READ_ONLY),
+            (image_3, 1, 0x10_1000 | page | READ_ONLY | EL0 | NOT_GLOBAL),
+            // .rodata and .data.
+            (image_3, 2, 0x10_2000 | page | READ_ONLY),
+            (image_3, 3, 0x10_3000 | page),
+        ];
+        // Physical memory, as 2 MiB blocks.
+        entries.extend((0..4).map(|i| (hhdm_2, i, (i << 21) | normal | NOT_GLOBAL)));
+        for (table, index, value) in entries {
+            // SAFETY: The tables aren't in use.
+            unsafe { loader.entry(table, index).store(value) };
+        }
+        cpu::with(|cpu| cpu.ttbr1 = loader.level_0);
+        // The framebuffer is inside the second block, and the GIC's
+        // registers are in none.
+        let fb = HHDM + 0x20_3800..HHDM + 0x20_5100;
+        let gic = 0x800_0000..0x800_1800;
+        let guard = IMAGE - 4096;
+        // SAFETY: Nothing reaches memory through the tables, the fake CPU
+        // included, so what they map needs no vouching for.
+        let kernel = unsafe {
+            take(
+                phys_offset,
+                guard,
+                IMAGE..IMAGE + 0x1800,
+                fb,
+                &[gic],
+                &mut || memory.frames.alloc(),
+            )
+        };
+        let Some(kernel) = kernel else {
+            panic!("take refused its first call");
+        };
+        // SAFETY: As above.
+        let again = unsafe { take(phys_offset, guard, 0..0, 0..0, &[], &mut || None) };
+        assert!(again.is_none(), "take ran twice");
+
+        cpu::with(|cpu| {
+            assert_eq!(cpu.ttbr1, kernel.tables.level_0);
+            assert_eq!(cpu.mair, 0x1122_3344_0444_04ff);
+            assert!(cpu.pan);
+            let lines: Vec<u64> = (HHDM + 0x20_3000..HHDM + 0x20_6000).step_by(64).collect();
+            assert_eq!(cpu.cleaned, lines);
+        });
+        assert_eq!(cpu::flushes(), [Flush::All, Flush::User]);
+        assert!(!ttbr0_walks());
+
+        let at = |addr| descriptor(&kernel.tables, addr);
+        // Blocks stay blocks, global and executable by neither EL.
+        let block = normal | UXN | PXN;
+        assert_eq!(at(HHDM + 0x1234), Some((2, block)));
+        assert_eq!(at(HHDM + 0x40_0000), Some((2, 0x40_0000 | block)));
+        // The framebuffer's block becomes pages, non-cacheable where the
+        // framebuffer is.
+        let split = page | UXN | PXN;
+        for phys in [0x20_2000, 0x20_6000] {
+            assert_eq!(at(HHDM + phys), Some((3, phys | split)));
+        }
+        for phys in [0x20_3000, 0x20_4000, 0x20_5000] {
+            assert_eq!(
+                at(HHDM + phys),
+                Some((3, phys | split | ATTR_NON_CACHEABLE))
+            );
+        }
+        // EL1 executes only .text's read-only pages, and EL0 none.
+        let code = page | READ_ONLY | UXN;
+        assert_eq!(at(IMAGE), Some((3, 0x10_0000 | code)));
+        assert_eq!(at(IMAGE + 0x1000), Some((3, 0x10_1000 | code)));
+        assert_eq!(at(IMAGE + 0x2000), Some((3, 0x10_2000 | code | PXN)));
+        assert_eq!(at(IMAGE + 0x3000), Some((3, 0x10_3000 | page | UXN | PXN)));
+        assert_eq!(at(guard), None);
+        // The GIC's pages, in the physical-memory mapping.
+        let device = VALID | TABLE_OR_PAGE | ACCESSED | ATTR_DEVICE | PXN | UXN;
+        for phys in [0x800_0000, 0x800_1000] {
+            assert_eq!(at(phys_offset + phys), Some((3, phys | device)));
+        }
+        // The copy has tables of its own, and the kernel's entry is one
+        // Limine left free.
+        assert_ne!(
+            kernel.tables.entry(kernel.tables.level_0, 256).load(),
+            loader.entry(loader.level_0, 256).load()
+        );
+        assert_eq!(loader.entry(loader.level_0, kernel.space).load(), 0);
+    }
+
+    // The walker reads entries while the space changes, so that Miri's race
+    // detector sees any non-atomic access to them. Both mappings share one
+    // level 3 table, linked before the walker starts, so meanwhile the space
+    // only stores and clears entries.
+    #[test]
+    fn the_walker_reads_entries_as_they_change() {
+        let mut memory = Memory::new();
+        let kernel = kernel(&mut memory);
+        let free = memory.frames.free_frames();
+        let space = new_space(&kernel, &mut memory);
+        for addr in [0x40_0000, 0x40_4000] {
+            let object = memory.object(4);
+            let mapped = space.map(addr, object, 0, 4, Protection::ReadWrite, &mut || {
+                memory.frames.alloc()
+            });
+            assert!(mapped.is_ok());
+        }
+        space.activate();
+        let tables = PageTables {
+            phys_offset: space.tables.phys_offset,
+            level_0: space.tables.level_0,
+        };
+        let walker = thread::spawn(move || {
+            for addr in (0x40_0000..0x40_8000).step_by(4096) {
+                hint::black_box(tables.translate(addr));
+            }
+        });
+        let Some(object) = space.unmap(0x40_4000) else {
+            panic!("the mapping at 0x40_4000 is gone");
+        };
+        let phys = object[1].start();
+        let mapped = space.map(0x40_4000, object, 1, 2, Protection::ReadOnly, &mut || {
+            memory.frames.alloc()
+        });
+        assert!(mapped.is_ok());
+        let Some(object) = space.unmap(0x40_0000) else {
+            panic!("the mapping at 0x40_0000 is gone");
+        };
+        assert!(walker.join().is_ok());
+        memory.free_object(object);
+
+        assert_eq!(space.translate(0x40_0000), None);
+        assert_eq!(space.translate(0x40_4000).map(|t| t.phys), Some(phys));
+        assert_eq!(space.translate(0x40_6000), None);
+        destroy(space, &mut memory, free);
+    }
 }

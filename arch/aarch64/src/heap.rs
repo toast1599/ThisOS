@@ -14,7 +14,7 @@ use crate::{ptr_at, to_u64};
 /// The heap's share of the reserved level 0 entry, from its start.
 pub const SIZE: u64 = 64 << 30;
 
-#[global_allocator]
+#[cfg_attr(not(test), global_allocator)]
 static TALC: TalcLock<spin::Mutex<()>, Manual> = TalcLock::new(Manual);
 
 /// The heap's pages, mapped from `base` up to `mapped` bytes above it, and
@@ -81,6 +81,13 @@ impl Heap {
 }
 
 /// Talc's counters. Takes talc's lock, so trap handlers never call it.
+#[cfg_attr(
+    test,
+    expect(
+        dead_code,
+        reason = "only Platform::heap_stats calls it, which host tests don't build"
+    )
+)]
 pub fn stats() -> HeapStats {
     let talc = TALC.lock();
     let counters = talc.counters();

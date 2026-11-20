@@ -77,14 +77,14 @@ pub fn ci() -> Result<()> {
     let host = output(Command::new("rustc").args(["--print", "host-tuple"]))?;
     for manifest in &libs {
         let mut miri = cargo();
-        // The arch crate reaches its page tables, in tests a buffer, by
+        // The arch crates reach their page tables, in tests a buffer, by
         // turning physical addresses into pointers, as the kernel does
         // through the physical-memory mapping. That needs exposed
         // provenance, which Miri allows only in permissive mode. There an
         // access must still land inside an allocation whose address was
         // exposed, though not necessarily the buffer. Strict mode would need
         // the tables to carry a pointer in place of the mapping's offset.
-        if manifest.ends_with(test::ARCH_X86_64) {
+        if manifest.ends_with(test::ARCH_X86_64) || manifest.ends_with(test::ARCH_AARCH64) {
             miri.env("MIRIFLAGS", "-Zmiri-permissive-provenance");
         }
         exec(
