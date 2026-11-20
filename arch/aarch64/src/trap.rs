@@ -11,9 +11,9 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use thisos_hal::{Access, BacktraceEnd, Cpu, Trap, TrapHandler};
 
-use crate::boot::STACK_SIZE;
 use crate::gic::{self, Acknowledged, Group};
 use crate::once::Once;
+use crate::paging::STACK_SIZE;
 use crate::{Aarch64, backtrace, catch, not_ported, paging, timer, to_u64};
 
 // The vector table: 16 entries of 0x80 bytes, for a synchronous exception,

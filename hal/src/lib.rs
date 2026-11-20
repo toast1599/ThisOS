@@ -522,7 +522,8 @@ pub trait PageTables: Send {
     /// an unmapped page below it that an overflow runs into, and its start
     /// is aligned to the power of two at or above twice its size, so that
     /// an architecture can tell an overflow by one bit of the stack
-    /// pointer. Stack addresses are never mapped again after
+    /// pointer. An architecture that does may map one size only, and
+    /// panic on any other. Stack addresses are never mapped again after
     /// [`PageTables::unmap_stack`], nor after a failed call. Returns
     /// `None` if `alloc` or the stacks' addresses run out, having handed
     /// the stack's frames it took to `free`; tables it added stay.

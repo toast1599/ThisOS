@@ -473,6 +473,11 @@ pub struct KernelPageTables {
     stacks: u64,
 }
 
+/// The size of every stack EL1 runs on, and the only one `map_stack`
+/// takes. Each one's base is aligned to twice this, so that the exception
+/// vectors can tell an overflow by one bit of SP.
+pub(crate) const STACK_SIZE: usize = 64 << 10;
+
 /// A kernel stack: whole pages of the stacks' window, mapped writable for
 /// one owner, with an unmapped page below. Only `map_stack` makes one.
 #[derive(Debug)]
@@ -802,8 +807,12 @@ impl thisos_hal::PageTables for KernelPageTables {
         alloc: &mut dyn FnMut() -> Option<Frame>,
         free: &mut dyn FnMut(Frame),
     ) -> Option<Stack> {
-        let size = to_u64(size.next_multiple_of(4096));
-        let align = (2 * size).next_power_of_two();
+        assert_eq!(
+            size, STACK_SIZE,
+            "a stack of {size} bytes; aarch64 maps only {STACK_SIZE}"
+        );
+        let size = to_u64(STACK_SIZE);
+        let align = 2 * size;
         let window = stack_window(self.space);
         // The page below start stays unmapped: it is at or above the
         // cursor, where nothing is mapped yet.

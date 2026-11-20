@@ -13,6 +13,7 @@ use thisos_hal::{BootInfo, Framebuffer, MemoryKind, PixelFormat, TrapHandler};
 
 use crate::framebuffer::FramebufferPixels;
 use crate::memory::MemoryMap;
+use crate::paging::STACK_SIZE;
 use crate::{Aarch64, backtrace, devices, ptr_at, to_u64, trap};
 
 // Limine finds these by their magic numbers anywhere in the kernel's
@@ -51,11 +52,6 @@ pub(crate) fn framebuffer_range() -> Range<u64> {
 pub(crate) fn text() -> Range<u64> {
     to_u64(addr_of!(__text_start).addr())..to_u64(addr_of!(__text_end).addr())
 }
-
-/// The size of every stack EL1 runs on. Each one's base is aligned to twice
-/// this, so that the exception vectors can tell an overflow by one bit of
-/// SP.
-pub(crate) const STACK_SIZE: usize = 64 << 10;
 
 // Limine enters at EL1 with the MMU on, interrupts masked and SP_EL0 on a
 // stack of its own, which has nothing unmapped below it. _start moves to
