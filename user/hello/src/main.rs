@@ -14,7 +14,7 @@ use thisos_rt::{Channel, Handle, Signals, println};
 thisos_rt::entry!(main);
 
 fn main(creator: Handle<Channel>) -> u64 {
-    if let Err(e) = creator.wait(Signals::READABLE, None) {
+    if let Err(e) = creator.wait(Signals::READABLE | Signals::PEER_CLOSED, None) {
         panic!("waiting for the line failed: {e:?}");
     }
     let mut line = Vec::new();

@@ -127,9 +127,34 @@ pub fn start_init() {
     let Some((archive, object)) = ramdisk() else {
         return;
     };
-    if let Err(e) = start_program(ramdisk_file(archive, "init"), object) {
+    if let Err(e) = start_with_ramdisk(ramdisk_file(archive, "init"), object) {
         panic!("starting init failed: {e}");
     }
+}
+
+/// Starts the executable in `file` as a user-space loader starts one: its
+/// one handle is the receiving end of a channel whose other end is closed,
+/// where one message waits, with a handle to the process itself with
+/// [`PROCESS_RIGHTS`] and one to `ramdisk` with [`RAMDISK_RIGHTS`]. The
+/// message is sent once the program runs, since it holds the process.
+fn start_with_ramdisk(file: &[u8], ramdisk: Arc<MemoryObject>) -> Result<Arc<Process>, LoadError> {
+    let (ours, theirs) = channel::create().map_err(LoadError::Start)?;
+    let mut handles = Vec::new();
+    handles
+        .try_reserve_exact(2)
+        .map_err(|_| LoadError::NoMemory)?;
+    let process = start_program(file, theirs)?;
+    handles.push((Object::Process(Arc::clone(&process)), PROCESS_RIGHTS));
+    handles.push((Object::Memory(ramdisk), RAMDISK_RIGHTS));
+    // Fails with PeerClosed only if the program ended without its message.
+    ours.send(|| {
+        Ok(Message {
+            bytes: Vec::new(),
+            handles,
+        })
+    })
+    .map_err(LoadError::Start)?;
+    Ok(process)
 }
 
 /// Why [`start_program`] failed.
@@ -163,33 +188,14 @@ struct Program {
 }
 
 /// Loads the executable in `file` and starts it in a process of its own,
-/// as a user-space loader starts one: its one handle is the receiving end
-/// of a channel whose other end is closed, where one message waits, with a
-/// handle to the process itself with [`PROCESS_RIGHTS`] and one to
-/// `ramdisk` with [`RAMDISK_RIGHTS`].
-fn start_program(file: &[u8], ramdisk: Arc<MemoryObject>) -> Result<Arc<Process>, LoadError> {
+/// whose one handle is `endpoint`, with [`ENDPOINT_RIGHTS`].
+fn start_program(file: &[u8], endpoint: Endpoint) -> Result<Arc<Process>, LoadError> {
     let program = load(file)?;
     let process = Process::new(program.space).map_err(LoadError::Start)?;
-    let (ours, theirs) = channel::create().map_err(LoadError::Start)?;
-    let theirs = Arc::try_new(theirs).map_err(|_| LoadError::NoMemory)?;
-    let mut handles = Vec::new();
-    handles
-        .try_reserve_exact(2)
-        .map_err(|_| LoadError::NoMemory)?;
-    handles.push((Object::Process(Arc::clone(&process)), PROCESS_RIGHTS));
-    handles.push((Object::Memory(ramdisk), RAMDISK_RIGHTS));
-    // A new channel has room, and its other end is open.
-    ours.send(|| {
-        Ok(Message {
-            bytes: Vec::new(),
-            handles,
-        })
-    })
-    .map_err(LoadError::Start)?;
-    drop(ours);
+    let endpoint = Arc::try_new(endpoint).map_err(|_| LoadError::NoMemory)?;
     process
         .start(program.entry, program.stack_top, || {
-            Ok((Object::Channel(theirs), ENDPOINT_RIGHTS))
+            Ok((Object::Channel(endpoint), ENDPOINT_RIGHTS))
         })
         .map_err(LoadError::Start)?;
     Ok(process)
@@ -780,6 +786,7 @@ impl fmt::Display for Escaped<'_> {
 #[cfg(test)]
 mod tests {
     use alloc::string::String;
+    use alloc::vec;
     use alloc::vec::Vec;
     use core::ops::Range;
     use core::ptr;
@@ -858,6 +865,24 @@ mod tests {
     /// Runs the program `name` from the ramdisk as the kernel runs init,
     /// and returns how it ended; see [`finish`].
     fn run_program(name: &str) -> End {
+        run_program_by(name, start_with_ramdisk, || {})
+    }
+
+    /// Runs the program `name` from the ramdisk with its one handle
+    /// `endpoint`, whose peer is closed, and returns how it ended; see
+    /// [`finish`].
+    fn run_program_alone(name: &str, endpoint: Endpoint) -> End {
+        run_program_by(name, |file, _| start_program(file, endpoint), || {})
+    }
+
+    /// Starts the program `name` from the ramdisk by `start`, given its
+    /// file and the ramdisk's copy, runs `meanwhile`, and returns how the
+    /// program ended; see [`finish`].
+    fn run_program_by(
+        name: &str,
+        start: impl FnOnce(&[u8], Arc<MemoryObject>) -> Result<Arc<Process>, LoadError>,
+        meanwhile: impl FnOnce(),
+    ) -> End {
         let Some((archive, object)) = ramdisk() else {
             panic!("no ramdisk");
         };
@@ -868,10 +893,21 @@ mod tests {
         };
         let before = frames::free_frames();
         let tables = paging::stack_table_frames();
-        match start_program(file, object) {
-            Ok(process) => finish(&process, before, tables, entry),
+        let process = match start(file, object) {
+            Ok(process) => process,
             Err(e) => panic!("starting {name} failed: {e}"),
-        }
+        };
+        meanwhile();
+        finish(&process, before, tables, entry)
+    }
+
+    /// Checks that a ramdisk program panicked with `message`: that it
+    /// exited with 101, rt's panic status, and that the last record it
+    /// wrote, its panic report, ends with `message`.
+    fn assert_panicked(end: End, message: &str) {
+        let written = take_written();
+        assert_eq!(end, End::Exited(101), "wrote {written:?}");
+        assert!(written.ends_with(message), "wrote {written:?}");
     }
 
     /// Waits until `process`, whose code starts at `code`, has ended and
@@ -935,6 +971,59 @@ mod tests {
     #[test_case]
     fn the_process_and_memory_checks_pass() {
         assert_eq!(run_program("checks"), End::Exited(0));
+    }
+
+    // A creator that closes without sending, or a pong that closes without
+    // answering, sends nothing more, so a wait for READABLE alone would
+    // never return.
+    #[test_case]
+    fn hello_ends_when_its_creator_closes_without_a_line() {
+        let (creator, hello) = channel::pair();
+        drop(creator);
+        take_written();
+        assert_panicked(
+            run_program_alone("hello", hello),
+            "receiving the line failed: PeerClosed",
+        );
+    }
+
+    #[test_case]
+    fn ping_ends_when_its_creator_closes_without_pong() {
+        let (creator, ping) = channel::pair();
+        drop(creator);
+        take_written();
+        assert_panicked(
+            run_program_alone("ping", ping),
+            "receiving the endpoint to pong failed: PeerClosed",
+        );
+    }
+
+    #[test_case]
+    fn ping_ends_when_pong_closes_without_answering() {
+        let (creator, to_creator) = channel::pair();
+        let (pong, to_pong) = channel::pair();
+        let handles = vec![(Object::Channel(Arc::new(to_pong)), ENDPOINT_RIGHTS)];
+        let sent = creator.send(|| {
+            Ok(Message {
+                bytes: Vec::new(),
+                handles,
+            })
+        });
+        assert!(sent.is_ok(), "sending ping its endpoint to pong failed");
+        take_written();
+        let end = run_program_by(
+            "ping",
+            |file, _| start_program(file, to_creator),
+            || {
+                let items = [(Waitable::Channel(Arc::new(pong)), Signals::READABLE)];
+                // Once ping has sent, it waits for the answer, and pong
+                // closes with the message still queued.
+                let first = wait::wait(&items, &mut [Signals::NONE], wait::deadline(5_000_000_000));
+                assert_eq!(first, Ok(1), "waiting for ping's first message");
+            },
+        );
+        assert_panicked(end, "receiving pong's answer failed: PeerClosed");
+        drop(creator);
     }
 
     #[test_case]

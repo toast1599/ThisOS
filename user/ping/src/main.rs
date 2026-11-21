@@ -74,7 +74,7 @@ fn main(creator: Handle<Channel>) -> u64 {
 /// Receives the creator's one message, and returns the endpoint it
 /// carries.
 fn receive_pong(creator: &Handle<Channel>) -> Handle<Channel> {
-    if let Err(e) = creator.wait(Signals::READABLE, None) {
+    if let Err(e) = creator.wait(Signals::READABLE | Signals::PEER_CLOSED, None) {
         panic!("waiting for the endpoint to pong failed: {e:?}");
     }
     let handles = match creator.receive(&mut Vec::new()) {
@@ -99,7 +99,7 @@ fn round_trip(
     if let Err((e, _)) = pong.send(bytes, handles) {
         panic!("sending to pong failed: {e:?}");
     }
-    if let Err(e) = pong.wait(Signals::READABLE, None) {
+    if let Err(e) = pong.wait(Signals::READABLE | Signals::PEER_CLOSED, None) {
         panic!("waiting for pong's answer failed: {e:?}");
     }
     let (len, handles) = match pong.receive_into(received) {
