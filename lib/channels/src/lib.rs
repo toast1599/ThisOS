@@ -126,10 +126,9 @@ impl<T> Channel<T> {
         }
     }
 
-    /// Queues the message `make` returns at `from`'s peer, and calls
-    /// `wake` with the waiters that wakes. Calls `make` only once the
-    /// message has a place,
-    /// so a send that fails with [`Error::PeerClosed`],
+    /// Queues the message `make` returns at `from`'s peer, and calls `wake`
+    /// with the waiters that wakes. Calls `make` only once the message has a
+    /// place, so a send that fails with [`Error::PeerClosed`],
     /// [`Error::ShouldWait`] if [`MAX_QUEUED`] messages wait there, or
     /// [`Error::NoMemory`], never calls it. A failure from `make` sends
     /// nothing.
@@ -155,11 +154,10 @@ impl<T> Channel<T> {
     }
 
     /// Hands the oldest message waiting at `at` to `take`, returns what it
-    /// returns, and calls `wake` with the waiters that wakes. A failed
-    /// `take` hands the
-    /// message back, and it stays the oldest. Fails with
-    /// [`Error::ShouldWait`] if no message waits, or [`Error::PeerClosed`]
-    /// if none waits and the peer is closed.
+    /// returns, and calls `wake` with the waiters that wakes. A failed `take`
+    /// hands the message back, and it stays the oldest. Fails with
+    /// [`Error::ShouldWait`] if no message waits, or [`Error::PeerClosed`] if
+    /// none waits and the peer is closed.
     pub fn receive<R>(
         &mut self,
         at: Side,
@@ -188,10 +186,9 @@ impl<T> Channel<T> {
     }
 
     /// Closes `side`, and calls `wake` with the waiters that wakes. The
-    /// messages
-    /// waiting there stay until [`Channel::discard`] takes them, and
-    /// messages it sent stay for its peer to receive. Closing it again
-    /// wakes nobody.
+    /// messages waiting there stay until [`Channel::discard`] takes them, and
+    /// messages it sent stay for its peer to receive. Closing it again wakes
+    /// nobody.
     pub fn close(&mut self, side: Side, wake: impl FnMut(u64)) {
         let before = self.both_signals();
         self.closed[side.index()] = true;

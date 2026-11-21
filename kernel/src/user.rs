@@ -269,9 +269,11 @@ fn map_object(
         .map_err(|e| LoadError::Map { addr, kind: e.kind })
 }
 
-/// Handles a trap that [`TrapFrame::raised_by_user`](thisos_hal::TrapFrame::raised_by_user)
-/// says user code raised: runs a syscall, and ends the process on any other
-/// trap, or on the exit syscall.
+/// Handles a trap that [`TrapFrame::raised_by_user`] says user code raised:
+/// runs a syscall, and ends the process on any other trap, or on the exit
+/// syscall.
+///
+/// [`TrapFrame::raised_by_user`]: thisos_hal::TrapFrame::raised_by_user
 pub fn trap(trap: Trap, frame: &mut <Arch as Platform>::TrapFrame) {
     if trap != Trap::Syscall {
         end(End::Killed {
@@ -942,6 +944,15 @@ mod tests {
         end
     }
 
+    /// A handle to `process` itself, with [`PROCESS_RIGHTS`], as the
+    /// argument of a program that checks syscalls on its own handles.
+    fn self_handle(_: u64, process: &Arc<Process>) -> u64 {
+        let Ok(handle) = process.insert_self(PROCESS_RIGHTS) else {
+            panic!("a new handle table is full");
+        };
+        u64::from(handle)
+    }
+
     fn page_object() -> MemoryObject {
         let Ok(object) = MemoryObject::new(1) else {
             panic!("no memory for a page");
@@ -964,6 +975,48 @@ mod tests {
             take_written(),
             "init: hello exited with status 0x5, fault was killed, ping and pong exited with status 0x0"
         );
+    }
+
+    // by_page splits every copy at page boundaries, so the HAL's copies
+    // check only one page; one that crossed would check too little.
+    #[test_case]
+    const A_USER_COPY_ACROSS_A_PAGE_PANICS: crate::testing::ExpectPanic =
+        crate::testing::ExpectPanic {
+            name: "thisos_kernel::user::tests::a_user_copy_across_a_page_panics",
+            run: || {
+                let mut buf = [0; 2];
+                Arch::without_interrupts(|| Arch::copy_from_user(0x1_0fff, &mut buf));
+            },
+            message: "copying 2 bytes at 0x10fff crosses a page",
+            after: None,
+        };
+
+    // by_page copies a page at a time, so a write that runs into a page it
+    // can't write has written the bytes before that page.
+    #[test_case]
+    fn a_user_copy_writes_up_to_the_first_bad_page() {
+        let Some(space) = paging::new_space() else {
+            panic!("no free frame for a space");
+        };
+        for (page, protection) in [
+            (0x40_0000, Protection::ReadWrite),
+            (0x40_1000, Protection::ReadOnly),
+        ] {
+            if let Err(e) = map_object(&space, page, page_object(), protection) {
+                panic!("mapping {page:#x} failed: {e}");
+            }
+        }
+        // A tick would switch this kernel thread back to the kernel's
+        // tables.
+        let bytes = Arch::without_interrupts(|| {
+            space.activate();
+            assert!(!copy_to_user(0x40_0fff, b"ab"));
+            let mut bytes = [0; 2];
+            assert!(copy_from_user(0x40_0fff, &mut bytes));
+            paging::activate();
+            bytes
+        });
+        assert_eq!(&bytes, b"a\0");
     }
 
     // checks tests the process-building, memory-copy and wait syscalls' error
@@ -1029,45 +1082,25 @@ mod tests {
 
     #[test_case]
     fn handle_syscalls_check_handles_and_rights() {
-        let (end, _) = run(UserProgram::Handles, |_, process| {
-            let Ok(handle) = process.insert_self(PROCESS_RIGHTS) else {
-                panic!("a new handle table is full");
-            };
-            u64::from(handle)
-        });
+        let (end, _) = run(UserProgram::Handles, self_handle);
         assert_eq!(end, End::Exited(0));
     }
 
     #[test_case]
     fn memory_syscalls_create_map_share_and_unmap() {
-        let (end, _) = run(UserProgram::Memory, |_, process| {
-            let Ok(handle) = process.insert_self(PROCESS_RIGHTS) else {
-                panic!("a new handle table is full");
-            };
-            u64::from(handle)
-        });
+        let (end, _) = run(UserProgram::Memory, self_handle);
         assert_eq!(end, End::Exited(0));
     }
 
     #[test_case]
     fn channel_syscalls_move_bytes_and_handles() {
-        let (end, _) = run(UserProgram::Channel, |_, process| {
-            let Ok(handle) = process.insert_self(PROCESS_RIGHTS) else {
-                panic!("a new handle table is full");
-            };
-            u64::from(handle)
-        });
+        let (end, _) = run(UserProgram::Channel, self_handle);
         assert_eq!(end, End::Exited(0));
     }
 
     #[test_case]
     fn wait_syscall_checks_its_items_and_observes_signals() {
-        let (end, _) = run(UserProgram::Wait, |_, process| {
-            let Ok(handle) = process.insert_self(PROCESS_RIGHTS) else {
-                panic!("a new handle table is full");
-            };
-            u64::from(handle)
-        });
+        let (end, _) = run(UserProgram::Wait, self_handle);
         assert_eq!(end, End::Exited(0));
     }
 

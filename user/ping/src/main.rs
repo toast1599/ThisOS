@@ -1,12 +1,12 @@
 //! Times round trips to `pong` and sends the results to its creator.
 //!
 //! Its creator sends it one message carrying its endpoint of a channel to
-//! `pong`. It times a near-empty syscall, then round trips of several
-//! sizes, the last carrying a handle, and closes the channel, which ends
-//! `pong`. The results go to the creator as little-endian `u64`s: the
-//! cycle counter's frequency in Hz, or 0 where it isn't known; the syscall's min,
-//! median and max in cycles; and for each round trip its bytes, its
-//! handles, and its min, median and max.
+//! `pong`. It times a near-empty syscall, then round trips of several sizes,
+//! the last carrying a handle, and closes the channel, which ends `pong`. The
+//! results go to the creator as little-endian `u64`s: the cycle counter's
+//! frequency in Hz, or 0 where it isn't known; the syscall's min, median and
+//! max in cycles; and for each round trip its bytes, its handles, and its min,
+//! median and max.
 
 #![no_std]
 #![no_main]

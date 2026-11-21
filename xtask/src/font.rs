@@ -41,7 +41,8 @@ pub fn font() -> Result<()> {
             if metrics.advance_width.round() as usize != width {
                 bail!("{c:?} at {px} px isn't {width} px wide");
             }
-            // fontdue's ymin is the bitmap's bottom edge, upwards from the baseline.
+            // fontdue's ymin is the bitmap's bottom edge, upwards from the
+            // baseline.
             let top = baseline - metrics.ymin - metrics.height as i32;
             let mut lost = false;
             for (gy, row) in bitmap.chunks_exact(metrics.width.max(1)).enumerate() {

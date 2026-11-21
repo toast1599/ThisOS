@@ -226,16 +226,16 @@ impl TestEnd {
 /// code of its own choosing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UserProgram {
-    /// Puts a value of its own in every general register a syscall keeps,
-    /// on x86_64 sets the direction, alignment-check and nested-task
-    /// flags, which the kernel must not run with, and on aarch64 the
-    /// condition flags, makes a syscall with the number `u64::MAX`, which
-    /// no syscall has, then checks those registers and flags. On aarch64
-    /// it first checks that `TPIDR_EL0`, a new thread's, and `TPIDRRO_EL0`
-    /// read 0, so that no kernel value reaches user code through them. It
-    /// exits with the error code the syscall returned if every check holds
-    /// and the syscall's value is 0, and with `u64::MAX` otherwise. It leaves the trap flag clear, since set it
-    /// would single-step the program itself.
+    /// Puts a value of its own in every general register a syscall keeps, on
+    /// x86_64 sets the direction, alignment-check and nested-task flags, which
+    /// the kernel must not run with, and on aarch64 the condition flags, makes
+    /// a syscall with the number `u64::MAX`, which no syscall has, then checks
+    /// those registers and flags. On aarch64 it first checks that `TPIDR_EL0`,
+    /// a new thread's, and `TPIDRRO_EL0` read 0, so that no kernel value
+    /// reaches user code through them. It exits with the error code the syscall
+    /// returned if every check holds and the syscall's value is 0, and with
+    /// `u64::MAX` otherwise. It leaves the trap flag clear, since set it would
+    /// single-step the program itself.
     Syscalls,
     /// Reads the byte at its argument, then exits with status 0.
     Read,
@@ -247,8 +247,8 @@ pub enum UserProgram {
     /// through many timer ticks, then exits with status 0: 2^28 cycles of
     /// x86_64's TSC, or 2^24 of aarch64's 62.5 MHz virtual counter.
     Spin,
-    /// Calls the write syscall with the buffer and the length in the two
-    /// words at its argument, then exits with the error code it returned, or with
+    /// Calls the write syscall with the buffer and the length in the two words
+    /// at its argument, then exits with the error code it returned, or with
     /// `u64::MAX` if it succeeded but its value isn't the length.
     Write,
     /// Raises the debug exception that needs no debugger: ICEBP on x86_64,
@@ -464,18 +464,18 @@ pub trait Platform {
     fn write_frame(frame: &Frame, offset: usize, bytes: &[u8]);
 
     /// Copies the bytes at `addr` in the address space the CPU uses into
-    /// `buf`, reaching their frames through the kernel's own mapping, so
-    /// the kernel never reaches user pages. Returns `false`, with `buf`
-    /// partly written, unless every byte is in a page mapped for user code.
-    /// Panics if interrupts are on: with them off, nothing can unmap the
-    /// pages or write them during the copy.
+    /// `buf`, reaching their frame through the kernel's own mapping, so the
+    /// kernel never reaches user pages. The bytes must end inside `addr`'s
+    /// page; a caller splits a longer copy. Returns `false`, copying
+    /// nothing, unless the page is mapped for user code. Panics if the
+    /// bytes cross a page, or if interrupts are on: with them off, nothing
+    /// can unmap the page or write it during the copy.
     fn copy_from_user(addr: u64, buf: &mut [u8]) -> bool;
 
     /// Copies `buf` to `addr` in the address space the CPU uses, as
-    /// [`copy_from_user`](Self::copy_from_user) copies the other way.
-    /// Returns `false`, with the pages before the first bad one written,
-    /// unless every byte is in a page mapped writable for user code.
-    /// Panics if interrupts are on.
+    /// [`copy_from_user`](Self::copy_from_user) copies the other way, and
+    /// panics as it does. Returns `false`, copying nothing, unless the page
+    /// is mapped writable for user code.
     fn copy_to_user(addr: u64, buf: &[u8]) -> bool;
 
     /// Writes code that only returns at the start of `frame`, for

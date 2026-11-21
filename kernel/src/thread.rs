@@ -150,20 +150,20 @@ fn with<T>(f: impl FnOnce(&mut Scheduler) -> T) -> T {
 /// the reaper. `kernel::init` calls this once, after `heap::init` and
 /// before the timer starts.
 pub fn init() {
-    let boot_stack = || {
+    let stack = || {
         let Some(stack) = paging::map_stack(STACK_SIZE) else {
             panic!("no frames for the idle thread's and the reaper's stacks");
         };
         stack
     };
     let idle = Box::new(Thread::new(
-        Some(Arch::new_context(boot_stack(), idle)),
+        Some(Arch::new_context(stack(), idle)),
         None,
         None,
         None,
     ));
     let reaper = Box::new(Thread::new(
-        Some(Arch::new_context(boot_stack(), start)),
+        Some(Arch::new_context(stack(), start)),
         Some(Entry::Kernel(Box::new(reaper))),
         None,
         None,
@@ -428,12 +428,8 @@ pub fn yield_now() {
 }
 
 /// Hands the CPU to the next ready thread. The kernel's trap handler calls
-/// this on every timer tick, with interrupts off. Does nothing before
-/// `init`.
+/// this on every timer tick, with interrupts off.
 pub fn tick() {
-    if SCHEDULER.lock().is_none() {
-        return;
-    }
     with(|scheduler| {
         let now = timer::ticks();
         let due =

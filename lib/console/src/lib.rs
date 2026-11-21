@@ -301,10 +301,10 @@ impl<M: Pixels> Screen<M> {
 }
 
 /// Writes `pixels` to the indices in `run`, two per 8-byte store, which
-/// [`Pixels::store_pair`] only takes at an even index: a run that starts
-/// at an odd index writes its first pixel alone, and one with an odd
-/// number of pixels after that writes its last alone. On an uncached framebuffer each store is a bus
-/// transaction, whatever its width.
+/// [`Pixels::store_pair`] only takes at an even index: a run that starts at an
+/// odd index writes its first pixel alone, and one with an odd number of pixels
+/// after that writes its last alone. On an uncached framebuffer each store is a
+/// bus transaction, whatever its width.
 fn write_pixels(fb: &mut impl Pixels, run: Range<usize>, mut pixels: impl Iterator<Item = u32>) {
     let mut index = run.start;
     if index % 2 == 1

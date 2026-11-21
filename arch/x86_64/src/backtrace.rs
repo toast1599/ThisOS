@@ -1,6 +1,6 @@
-//! Walking the frame pointers on the running thread's stack. The kernel is built with
-//! frame pointers, so each function's prologue pushes its caller's rbp right
-//! below the return address and points rbp at it.
+//! Walking the frame pointers on the running thread's stack. The kernel is
+//! built with frame pointers, so each function's prologue pushes its caller's
+//! rbp right below the return address and points rbp at it.
 
 use core::ops::Range;
 use core::sync::atomic::{AtomicU64, Ordering};

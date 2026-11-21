@@ -1,5 +1,5 @@
-//! The GIC, version 3: its distributor, the boot CPU's redistributor and the CPU
-//! interface's system registers. Only the virtual timer's interrupt is
+//! The GIC, version 3: its distributor, the boot CPU's redistributor and the
+//! CPU interface's system registers. Only the virtual timer's interrupt is
 //! enabled; every other private and shared interrupt stays off.
 
 use core::hint::spin_loop;

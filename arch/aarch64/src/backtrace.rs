@@ -1,5 +1,5 @@
-//! Walking the frame records on the running thread's stack. The kernel is built with
-//! frame pointers, so each function's prologue stores its caller's x29 and
+//! Walking the frame records on the running thread's stack. The kernel is built
+//! with frame pointers, so each function's prologue stores its caller's x29 and
 //! its own return address, x30, as a pair and points x29 at it.
 
 use core::ops::Range;

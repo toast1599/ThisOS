@@ -1,6 +1,7 @@
 //! The source check for the banned patterns in CONTRIBUTING.md that no
-//! lint catches: `static mut`, `&'static mut`, and unchecked operations,
-//! which `disallowed-methods` catches only one listed path at a time.
+//! lint catches: `static mut`, `&'static mut`, unchecked operations, which
+//! `disallowed-methods` catches only one listed path at a time, and comment
+//! lines wider than rustfmt leaves them.
 
 use std::fs;
 use std::io;
@@ -22,6 +23,10 @@ const LOADER_ENTRY: (&str, &str) = ("arch/x86_64/src/lib.rs", "bootloader_api::B
 /// `Tss::slot`'s atomic writes would alias.
 const TSS_DESCRIPTOR: (&str, &str) = ("arch/x86_64/src/trap.rs", "tss_segment_unchecked");
 
+/// The most columns a comment line may take, its indentation included.
+/// rustfmt doesn't wrap comments, so nothing else holds them to it.
+const COMMENT_WIDTH: usize = 80;
+
 /// Fails, naming each line, if any Rust source in the repository, tracked or
 /// not yet added, has a banned pattern.
 pub fn check() -> Result<()> {
@@ -36,6 +41,7 @@ pub fn check() -> Result<()> {
     for path in files.lines() {
         if let Some(source) = source(path)? {
             found.extend(scan(path, &source));
+            found.extend(long_comments(path, &source));
         }
     }
     if !found.is_empty() {
@@ -96,6 +102,26 @@ fn scan(path: &str, source: &str) -> Vec<String> {
         found.push(format!("{path}:{}: {banned}", i + 1));
     }
     found
+}
+
+/// The lines of `source` that hold only a comment and are wider than
+/// [`COMMENT_WIDTH`], one `path:line: comment of N columns` each. A line of
+/// a string literal that starts with `//` counts too.
+fn long_comments(path: &str, source: &str) -> Vec<String> {
+    source
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| line.trim_start().starts_with("//"))
+        .filter_map(|(i, line)| {
+            let width = line.chars().count();
+            (width > COMMENT_WIDTH).then(|| {
+                format!(
+                    "{path}:{}: comment of {width} columns, over {COMMENT_WIDTH}",
+                    i + 1
+                )
+            })
+        })
+        .collect()
 }
 
 /// `source` with its comments and the contents of its string and character
@@ -204,6 +230,28 @@ fn skipped(chars: &[char], i: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finds_comment_lines_wider_than_80_columns() {
+        let wide = "x".repeat(COMMENT_WIDTH);
+        let source = format!(
+            "{code}\n\
+             // {fits}\n\
+             // {wide}\n\
+             \x20   /// {fits}\n\
+             /// é{fits}\n",
+            code = "let x = 1;".repeat(9),
+            fits = &wide[..COMMENT_WIDTH - 3],
+        );
+        assert_eq!(
+            long_comments("kernel/src/lib.rs", &source),
+            [
+                "kernel/src/lib.rs:3: comment of 83 columns, over 80",
+                "kernel/src/lib.rs:4: comment of 85 columns, over 80",
+                "kernel/src/lib.rs:5: comment of 82 columns, over 80",
+            ]
+        );
+    }
 
     #[test]
     fn finds_both_patterns_outside_comments_and_strings() {
