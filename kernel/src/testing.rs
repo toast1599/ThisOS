@@ -10,7 +10,7 @@ use core::hint::spin_loop;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use spin::Mutex;
-use thisos_hal::{Cpu, Platform, Probe, TestEnd, Trap, TrapFrame};
+use thisos_hal::{Cpu, PANIC_TEST_FILE, Platform, Probe, TestEnd, Trap, TrapFrame};
 
 use crate::{Arch, logger, panic, timer, user};
 
@@ -31,11 +31,6 @@ struct Run {
     /// The tick the running test started at.
     started: u64,
 }
-
-/// The ramdisk file that holds which test that expects a panic a boot
-/// runs, by its place among them from 0, in decimal. xtask adds it to
-/// every boot's ramdisk but the first's.
-const PANIC_TEST_FILE: &str = "panic-test";
 
 /// How many tests this boot has started.
 static STARTED: AtomicUsize = AtomicUsize::new(0);

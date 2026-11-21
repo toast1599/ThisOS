@@ -738,6 +738,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "thisos-frames"
+version = "0.0.0"
+
+[[package]]
+name = "thisos-hal"
+version = "0.0.0"
+dependencies = [
+ "thisos-frames",
+]
+
+[[package]]
 name = "thisos-ustar"
 version = "0.0.0"
 
@@ -991,6 +1002,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tar",
+ "thisos-hal",
  "thisos-ustar",
  "ureq",
 ]

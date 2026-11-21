@@ -28,6 +28,7 @@ ovmf-prebuilt = "0.2"
 serde_json = "1"
 sha2 = "0.11"
 tar = "0.4"
+thisos-hal = { path = "../hal" }
 ureq = { version = "3", default-features = false, features = ["rustls"] }
 
 [dev-dependencies]

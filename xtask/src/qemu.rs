@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use ovmf_prebuilt::{FileType, Prebuilt, Source};
+use thisos_hal::{PANIC_TEST_FILE, TestEnd};
 
 use crate::build::{self, Arch, Kernel};
 use crate::cmd::exec;
@@ -20,15 +21,15 @@ const OVMF: Source = Source::EDK2_STABLE202605_R1;
 const TEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The statuses QEMU exits with when the kernel reports success, and
-/// success with another panic-expecting test to boot for: through
-/// isa-debug-exit, (0x10 << 1) | 1 and (0x12 << 1) | 1, and through
-/// semihosting the same numbers, so that one constant covers both.
-const TEST_SUCCESS: i32 = 33;
-const TEST_SUCCESS_WITH_MORE: i32 = 37;
+/// success with another panic-expecting test to boot for.
+const TEST_SUCCESS: u8 = TestEnd::Passed.status();
+const TEST_SUCCESS_WITH_MORE: u8 = TestEnd::PassedWithMore.status();
 
-/// The ramdisk file that tells a test kernel which panic-expecting test to
-/// run, by its place among them from 0.
-const PANIC_TEST_FILE: &str = "panic-test";
+/// The most boots of one test binary, one per panic-expecting test, far
+/// more than the kernel has. A kernel that still asks for another is
+/// broken, for instance by not finding [`PANIC_TEST_FILE`], and would
+/// otherwise be booted for good.
+const MAX_BOOTS: u32 = 64;
 
 /// Builds, then boots the image in QEMU with a window and serial on the
 /// terminal.
@@ -48,15 +49,28 @@ pub fn run(arch: Arch, release: bool, gdb: bool) -> Result<()> {
 /// per boot, so while the kernel reports another to run, this boots it
 /// again with a copy of the ramdisk that names the next.
 pub fn test(arch: Arch, ramdisk: Option<&Path>, elf: &Path) -> Result<()> {
-    let mut panic_test = 0;
-    while boot_test(arch, ramdisk, elf, panic_test)? {
-        panic_test += 1;
-        eprintln!(
-            "booting {} again for panic test {panic_test}",
-            elf.display()
-        );
+    boot_all(elf, |panic_test| boot_test(arch, ramdisk, elf, panic_test))
+}
+
+/// Calls `boot` for panic-expecting test 0, 1 and so on while it returns
+/// that the kernel reports another to run, and fails after [`MAX_BOOTS`].
+fn boot_all(elf: &Path, mut boot: impl FnMut(u32) -> Result<bool>) -> Result<()> {
+    for panic_test in 0..MAX_BOOTS {
+        if panic_test > 0 {
+            eprintln!(
+                "booting {} again for panic test {panic_test}",
+                elf.display()
+            );
+        }
+        if !boot(panic_test)? {
+            return Ok(());
+        }
     }
-    Ok(())
+    bail!(
+        "{} still asked for another panic test after {MAX_BOOTS} boots; \
+         does the kernel read the {PANIC_TEST_FILE} file xtask writes?",
+        elf.display()
+    )
 }
 
 /// Boots a kernel test ELF to run panic-expecting test `panic_test`, and
@@ -117,7 +131,7 @@ fn boot_test(arch: Arch, ramdisk: Option<&Path>, elf: &Path, panic_test: u32) ->
         }
         thread::sleep(Duration::from_millis(100));
     };
-    match status.code() {
+    match status.code().and_then(|code| u8::try_from(code).ok()) {
         Some(TEST_SUCCESS) => Ok(false),
         Some(TEST_SUCCESS_WITH_MORE) => Ok(true),
         _ => bail!(
@@ -197,4 +211,32 @@ fn kvm_usable() -> bool {
         .write(true)
         .open("/dev/kvm")
         .is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn boots_each_panic_test_in_turn_until_none_is_left() {
+        let mut booted = Vec::new();
+        let result = boot_all(Path::new("kernel"), |panic_test| {
+            booted.push(panic_test);
+            Ok(panic_test < 2)
+        });
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(booted, [0, 1, 2]);
+    }
+
+    // A kernel that never finds the file would otherwise be booted for good.
+    #[test]
+    fn a_kernel_that_always_asks_for_another_fails_at_the_limit() {
+        let mut boots = 0;
+        let result = boot_all(Path::new("kernel"), |_| {
+            boots += 1;
+            Ok(true)
+        });
+        assert!(result.is_err());
+        assert_eq!(boots, MAX_BOOTS);
+    }
 }

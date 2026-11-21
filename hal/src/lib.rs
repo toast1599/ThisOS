@@ -188,6 +188,12 @@ pub enum Probe {
     ExecuteUser,
 }
 
+/// The ramdisk file that names which test that expects a panic a QEMU test
+/// boot runs, by its place among them from 0, in decimal. xtask adds it to
+/// every boot's ramdisk but the first's, and reads its name from here, as
+/// it reads [`TestEnd::status`], so that the two can't drift apart.
+pub const PANIC_TEST_FILE: &str = "panic-test";
+
 /// How a QEMU test boot ends, which [`Platform::exit_qemu`] reports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TestEnd {
