@@ -17,7 +17,11 @@ pub fn test(arch: Arch) -> Result<()> {
             cargo().arg("test").arg("--manifest-path").arg(&manifest),
         ))?;
     }
+    qemu(arch)
+}
 
+/// Runs the kernel's tests for `arch` in QEMU, without the host tests.
+pub fn qemu(arch: Arch) -> Result<()> {
     // Set here rather than in .cargo/config.toml: cargo starts the runner in
     // kernel/, where the xtask alias's relative manifest path doesn't resolve.
     let xtask = std::env::current_exe().context("finding the xtask executable")?;

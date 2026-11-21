@@ -8,7 +8,7 @@ use serde_json::Value;
 
 use crate::build::{self, Arch, Kernel};
 use crate::cmd::{cargo, exec, on_host, output, show};
-use crate::{banned, test};
+use crate::{banned, ramdisk, test};
 
 /// Runs the checks in CI's order and stops at the first that fails.
 pub fn ci() -> Result<()> {
@@ -40,15 +40,22 @@ pub fn ci() -> Result<()> {
     // which need std, for x86_64-unknown-none.
     clippy(cargo().args(["clippy", "-p", "thisos-kernel", "--tests"]))?;
     let aarch64 = Arch::Aarch64.target();
-    clippy(cargo().args([
+    // The user crates have aarch64-only code too, which the x86_64 pass
+    // above never compiles.
+    let mut aarch64_clippy = cargo();
+    aarch64_clippy.args([
         "clippy",
         "-p",
         "thisos-kernel",
         "-p",
         "thisos-arch-aarch64",
-        "--target",
-        aarch64,
-    ]))?;
+        "-p",
+        "thisos-rt",
+    ]);
+    for package in ramdisk::PROGRAMS {
+        aarch64_clippy.args(["-p", package]);
+    }
+    clippy(aarch64_clippy.args(["--target", aarch64]))?;
     clippy(cargo().args([
         "clippy",
         "-p",
@@ -72,6 +79,8 @@ pub fn ci() -> Result<()> {
     ])))?;
 
     test::test(Arch::X86_64)?;
+    // The host tests just ran; aarch64 adds only its kernel's.
+    test::qemu(Arch::Aarch64)?;
     // cargo miri takes host-tuple as a target name and fails to build a
     // sysroot for it, so it gets the host's actual tuple.
     let host = output(Command::new("rustc").args(["--print", "host-tuple"]))?;

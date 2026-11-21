@@ -1,7 +1,7 @@
 # 0006. aarch64 under QEMU, behind x86_64
 
 - **Status:** Accepted
-- **Date:** 2026-11-11
+- **Date:** 2026-11-11, updated 2026-11-21
 
 ## Context
 
@@ -22,6 +22,6 @@ aarch64 runs behind x86_64, with no deadline to catch up:
 
 ## Consequences
 
-Each new HAL call costs a stub in the aarch64 crate, and a change to generic code has to build for both targets. There are two loaders to keep up with. The aarch64 QEMU tests run only through `cargo xtask test --arch aarch64`: neither `cargo xtask ci` nor GitHub CI runs them, and the runner image has no `qemu-system-aarch64`, so a regression there shows up only when someone runs them. From milestone 3 until its port, that run fails before the first test, since the kernel makes threads at boot and aarch64 has none.
+Each new HAL call costs a stub in the aarch64 crate, and a change to generic code has to build for both targets. There are two loaders to keep up with. Until milestone 3's port, the aarch64 QEMU tests ran only through `cargo xtask test --arch aarch64`, and failed before the first test, since the kernel makes threads at boot. Since the port, `cargo xtask ci` and so GitHub CI run them after x86_64's, and a regression there fails CI like one on x86_64.
 
-aarch64 has no real hardware target, no ACPI support and, for now, no serial console: the kernel logs to the ramfb framebuffer alone. Anything past milestone 2, starting with threads, lands on x86_64 only until its port is scheduled.
+aarch64 has no real hardware target, no ACPI support and, for now, no serial console: the kernel logs to the ramfb framebuffer alone. A failing aarch64 test in CI shows only as QEMU's exit status or a timeout, and is reproduced locally to see the summary. Anything past milestone 2, starting with threads, lands on x86_64 only until its port is scheduled.

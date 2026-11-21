@@ -36,9 +36,10 @@ jobs:
         with:
           tool: cargo-deny@0.20.2
       # The runner image has no QEMU, and the QEMU tests need it.
+      # qemu-system-arm has qemu-system-aarch64.
       - run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends qemu-system-x86
+          sudo apt-get install -y --no-install-recommends qemu-system-x86 qemu-system-arm
       # A warm run takes 3-5 minutes. Without an exact cache hit both
       # workspaces, Miri's sysroot, OVMF and Limine come in from scratch.
       - run: cargo xtask ci
