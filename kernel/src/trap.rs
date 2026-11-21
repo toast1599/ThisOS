@@ -4,8 +4,9 @@ use thisos_hal::{Platform, Trap, TrapFrame as _};
 
 use crate::{Arch, paging, panic, thread, timer, user};
 
-/// Moves the stacks the CPU takes double faults, NMIs and machine checks
-/// on to stacks with an unmapped page below each.
+/// Moves the stacks the CPU switches to for some traps, x86_64's for
+/// double faults, NMIs and machine checks and aarch64's for a stack
+/// overflow, to stacks with an unmapped page below each.
 /// `kernel::init` calls this once, after `paging::init`.
 pub fn init() {
     let mut count = 0;

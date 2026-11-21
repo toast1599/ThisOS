@@ -1,7 +1,7 @@
 //! ThisOS's aarch64 support: the implementation of `thisos-hal` for aarch64
-//! under QEMU's virt machine, booted by Limine. Together with the x86_64
-//! arch crate it is the only code allowed unsafe code, and the only crate
-//! that may depend on `aarch64-cpu` and `limine`.
+//! under QEMU's virt machine, booted by Limine. It is one of the three
+//! crates allowed unsafe code, with `thisos-arch-x86_64` and `thisos-rt`,
+//! and the only one that may depend on `aarch64-cpu` and `limine`.
 //!
 //! Not every HAL call is ported yet: those that aren't panic with
 //! `<call> isn't ported to aarch64`, and the types behind them are the

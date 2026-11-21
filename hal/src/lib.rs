@@ -251,7 +251,8 @@ pub enum UserProgram {
     /// words at its argument, then exits with the error code it returned, or with
     /// `u64::MAX` if it succeeded but its value isn't the length.
     Write,
-    /// Raises the debug exception that needs no debugger: ICEBP on x86_64.
+    /// Raises the debug exception that needs no debugger: ICEBP on x86_64,
+    /// `brk #0` on aarch64.
     Debug,
     /// Gets a handle with read and duplicate rights at least as its
     /// argument, then checks, in order: (1) duplicating it with read and
@@ -489,9 +490,10 @@ pub trait Platform {
     /// Writes `program` at the start of `frame`. For tests.
     fn write_user_program(frame: &mut Frame, program: UserProgram);
 
-    /// Ends a QEMU test boot through QEMU's debug exit device, reporting
-    /// how it ended. It touches the device only when it runs under a
-    /// hypervisor; on real hardware it only halts.
+    /// Ends a QEMU test boot, reporting how it ended: through QEMU's debug
+    /// exit device on x86_64, which it touches only under a hypervisor, and
+    /// through semihosting on aarch64, only on QEMU's virt machine. On real
+    /// hardware it only halts.
     fn exit_qemu(end: TestEnd) -> !;
 }
 
@@ -593,8 +595,9 @@ pub trait PageTables: Send {
 pub trait AddressSpace<O>: Send + Sync {
     /// The virtual addresses [`AddressSpace::map`] maps into: the lower
     /// half, apart from the first pages, which stay unmapped so that a
-    /// null pointer plus a small offset always faults, and on x86_64 the
-    /// last page, which SYSRET couldn't return past.
+    /// null pointer plus a small offset always faults, and the last page,
+    /// which SYSRET couldn't return past on x86_64 and aarch64 leaves out
+    /// to match.
     fn user_space(&self) -> Range<u64>;
 
     /// Maps `pages` pages from `addr` for user code, with `protection`, to
@@ -832,7 +835,7 @@ pub trait TrapFrame: fmt::Display {
     fn raised_by_user(&self) -> bool;
 
     /// The number and the six arguments of a [`Trap::Syscall`], in the
-    /// registers ADR 0007 puts them in.
+    /// registers ADR 0007 puts them in on x86_64 and ADR 0010 on aarch64.
     fn syscall(&self) -> (u64, [u64; 6]);
 
     /// Makes a [`Trap::Syscall`] return `error`, 0 for success, and

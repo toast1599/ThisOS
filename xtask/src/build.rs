@@ -4,6 +4,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
@@ -239,10 +240,15 @@ fn executables(cargo_build: &mut Command, names: &[&str], test: bool) -> Result<
 /// Cargo's target directory, `<root>/target` unless `CARGO_TARGET_DIR` or a
 /// cargo config moves it. xtask keeps its images and caches there too.
 pub fn target_dir() -> Result<PathBuf> {
+    // cargo metadata takes about 40 ms, and one run asks many times.
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    if let Some(dir) = DIR.get() {
+        return Ok(dir.clone());
+    }
     let metadata = output(cargo().args(["metadata", "--format-version", "1", "--no-deps"]))?;
     let metadata: Value = serde_json::from_str(&metadata).context("cargo metadata's output")?;
     let dir = metadata["target_directory"]
         .as_str()
         .context("cargo metadata gave no target_directory")?;
-    Ok(PathBuf::from(dir))
+    Ok(DIR.get_or_init(|| PathBuf::from(dir)).clone())
 }

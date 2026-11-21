@@ -27,8 +27,9 @@ pub fn enter_user(ip: u64, sp: u64, arg: u64) -> ! {
     // from the first instruction, so no trap overwrites ELR_EL1 or SPSR_EL1
     // before the eret. SP moves to the top of the calling thread's own
     // stack, where the next trap from EL0 starts, and this never returns,
-    // so nothing on that stack is used again. Every general register but x0, which holds arg, is cleared, so
-    // no kernel value reaches user code.
+    // so nothing on that stack is used again. Every general register but
+    // x0, which holds arg, is cleared, so no kernel value reaches user
+    // code.
     unsafe {
         asm!(
             "msr daifset, #0xf",

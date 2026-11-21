@@ -89,8 +89,9 @@ pub fn null_syscall() {
 
 /// Makes the write syscall with `bytes`, and returns its error code.
 fn write_bytes(bytes: &[u8]) -> u64 {
-    // SAFETY: By ADR 0007, write reads the bytes.len() bytes at
-    // bytes.as_ptr(), which bytes holds, and writes no user memory.
+    // SAFETY: By `Syscall::Write`'s docs, write reads the bytes.len()
+    // bytes at bytes.as_ptr(), which bytes holds, and writes no user
+    // memory.
     let (error, _) = unsafe {
         arch::syscall_reads(
             Syscall::Write.number(),
@@ -283,8 +284,9 @@ impl Handle<Memory> {
         let Ok(offset) = u64::try_from(offset) else {
             unreachable!("ThisOS's addresses are 64 bits");
         };
-        // SAFETY: By ADR 0007, memory-read writes at most buf.len() bytes
-        // at buf.as_mut_ptr(), which buf holds, and reads no user memory.
+        // SAFETY: By `Syscall::MemoryRead`'s docs, memory-read writes at
+        // most buf.len() bytes at buf.as_mut_ptr(), which buf holds, and
+        // reads no user memory.
         let (code, _) = unsafe {
             arch::syscall_writes(
                 Syscall::MemoryRead.number(),
@@ -309,8 +311,9 @@ impl Handle<Memory> {
         let Ok(offset) = u64::try_from(offset) else {
             unreachable!("ThisOS's addresses are 64 bits");
         };
-        // SAFETY: By ADR 0007, memory-write reads the bytes.len() bytes at
-        // bytes.as_ptr(), which bytes holds, and writes no user memory.
+        // SAFETY: By `Syscall::MemoryWrite`'s docs, memory-write reads the
+        // bytes.len() bytes at bytes.as_ptr(), which bytes holds, and
+        // writes no user memory.
         let (code, _) = unsafe {
             arch::syscall_reads(
                 Syscall::MemoryWrite.number(),
@@ -353,9 +356,9 @@ impl Handle<Channel> {
         for (value, handle) in values.iter_mut().zip(&handles) {
             *value = handle.value;
         }
-        // SAFETY: By ADR 0007, send reads the bytes.len() bytes at
-        // bytes.as_ptr() and the handles.len() u32s at values, which those
-        // hold, and writes no user memory.
+        // SAFETY: By `Syscall::Send`'s docs, send reads the bytes.len()
+        // bytes at bytes.as_ptr() and the handles.len() u32s at values,
+        // which those hold, and writes no user memory.
         let (code, _) = unsafe {
             arch::syscall_reads(
                 Syscall::Send.number(),
@@ -406,9 +409,10 @@ impl Handle<Channel> {
     /// when `bytes` is shorter than the message.
     pub fn receive_into(&self, bytes: &mut [u8]) -> Result<(usize, Vec<Handle<Unknown>>), Error> {
         let mut values = [0u32; MAX_MESSAGE_HANDLES];
-        // SAFETY: By ADR 0007, receive writes at most bytes.len() bytes at
-        // bytes.as_mut_ptr() and at most MAX_MESSAGE_HANDLES u32s at
-        // values, which those hold, and reads no user memory.
+        // SAFETY: By `Syscall::Receive`'s docs, receive writes at most
+        // bytes.len() bytes at bytes.as_mut_ptr() and at most
+        // MAX_MESSAGE_HANDLES u32s at values, which those hold, and reads
+        // no user memory.
         let (code, value) = unsafe {
             arch::syscall_writes(
                 Syscall::Receive.number(),
@@ -513,8 +517,8 @@ pub fn wait(items: &mut [WaitItem<'_>], timeout: Option<Duration>) -> Result<usi
     let timeout = timeout.map_or(u64::MAX, |timeout| {
         u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX)
     });
-    // SAFETY: By ADR 0007, wait reads and writes at most items.len() items
-    // of three u32s at raw, which raw holds.
+    // SAFETY: By `Syscall::Wait`'s docs, wait reads and writes at most
+    // items.len() items of three u32s at raw, which raw holds.
     let (code, value) = unsafe {
         arch::syscall_writes(
             Syscall::Wait.number(),

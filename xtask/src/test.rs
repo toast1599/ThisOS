@@ -56,9 +56,9 @@ pub fn qemu(arch: Arch) -> Result<()> {
 }
 
 /// The manifests of the crates that build and test on the host: the
-/// `lib/*` crates, `thisos-abi`, `thisos-rt`, whose tests leave out its entry point,
-/// panic handler and syscalls, and the two arch crates, whose tests cover
-/// their page tables over a fake CPU.
+/// `lib/*` crates, `thisos-abi`, `thisos-rt`, whose tests leave out its
+/// entry point, panic handler and syscalls, and the two arch crates, whose
+/// tests cover their page tables over a fake CPU.
 pub fn libs() -> Result<Vec<PathBuf>> {
     let dir = root().join("lib");
     let mut manifests = Vec::new();

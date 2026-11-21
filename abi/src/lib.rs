@@ -1,5 +1,6 @@
 //! What ThisOS's kernel and user code agree on: syscall numbers, errors,
-//! rights and signals. How they pass through the registers is ADR 0007's.
+//! rights and signals. How they pass through the registers is ADR 0007's
+//! on x86_64 and ADR 0010's on aarch64.
 
 #![no_std]
 #![forbid(unsafe_code)]
