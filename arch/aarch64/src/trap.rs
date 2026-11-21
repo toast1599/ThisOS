@@ -181,6 +181,7 @@ const FIQ: u64 = 2;
 /// from.
 const EL1H_SYNC: u64 = 4;
 const EL1H_IRQ: u64 = 5;
+const EL1H_FIQ: u64 = 6;
 
 /// The entries for traps from EL0, which the kernel resumes from too.
 const EL0_SYNC: u64 = 8;
@@ -273,15 +274,19 @@ impl TrapFrame {
     fn taken_from_el0(&self) -> bool {
         (EL0_SYNC..EL0_SYNC + 8).contains(&self.entry())
     }
+
+    /// The name of the entry the CPU took the trap by.
+    fn entry_name(&self) -> &'static str {
+        usize::try_from(self.entry())
+            .ok()
+            .and_then(|entry| ENTRY_NAMES.get(entry))
+            .unwrap_or(&"")
+    }
 }
 
 impl fmt::Display for TrapFrame {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let name = usize::try_from(self.entry())
-            .ok()
-            .and_then(|entry| ENTRY_NAMES.get(entry))
-            .unwrap_or(&"");
-        write!(f, "registers at {name}")?;
+        write!(f, "registers at {}", self.entry_name())?;
         if self.overflowed() {
             write!(f, " on an overflowed stack")?;
         }
@@ -425,9 +430,13 @@ extern "C" fn trap_entry(frame: &mut TrapFrame) {
     } else {
         matches!(frame.entry(), EL1H_SYNC | EL1H_IRQ | EL0_SYNC | EL0_IRQ)
     };
-    if !resumes {
-        Aarch64::halt();
-    }
+    // The eret would go back to where the trap was taken, which for these
+    // entries the kernel never expects; halting would leave no report.
+    assert!(
+        resumes,
+        "returned from {}, which the kernel can't resume from",
+        frame.entry_name()
+    );
 }
 
 /// Acknowledges the interrupt in `group` that the CPU took, and returns
@@ -459,6 +468,20 @@ static HANDLER: Once<TrapHandler<Aarch64>> = Once::new();
 /// pending, the GIC answers the acknowledge with 1023, and the kernel
 /// sees `Trap::Spurious`. A tick that is pending then is taken instead.
 pub fn raise_spurious() {
+    enter_el1h::<{ EL1H_IRQ * 0x80 }>();
+}
+
+/// Enters the FIQ entry for EL1 on `SP_EL1` as the CPU would, for tests.
+/// Group 0 is never enabled, so the GIC answers the acknowledge with 1023,
+/// the kernel sees `Trap::Spurious` and returns, and since the kernel
+/// can't resume from an FIQ, the entry panics.
+pub fn raise_spurious_fiq() {
+    enter_el1h::<{ EL1H_FIQ * 0x80 }>();
+}
+
+/// Enters the vector table at `OFFSET` as an exception taken from EL1 on
+/// `SP_EL1` would, with interrupts masked.
+fn enter_el1h<const OFFSET: u64>() {
     // SAFETY: The entry saves every register in a frame on this stack, and
     // its eret comes back to 1: with them, with SPSR_EL1's EL1h, the
     // interrupt masks and PAN as they were here. Interrupts are masked
@@ -480,7 +503,7 @@ pub fn raise_spurious() {
             "1:",
             el1h = const SPSR_EL1H,
             vectors = sym thisos_vectors,
-            entry = const EL1H_IRQ * 0x80,
+            entry = const OFFSET,
             out("x9") _,
             out("x10") _,
         );

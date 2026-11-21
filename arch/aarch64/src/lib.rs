@@ -73,7 +73,7 @@ pub use framebuffer::FramebufferPixels;
 pub use memory::MemoryMap;
 pub use paging::{KernelPageTables, UserSpace};
 #[cfg(not(test))]
-pub use trap::TrapFrame;
+pub use trap::{TrapFrame, raise_spurious_fiq};
 #[cfg(not(test))]
 pub use unported::NoSerial;
 

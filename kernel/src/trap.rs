@@ -79,6 +79,17 @@ mod tests {
         Arch::raise_spurious();
     }
 
+    // The kernel can't resume from an FIQ, so once the handler returns, the
+    // entry has to report it rather than halt with nothing on screen.
+    #[cfg(target_arch = "aarch64")]
+    #[test_case]
+    const A_RETURNED_FIQ_PANICS: crate::testing::ExpectPanic = crate::testing::ExpectPanic {
+        name: "thisos_kernel::trap::tests::a_returned_fiq_panics",
+        run: thisos_arch_aarch64::raise_spurious_fiq,
+        message: "returned from EL1h FIQ",
+        after: None,
+    };
+
     #[test_case]
     fn legacy_interrupts_stay_masked() {
         assert!(Arch::legacy_interrupts_masked());

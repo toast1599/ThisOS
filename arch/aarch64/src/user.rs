@@ -10,6 +10,10 @@ use thisos_hal::UserProgram;
 use crate::paging::USER_SPACE;
 use crate::{backtrace, ptr_at};
 
+/// `SPSR_EL1` for user code: `EL0t`, with only FIQs masked. Group 0, which
+/// signals FIQs, is never enabled, and EL1 runs with them masked too.
+const SPSR_EL0: u64 = 1 << 6;
+
 /// Leaves for user code; see `Cpu::enter_user`.
 pub fn enter_user(ip: u64, sp: u64, arg: u64) -> ! {
     assert!(
@@ -18,12 +22,12 @@ pub fn enter_user(ip: u64, sp: u64, arg: u64) -> ! {
     );
     let top = backtrace::stack().end;
     // SAFETY: eret takes the CPU to EL0t at ip, on stack sp, both in user
-    // space, which the assert checks, with an SPSR of 0, so with every
-    // interrupt unmasked. Interrupts are masked from the first instruction,
-    // so no trap overwrites ELR_EL1 or SPSR_EL1 before the eret. SP moves to
-    // the top of the calling thread's own stack, where the next trap from
-    // EL0 starts, and this never returns, so nothing on that stack is used
-    // again. Every general register but x0, which holds arg, is cleared, so
+    // space, which the assert checks, with an SPSR of SPSR_EL0, so with
+    // IRQs, SErrors and debug exceptions unmasked. Interrupts are masked
+    // from the first instruction, so no trap overwrites ELR_EL1 or SPSR_EL1
+    // before the eret. SP moves to the top of the calling thread's own
+    // stack, where the next trap from EL0 starts, and this never returns,
+    // so nothing on that stack is used again. Every general register but x0, which holds arg, is cleared, so
     // no kernel value reaches user code.
     unsafe {
         asm!(
@@ -31,7 +35,8 @@ pub fn enter_user(ip: u64, sp: u64, arg: u64) -> ! {
             "mov sp, x1",
             "msr sp_el0, x2",
             "msr elr_el1, x3",
-            "msr spsr_el1, xzr",
+            "mov x4, #{spsr}",
+            "msr spsr_el1, x4",
             "mov x1, xzr",
             "mov x2, xzr",
             "mov x3, xzr",
@@ -67,6 +72,7 @@ pub fn enter_user(ip: u64, sp: u64, arg: u64) -> ! {
             in("x1") top,
             in("x2") sp,
             in("x3") ip,
+            spsr = const SPSR_EL0,
             options(noreturn),
         );
     }
