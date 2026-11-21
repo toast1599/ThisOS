@@ -1,4 +1,4 @@
-//! Checks the process-building and memory-copy syscalls from Rust: what
+//! Checks the process-building, memory-copy and wait syscalls from Rust: what
 //! they do, and how they fail. A kernel test runs it as the kernel runs
 //! init, and a check that fails panics, which exits with status 101 after
 //! logging where. A normal boot never runs it.
@@ -49,6 +49,7 @@ fn main(kernel: Handle<Channel>) -> u64 {
     building_a_process();
     starting_a_process();
     process_ends();
+    waits_ask_for_signals_their_objects_have();
     0
 }
 
@@ -217,4 +218,28 @@ fn process_ends() {
         ok(process.wait(Signals::ENDED, Some(core::time::Duration::ZERO))),
         Signals::ENDED
     );
+}
+
+// A signal the object can never have would leave the wait to its timeout,
+// and with none, waiting for good.
+fn waits_ask_for_signals_their_objects_have() {
+    let now = Some(core::time::Duration::ZERO);
+    let (endpoint, _peer) = channel();
+    let process = ok(Handle::<Process>::create());
+    for (wanted, what) in [
+        (Signals::NONE, "no signal on an endpoint"),
+        (Signals::ENDED, "ENDED on an endpoint"),
+        (
+            Signals::READABLE | Signals::ENDED,
+            "an endpoint signal and ENDED on an endpoint",
+        ),
+    ] {
+        assert_eq!(endpoint.wait(wanted, now), Err(Error::BadSignals), "{what}");
+    }
+    for (wanted, what) in [
+        (Signals::NONE, "no signal on a process"),
+        (Signals::READABLE, "READABLE on a process"),
+    ] {
+        assert_eq!(process.wait(wanted, now), Err(Error::BadSignals), "{what}");
+    }
 }

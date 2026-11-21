@@ -496,7 +496,10 @@ impl<'a> WaitItem<'a> {
 /// checks, and no items waits out the timeout. Fails with
 /// [`Error::TimedOut`] when the timeout passes, and with
 /// [`Error::TooLong`] for more than [`MAX_WAIT_ITEMS`] items. Each handle
-/// needs [`Rights::READ`]; channel endpoints and processes have signals.
+/// needs [`Rights::READ`]; channel endpoints and processes have signals,
+/// and each item wants at least one, all of them its object's:
+/// [`Signals::ENDPOINT`] or [`Signals::PROCESS`], or the wait fails with
+/// [`Error::BadSignals`].
 pub fn wait(items: &mut [WaitItem<'_>], timeout: Option<Duration>) -> Result<usize, Error> {
     if items.len() > MAX_WAIT_ITEMS {
         return Err(Error::TooLong);

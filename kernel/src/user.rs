@@ -662,7 +662,11 @@ fn wait(items: u64, count_arg: u64, timeout: u64) -> Result<u64, Error> {
         if !held.contains(Rights::READ) {
             return Err(Error::AccessDenied);
         }
-        let wanted = Signals::from_bits(wanted).ok_or(Error::BadSignals)?;
+        // A signal the object never has would leave the wait to its
+        // timeout, and with none, blocked for good.
+        let wanted = Signals::from_bits(wanted)
+            .filter(|&wanted| wanted != Signals::NONE && object.signals().contains(wanted))
+            .ok_or(Error::BadSignals)?;
         waits.push((object, wanted));
     }
     let mut observed = [Signals::NONE; MAX_WAIT_ITEMS];
@@ -925,7 +929,7 @@ mod tests {
         );
     }
 
-    // checks tests the process-building and memory-copy syscalls' error
+    // checks tests the process-building, memory-copy and wait syscalls' error
     // paths from Rust, and panics, exiting with 101, at the first that
     // fails.
     #[test_case]

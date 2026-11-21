@@ -135,7 +135,9 @@ pub enum Syscall {
     /// [`Error::TooLong`], with [`Error::BadAddress`] before it waits for
     /// items it can't read and write, [`Error::BadHandle`],
     /// [`Error::WrongType`] for an object that has no signals,
-    /// [`Error::AccessDenied`], [`Error::BadSignals`], [`Error::NoMemory`],
+    /// [`Error::AccessDenied`], with [`Error::BadSignals`] for an item that
+    /// wants no signal, or one its object doesn't have
+    /// ([`Signals::ENDPOINT`], [`Signals::PROCESS`]), [`Error::NoMemory`],
     /// or with [`Error::TimedOut`] once the time has passed with no wanted
     /// signal.
     Wait,
@@ -290,7 +292,8 @@ pub enum Error {
     Cycle,
     /// A wait's time passed with no wanted signal.
     TimedOut,
-    /// Signals have bits that no signal has.
+    /// Wanted signals are none, or have a bit that no signal has, or one
+    /// the object never has.
     BadSignals,
     /// The process has started, and the call works only before that.
     Started,
@@ -430,6 +433,12 @@ impl Signals {
     pub const ENDED: Signals = Signals(1 << 3);
     /// Every signal.
     pub const ALL: Signals = Signals((1 << 4) - 1);
+    /// The signals a channel endpoint has.
+    pub const ENDPOINT: Signals = Signals::READABLE
+        .union(Signals::WRITABLE)
+        .union(Signals::PEER_CLOSED);
+    /// The signals a process has.
+    pub const PROCESS: Signals = Signals::ENDED;
 
     /// The signals with these bits, or `None` if a bit has no signal.
     pub const fn from_bits(bits: u32) -> Option<Signals> {

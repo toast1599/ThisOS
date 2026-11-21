@@ -29,6 +29,14 @@ impl Waitable {
         }
     }
 
+    /// Every signal the object can have.
+    pub fn signals(&self) -> Signals {
+        match self {
+            Waitable::Channel(_) => Signals::ENDPOINT,
+            Waitable::Process(_) => Signals::PROCESS,
+        }
+    }
+
     fn add_waiter(&self, id: u64) -> Result<Signals, Error> {
         match self {
             Waitable::Channel(endpoint) => endpoint.add_waiter(id),
