@@ -660,10 +660,11 @@ fn wait(items: u64, count_arg: u64, timeout: u64) -> Result<u64, Error> {
     waits
         .try_reserve_exact(count)
         .map_err(|_| Error::NoMemory)?;
+    let process = process();
     for item in raw.as_chunks::<WAIT_ITEM_SIZE>().0 {
         let [handle, wanted] = [0, 4]
             .map(|at| u32::from_le_bytes([item[at], item[at + 1], item[at + 2], item[at + 3]]));
-        let (object, held) = process().get(handle)?;
+        let (object, held) = process.get(handle)?;
         let object = Waitable::new(object).ok_or(Error::WrongType)?;
         if !held.contains(Rights::READ) {
             return Err(Error::AccessDenied);
