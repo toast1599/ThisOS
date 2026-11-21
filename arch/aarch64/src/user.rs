@@ -100,9 +100,16 @@ global_asm!(
     ".globl thisos_user_programs",
     ".hidden thisos_user_programs",
     "thisos_user_programs:",
-    // Syscalls. Every value has its upper half all ones, so a register
+    // Syscalls. The thread pointers come first: a new thread's TPIDR_EL0
+    // is 0, and TPIDRRO_EL0, which the kernel's overflow path uses as
+    // scratch, must be 0 even after the overflow tests, which run before
+    // this one. Then every value has its upper half all ones, so a register
     // zeroed or truncated on the way shows. The condition flags go in set
     // and must come back so.
+    "mrs x9, tpidr_el0",
+    "cbnz x9, 2f",
+    "mrs x9, tpidrro_el0",
+    "cbnz x9, 2f",
     "mov x9, #0xf0000000",
     "msr nzcv, x9",
     "movn x2, #2, lsl #16",

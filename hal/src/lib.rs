@@ -223,11 +223,12 @@ pub enum UserProgram {
     /// Puts a value of its own in every general register a syscall keeps,
     /// on x86_64 sets the direction, alignment-check and nested-task
     /// flags, which the kernel must not run with, and on aarch64 the
-    /// condition flags, makes a syscall with the
-    /// number `u64::MAX`, which no syscall has, then checks those registers
-    /// and flags. It exits with the error code the syscall returned if they
-    /// all kept their values and the syscall's value is 0, and with
-    /// `u64::MAX` otherwise. It leaves the trap flag clear, since set it
+    /// condition flags, makes a syscall with the number `u64::MAX`, which
+    /// no syscall has, then checks those registers and flags. On aarch64
+    /// it first checks that `TPIDR_EL0`, a new thread's, and `TPIDRRO_EL0`
+    /// read 0, so that no kernel value reaches user code through them. It
+    /// exits with the error code the syscall returned if every check holds
+    /// and the syscall's value is 0, and with `u64::MAX` otherwise. It leaves the trap flag clear, since set it
     /// would single-step the program itself.
     Syscalls,
     /// Reads the byte at its argument, then exits with status 0.

@@ -110,6 +110,19 @@ pub(crate) unsafe fn dc_civac(addr: u64) {
     unsafe { asm!("dc civac, {}", in(reg) addr, options(nostack, preserves_flags)) };
 }
 
+/// Zeroes `TPIDRRO_EL0`, which EL0 can read and the kernel uses only as
+/// scratch.
+pub(crate) fn clear_tpidrro_el0() {
+    // SAFETY: TPIDRRO_EL0 only holds a value for EL0 to read; nothing in
+    // the kernel depends on it.
+    unsafe {
+        asm!(
+            "msr tpidrro_el0, xzr",
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+}
+
 /// Cleans the data cache line that holds `addr` to the point of
 /// unification, with `dc cvau`, and doesn't wait for it.
 ///

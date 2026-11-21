@@ -29,10 +29,12 @@ use crate::{Aarch64, backtrace, catch, paging, sysreg, timer, to_u64};
 // STACK_SIZE below it. The add and sub around tbnz test that bit with no
 // free register, and put SP and x0 back after it.
 //
-// An entry that finds the stack overflowed parks the frame's address and
-// x0 in the EL0 thread registers, which the trapped code never gets back
-// since an overflow never resumes, moves to the overflow stack, and adds
-// OVERFLOWED to its entry number. The common path saves the rest of the
+// An entry that finds the stack overflowed parks the frame's address in
+// TPIDR_EL1, which the kernel uses for nothing else, and x0 in
+// TPIDRRO_EL0, moves to the overflow stack, and adds OVERFLOWED to its
+// entry number. EL0 can read TPIDRRO_EL0, so the overflow path zeroes it
+// once it has x0 back, as boot does; EL0's thread pointer, TPIDR_EL0,
+// stays the trapped thread's. The common path saves the rest of the
 // frame, with the trapped SP that x1 brings and SP_EL0, calls trap_entry,
 // and restores everything but SP, which it gets back by dropping the
 // frame. SP_EL0 is user code's stack pointer, and goes with the frame
@@ -56,7 +58,7 @@ global_asm!(
     "add x1, sp, #{frame}",
     "b .Ltrap_common",
     "1:",
-    "msr tpidr_el0, x0",
+    "msr tpidr_el1, x0",
     "sub x0, sp, x0",
     "msr tpidrro_el0, x0",
     "adrp x0, {top}",
@@ -72,7 +74,8 @@ global_asm!(
     "str x1, [sp, #8]",
     "mrs x1, tpidrro_el0",
     "str x1, [sp]",
-    "mrs x1, tpidr_el0",
+    "msr tpidrro_el0, xzr",
+    "mrs x1, tpidr_el1",
     "add x1, x1, #{frame}",
     ".Ltrap_common:",
     "stp x2, x3, [sp, #0x10]",

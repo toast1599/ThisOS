@@ -15,7 +15,7 @@ use thisos_hal::{BootInfo, Framebuffer, MemoryKind, PixelFormat, TrapHandler};
 use crate::framebuffer::FramebufferPixels;
 use crate::memory::MemoryMap;
 use crate::paging::STACK_SIZE;
-use crate::{Aarch64, backtrace, devices, ptr_at, to_u64, trap};
+use crate::{Aarch64, backtrace, devices, ptr_at, sysreg, to_u64, trap};
 
 // Limine finds these by their magic numbers anywhere in the kernel's
 // writable data, and writes its answers into them before it jumps to
@@ -129,6 +129,8 @@ pub unsafe fn boot_info(trap: TrapHandler<Aarch64>) -> BootInfo<Aarch64> {
     CPACR_EL1.modify(CPACR_EL1::FPEN::TrapEl0El1);
     // User code reads the virtual counter, as x86_64's reads the TSC.
     CNTKCTL_EL1.modify(CNTKCTL_EL1::EL0VCTEN::TrappedNone);
+    // Whatever the firmware or Limine left there would reach user code.
+    sysreg::clear_tpidrro_el0();
     assert!(
         BASE_REVISION.is_supported(),
         "Limine doesn't support base revision {}",
