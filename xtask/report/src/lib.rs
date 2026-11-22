@@ -26,7 +26,7 @@ use anyhow::{Context, Result, bail};
 pub use look::Glyphs;
 use look::Outcome;
 use parse::{Lines, Progress};
-use screen::Screen;
+use screen::{Ended, Screen};
 
 /// Who the output is for.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -146,6 +146,8 @@ struct State {
     interrupted: bool,
     /// Whether the screen is hidden for a prompt or an attached command.
     suspended: bool,
+    /// What the summary says after its counts.
+    detail: Option<String>,
     screen: Option<Screen>,
 }
 
@@ -162,6 +164,8 @@ struct Current {
     log: String,
     progress: Option<Progress>,
     expected: Option<u64>,
+    /// What its finished line says before its time.
+    detail: Option<String>,
 }
 
 struct Done {
@@ -377,6 +381,7 @@ impl State {
             log: String::new(),
             progress: None,
             expected: None,
+            detail: None,
         };
         match &mut self.screen {
             Some(screen) => {
@@ -428,14 +433,15 @@ impl State {
                     &full
                 };
                 let failed_log = (outcome == Outcome::Failed).then_some(log.as_str());
-                screen.end(
-                    current.grouped,
+                screen.end(&Ended {
+                    grouped: current.grouped,
                     last_in_group,
                     item,
                     outcome,
                     elapsed,
+                    detail: current.detail.as_deref(),
                     failed_log,
-                );
+                });
             }
             None => {
                 if settings.github {
@@ -443,7 +449,15 @@ impl State {
                 }
                 eprintln!(
                     "{}",
-                    look::machine_line(number, total, outcome, &full, self.width, Some(elapsed))
+                    look::machine_line(
+                        number,
+                        total,
+                        outcome,
+                        &full,
+                        self.width,
+                        current.detail.as_deref(),
+                        Some(elapsed)
+                    )
                 );
                 if let (true, Outcome::Failed, Some(error)) = (settings.github, outcome, error) {
                     eprintln!(
@@ -516,6 +530,7 @@ impl State {
                 (count(Outcome::Interrupted), "interrupted"),
                 (skipped.len(), "skipped"),
             ],
+            self.detail.as_deref(),
         );
         match &mut self.screen {
             Some(screen) => {
@@ -537,6 +552,7 @@ impl State {
                             Outcome::Skipped,
                             &name.full(),
                             self.width,
+                            None,
                             None
                         )
                     );
@@ -769,6 +785,23 @@ pub fn println(text: &str) {
         current.log.push('\n');
     }
     state.note(text);
+}
+
+/// Sets what the running step's finished line says before its time, such
+/// as how much it freed.
+pub fn step_detail(text: &str) {
+    if let Some(r) = reporter()
+        && let Some(current) = &mut r.state().current
+    {
+        current.detail = Some(text.to_owned());
+    }
+}
+
+/// Sets what the run's summary says after its counts.
+pub fn run_detail(text: &str) {
+    if let Some(r) = reporter() {
+        r.state().detail = Some(text.to_owned());
+    }
 }
 
 /// Sets how many bytes the running step's command will write, so that its

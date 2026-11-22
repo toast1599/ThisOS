@@ -25,6 +25,21 @@ pub struct Screen {
     step: Option<StepBars>,
 }
 
+/// A step that just ended, for [`Screen::end`].
+pub struct Ended<'a> {
+    /// Whether it shows under its group's header.
+    pub grouped: bool,
+    pub last_in_group: bool,
+    /// Its name as its line shows it.
+    pub item: &'a str,
+    pub outcome: Outcome,
+    pub elapsed: Duration,
+    /// What its line says before its time.
+    pub detail: Option<&'a str>,
+    /// Its whole output, when it failed.
+    pub failed_log: Option<&'a str>,
+}
+
 /// A running group of steps.
 struct Group {
     name: String,
@@ -207,18 +222,19 @@ impl Screen {
     }
 
     /// Replaces the running step's bars with its finished line, followed by
-    /// `failed_log` when it failed. A step in a group adds its line under
-    /// the group's header; the group's last step folds the group into one
-    /// line if it passed, and a step that didn't pass prints the group out.
-    pub fn end(
-        &mut self,
-        grouped: bool,
-        last_in_group: bool,
-        item: &str,
-        outcome: Outcome,
-        elapsed: Duration,
-        failed_log: Option<&str>,
-    ) {
+    /// its log when it failed. A step in a group adds its line under the
+    /// group's header; the group's last step folds the group into one line
+    /// if it passed, and a step that didn't pass prints the group out.
+    pub fn end(&mut self, ended: &Ended) {
+        let Ended {
+            grouped,
+            last_in_group,
+            item,
+            outcome,
+            elapsed,
+            detail,
+            failed_log,
+        } = *ended;
         if let Some(step) = self.step.take() {
             for bar in step.tail.iter().chain([&step.spinner]) {
                 self.remove(bar);
@@ -233,7 +249,10 @@ impl Screen {
             style(item.to_owned()).red()
         };
         let mark = look::mark(self.glyphs, outcome);
-        let time = look::time_styled(outcome, elapsed);
+        let mut time = look::time_styled(outcome, elapsed);
+        if let Some(detail) = detail {
+            time = format!("{}  {time}", style(detail).cyan());
+        }
         match self.group.take() {
             Some(mut running) if grouped && outcome == Outcome::Ok && !last_in_group => {
                 running.finished.push((item.to_owned(), elapsed));

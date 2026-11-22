@@ -131,21 +131,28 @@ pub fn counter(number: usize, total: usize) -> String {
 
 /// A finished or skipped step in machine mode:
 /// `[ 3/31] FAIL  clippy x86_64 kernel tests     5.1s`, the name padded to
-/// `width`.
+/// `width`, with the step's `detail`, if any, before the time.
 pub fn machine_line(
     number: usize,
     total: usize,
     outcome: Outcome,
     name: &str,
     width: usize,
+    detail: Option<&str>,
     elapsed: Option<Duration>,
 ) -> String {
-    let line = format!(
-        "{} {:<5} {name:<width$}  {}",
+    let mut line = format!(
+        "{} {:<5} {name:<width$}",
         counter(number, total),
-        outcome.word(),
-        elapsed.map(time).unwrap_or_default()
+        outcome.word()
     );
+    for part in detail
+        .map(str::to_owned)
+        .into_iter()
+        .chain(elapsed.map(time))
+    {
+        write!(line, "  {part}").expect("writing to a String");
+    }
     line.trim_end().to_owned()
 }
 
@@ -210,8 +217,15 @@ fn result_word(word: &str) -> console::StyledObject<&str> {
     }
 }
 
-/// The last line of a run: `ci failed in 6.0s: 2 ok, 1 failed, 28 skipped`.
-pub fn summary(title: &str, result: &str, elapsed: Duration, counts: &[(usize, &str)]) -> String {
+/// The last line of a run: `ci failed in 6.0s: 2 ok, 1 failed, 28 skipped`,
+/// then `detail`, if any.
+pub fn summary(
+    title: &str,
+    result: &str,
+    elapsed: Duration,
+    counts: &[(usize, &str)],
+    detail: Option<&str>,
+) -> String {
     let mut line = format!("{title} {result} in {}:", time(elapsed));
     let mut first = true;
     for &(count, what) in counts {
@@ -220,6 +234,9 @@ pub fn summary(title: &str, result: &str, elapsed: Duration, counts: &[(usize, &
             write!(line, "{comma} {count} {what}").expect("writing to a String");
             first = false;
         }
+    }
+    if let Some(detail) = detail {
+        write!(line, ", {detail}").expect("writing to a String");
     }
     line
 }
@@ -297,11 +314,23 @@ mod tests {
     fn machine_lines_line_up() {
         let elapsed = Some(Duration::from_millis(5100));
         assert_eq!(
-            machine_line(3, 31, Outcome::Failed, "clippy x86_64", 15, elapsed),
+            machine_line(3, 31, Outcome::Failed, "clippy x86_64", 15, None, elapsed),
             "[ 3/31] FAIL  clippy x86_64    5.1s"
         );
         assert_eq!(
-            machine_line(4, 31, Outcome::Skipped, "clippy aarch64", 15, None),
+            machine_line(
+                1,
+                2,
+                Outcome::Ok,
+                "root target",
+                12,
+                Some("2.6 GiB freed"),
+                elapsed
+            ),
+            "[1/2] ok    root target   2.6 GiB freed  5.1s"
+        );
+        assert_eq!(
+            machine_line(4, 31, Outcome::Skipped, "clippy aarch64", 15, None, None),
             "[ 4/31] skip  clippy aarch64"
         );
         assert_eq!(time(Duration::from_secs(185)), "3m05s");
@@ -320,13 +349,20 @@ mod tests {
                     (1, "failed"),
                     (0, "interrupted"),
                     (28, "skipped")
-                ]
+                ],
+                None
             ),
             "ci failed in 6.0s: 2 ok, 1 failed, 28 skipped"
         );
         assert_eq!(
-            summary("flash", "failed", elapsed, &[(0, "ok"), (1, "failed")]),
-            "flash failed in 6.0s: 0 ok, 1 failed"
+            summary(
+                "clean",
+                "passed",
+                elapsed,
+                &[(2, "ok"), (0, "failed")],
+                Some("3.8 GiB freed")
+            ),
+            "clean passed in 6.0s: 2 ok, 3.8 GiB freed"
         );
     }
 

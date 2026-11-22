@@ -1,6 +1,7 @@
 mod banned;
 mod build;
 mod ci;
+mod clean;
 mod cmd;
 mod flash;
 mod font;
@@ -94,6 +95,16 @@ enum Command {
     },
     /// Run locally everything CI runs.
     Ci,
+    /// Empty cargo's target directories, the root workspace's and
+    /// xtask's, but for the OVMF and Limine downloads.
+    Clean {
+        /// Remove the OVMF and Limine downloads too.
+        #[arg(long)]
+        all: bool,
+        /// Give only the total freed, on the summary line.
+        #[arg(short, long)]
+        summary: bool,
+    },
     /// Rasterize the console font into lib/console/src/font.
     Font,
     /// Boot a kernel test ELF in QEMU; cargo's runner for `xtask test`.
@@ -187,6 +198,12 @@ fn run(command: Command) -> Result<()> {
             let plan = steps.iter().map(|step| step.name.clone()).collect();
             report::start("ci", plan, &logs)?;
             report::all(steps)
+        }
+        Command::Clean { all, summary } => {
+            let dirs = clean::dirs()?;
+            let plan = names(dirs.iter().map(|(name, _)| name.clone()));
+            report::start("clean", plan, &logs)?;
+            clean::clean(&dirs, all, summary)
         }
         Command::Font => {
             report::start("font", names(font::steps()), &logs)?;
