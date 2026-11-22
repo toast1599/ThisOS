@@ -7,13 +7,14 @@ use std::path::Path;
 use std::process::Command;
 
 use anyhow::{Context, Result, bail, ensure};
+use thisos_report as report;
 
 use crate::build::{self, Arch, BUILD_FILE, Kernel};
-use crate::cmd::{confirm, exec, output, output_bytes};
+use crate::cmd::{attached, confirm, exec, output, output_bytes};
 use crate::lsblk::{Row, lsblk};
 
 /// A whole disk, as `lsblk` describes it.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Disk {
     path: String,
     /// The disk's `/dev/disk/by-id` link, when udev made one. It names the
@@ -36,81 +37,115 @@ impl fmt::Display for Disk {
     }
 }
 
+/// The steps of [`flash`].
+pub const STEPS: [&str; 7] = [
+    "build image",
+    "find the stick",
+    "confirm",
+    "write",
+    "verify",
+    "fix the GPT",
+    "power off",
+];
+
 /// Builds the image of `kernel`, writes it to a USB stick with `sudo dd`,
 /// reads it back to check it, moves the backup GPT to the end of the stick
-/// and powers the stick off.
+/// and powers the stick off, in the steps [`STEPS`] names.
 pub fn flash(release: bool, kernel: Kernel, device: Option<&str>) -> Result<()> {
-    let image = build::build(Arch::X86_64, release, kernel)?;
-    let data =
-        fs::read(&image.path).with_context(|| format!("reading {}", image.path.display()))?;
+    let (image, data) = report::step("build image", || {
+        let image = build::build(Arch::X86_64, release, kernel)?;
+        let data =
+            fs::read(&image.path).with_context(|| format!("reading {}", image.path.display()))?;
+        Ok((image, data))
+    })?;
 
-    let disks = usb_disks(lsblk(&[
-        "-d",
-        "-b",
-        "-e7",
-        "-o",
-        "PATH,TYPE,TRAN,RM,HOTPLUG,SIZE,MODEL,SERIAL,ID-LINK",
-    ])?)?;
-    // From here on every command names the disk by its by-id link, so a
-    // stick swapped while the question below waits makes them fail.
-    let (disk, dev) = pick(&disks, device)?;
-    check_link(dev, &disk.path)?;
-    ensure!(
-        data.len() as u64 <= disk.size,
-        "the image is {} bytes, larger than {disk}",
-        data.len()
-    );
+    let (disk, dev, held) = report::step("find the stick", || {
+        let disks = usb_disks(lsblk(&[
+            "-d",
+            "-b",
+            "-e7",
+            "-o",
+            "PATH,TYPE,TRAN,RM,HOTPLUG,SIZE,MODEL,SERIAL,ID-LINK",
+        ])?)?;
+        // From here on every command names the disk by its by-id link, so
+        // a stick swapped while the question below waits makes them fail.
+        let (disk, dev) = pick(&disks, device)?;
+        check_link(dev, &disk.path)?;
+        ensure!(
+            data.len() as u64 <= disk.size,
+            "the image is {} bytes, larger than {disk}",
+            data.len()
+        );
+        let held = match stick_build(dev) {
+            Ok(Some(held)) if held == image.id => "this same build".into(),
+            Ok(Some(held)) => held,
+            Ok(None) => "no ThisOS build ID".into(),
+            // Not being able to read it is no reason to refuse to overwrite
+            // it.
+            Err(e) => format!("unknown ({e:#})"),
+        };
+        Ok((disk.clone(), dev.to_owned(), held))
+    })?;
+    let dev = dev.as_str();
 
-    println!("image: {} ({} bytes)", image.path.display(), data.len());
-    println!("       {}", image.id);
-    println!("stick: {disk}");
-    println!("       {dev}");
-    let held = match stick_build(dev) {
-        Ok(Some(held)) if held == image.id => "this same build".into(),
-        Ok(Some(held)) => held,
-        Ok(None) => "no ThisOS build ID".into(),
-        // Not being able to read it is no reason to refuse to overwrite it.
-        Err(e) => format!("unknown ({e:#})"),
-    };
-    println!("stick holds: {held}");
-    // Always asked: external USB disks report hotplug too, so this is what
-    // tells the stick from a backup drive left plugged in.
-    if !confirm(&format!(
-        "Erase everything on {} and write the image? [y/N] ",
-        disk.path
-    ))? {
-        bail!("canceled; nothing was written");
-    }
+    report::step("confirm", || {
+        // Always asked: external USB disks report hotplug too, so this is
+        // what tells the stick from a backup drive left plugged in.
+        let yes = report::suspend(|| {
+            println!("image: {} ({} bytes)", image.path.display(), data.len());
+            println!("       {}", image.id);
+            println!("stick: {disk}");
+            println!("       {dev}");
+            println!("stick holds: {held}");
+            confirm(&format!(
+                "Erase everything on {} and write the image? [y/N] ",
+                disk.path
+            ))
+        })?;
+        ensure!(yes, "canceled; nothing was written");
+        Ok(())
+    })?;
 
-    unmount(dev)?;
-    // Ask for the password now, not in the middle of dd's progress output.
-    exec(Command::new("sudo").arg("-v"))?;
-    // A stick swapped during the question or the password prompt for one
-    // with the same model and serial keeps the link but may not keep the path.
-    check_link(dev, &disk.path)?;
-    // nocreat, because a stick pulled during the password prompt takes its
-    // link with it, and dd would otherwise write the image to a new file there.
-    exec(Command::new("sudo").args([
-        "dd",
-        &format!("if={}", image.path.display()),
-        &format!("of={dev}"),
-        "bs=4M",
-        "conv=fsync,nocreat",
-        "status=progress",
-    ]))?;
-    // This has to come before sgdisk -e, which rewrites the primary GPT header.
-    verify(dev, &data)?;
-    exec(Command::new("sudo").args(["sgdisk", "-e", dev]))?;
-    let check = output(Command::new("sudo").args(["sgdisk", "-v", dev]))?;
-    ensure!(
-        check.contains("No problems found"),
-        "sgdisk -v found problems on {dev}:\n{check}"
-    );
-    // The desktop may have mounted the new partition after dd.
-    unmount(dev)?;
-    exec(Command::new("udisksctl").args(["power-off", "-b", dev]))?;
-    println!("{} written, verified and powered off", disk.path);
-    Ok(())
+    report::step("write", || {
+        unmount(dev)?;
+        // Ask for the password now, with the terminal, not in the middle of
+        // dd.
+        attached(Command::new("sudo").arg("-v"))?;
+        // A stick swapped during the question or the password prompt for
+        // one with the same model and serial keeps the link but may not keep
+        // the path.
+        check_link(dev, &disk.path)?;
+        report::expect_bytes(data.len() as u64);
+        // nocreat, because a stick pulled during the password prompt takes
+        // its link with it, and dd would otherwise write the image to a new
+        // file there.
+        exec(Command::new("sudo").args([
+            "dd",
+            &format!("if={}", image.path.display()),
+            &format!("of={dev}"),
+            "bs=4M",
+            "conv=fsync,nocreat",
+            "status=progress",
+        ]))
+    })?;
+    // This has to come before sgdisk -e, which rewrites the primary GPT
+    // header.
+    report::step("verify", || verify(dev, &data))?;
+    report::step("fix the GPT", || {
+        exec(Command::new("sudo").args(["sgdisk", "-e", dev]))?;
+        let check = output(Command::new("sudo").args(["sgdisk", "-v", dev]))?;
+        ensure!(
+            check.contains("No problems found"),
+            "sgdisk -v found problems on {dev}:\n{check}"
+        );
+        // The desktop may have mounted the new partition after dd.
+        unmount(dev)
+    })?;
+    report::step("power off", || {
+        exec(Command::new("udisksctl").args(["power-off", "-b", dev]))?;
+        report::log(&format!("{} written, verified and powered off", disk.path));
+        Ok(())
+    })
 }
 
 /// The whole disks on USB that are removable or hotplug, from lsblk's rows
@@ -252,7 +287,7 @@ fn verify(device: &str, image: &[u8]) -> Result<()> {
         read.len(),
         image.len()
     );
-    println!("verified: {device} holds the image");
+    report::log(&format!("verified: {device} holds the image"));
     Ok(())
 }
 

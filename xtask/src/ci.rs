@@ -1,123 +1,166 @@
 //! Running locally everything CI runs.
 
-use std::io::{self, IsTerminal};
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, ensure};
 use serde_json::Value;
+use thisos_report::{Name, Stdout, Step};
 
 use crate::build::{self, Arch, Kernel};
 use crate::cmd::{cargo, exec, on_host, output, show};
 use crate::{banned, ramdisk, test};
 
-/// Runs the checks in CI's order and stops at the first that fails.
-pub fn ci() -> Result<()> {
-    // Checked first, so a missing tool fails before minutes of other checks.
-    ensure!(
-        cargo()
-            .args(["deny", "--version"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success()),
-        "cargo deny isn't installed; install it with `cargo install cargo-deny --locked`"
-    );
-
-    banned::check()?;
-    exec(cargo().args(["fmt", "--all", "--check"]))?;
-    exec(cargo().args([
-        "fmt",
-        "--manifest-path",
-        "xtask/Cargo.toml",
-        "--all",
-        "--check",
-    ]))?;
-
-    // The aarch64 arch crate's assembly doesn't build for x86_64; it gets
-    // its own passes below.
-    clippy(cargo().args(["clippy", "--workspace", "--exclude", "thisos-arch-aarch64"]))?;
-    // Not --workspace --all-targets: that builds thisos-console's tests,
-    // which need std, for x86_64-unknown-none.
-    clippy(cargo().args(["clippy", "-p", "thisos-kernel", "--tests"]))?;
-    let aarch64 = Arch::Aarch64.target();
-    // The user crates have aarch64-only code too, which the x86_64 pass
-    // above never compiles.
-    let mut aarch64_clippy = cargo();
-    aarch64_clippy.args([
-        "clippy",
-        "-p",
-        "thisos-kernel",
-        "-p",
-        "thisos-arch-aarch64",
-        "-p",
-        "thisos-rt",
-    ]);
-    for package in ramdisk::PROGRAMS {
-        aarch64_clippy.args(["-p", package]);
-    }
-    clippy(aarch64_clippy.args(["--target", aarch64]))?;
-    clippy(cargo().args([
-        "clippy",
-        "-p",
-        "thisos-kernel",
-        "--tests",
-        "--target",
-        aarch64,
-    ]))?;
+/// The checks in CI's order, a step each, which stop at the first that
+/// fails.
+pub fn steps() -> Result<Vec<Step>> {
+    let mut steps = vec![
+        // Checked first, so a missing tool fails before minutes of other
+        // checks.
+        Step::new("cargo deny installed", || {
+            ensure!(
+                cargo()
+                    .args(["deny", "--version"])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .is_ok_and(|status| status.success()),
+                "cargo deny isn't installed; install it with `cargo install cargo-deny --locked`"
+            );
+            Ok(())
+        }),
+        Step::new("banned patterns", banned::check),
+        Step::new(Name::grouped("rustfmt", "root"), || {
+            exec(cargo().args(["fmt", "--all", "--check"]))
+        }),
+        Step::new(Name::grouped("rustfmt", "xtask"), || {
+            exec(cargo().args([
+                "fmt",
+                "--manifest-path",
+                "xtask/Cargo.toml",
+                "--all",
+                "--check",
+            ]))
+        }),
+        // The aarch64 arch crate's assembly doesn't build for x86_64; it
+        // gets its own passes below.
+        Step::new(Name::grouped("clippy", "x86_64"), || {
+            clippy(cargo().args(["clippy", "--workspace", "--exclude", "thisos-arch-aarch64"]))
+        }),
+        // Not --workspace --all-targets: that builds thisos-console's tests,
+        // which need std, for x86_64-unknown-none.
+        Step::new(Name::grouped("clippy", "x86_64 kernel tests"), || {
+            clippy(cargo().args(["clippy", "-p", "thisos-kernel", "--tests"]))
+        }),
+        // The user crates have aarch64-only code too, which the x86_64 pass
+        // above never compiles.
+        Step::new(Name::grouped("clippy", "aarch64"), || {
+            let mut aarch64_clippy = cargo();
+            aarch64_clippy.args([
+                "clippy",
+                "-p",
+                "thisos-kernel",
+                "-p",
+                "thisos-arch-aarch64",
+                "-p",
+                "thisos-rt",
+            ]);
+            for package in ramdisk::PROGRAMS {
+                aarch64_clippy.args(["-p", package]);
+            }
+            clippy(aarch64_clippy.args(["--target", Arch::Aarch64.target()]))
+        }),
+        Step::new(Name::grouped("clippy", "aarch64 kernel tests"), || {
+            clippy(cargo().args([
+                "clippy",
+                "-p",
+                "thisos-kernel",
+                "--tests",
+                "--target",
+                Arch::Aarch64.target(),
+            ]))
+        }),
+    ];
     let libs = test::libs()?;
     for manifest in &libs {
-        clippy(on_host(cargo().arg("clippy").arg("--manifest-path").arg(manifest)).arg("--tests"))?;
+        let manifest = manifest.clone();
+        steps.push(Step::new(
+            Name::grouped("clippy", test::crate_dir(&manifest)),
+            move || {
+                clippy(
+                    on_host(cargo().arg("clippy").arg("--manifest-path").arg(&manifest))
+                        .arg("--tests"),
+                )
+            },
+        ));
     }
-    clippy(
-        on_host(cargo().args(["clippy", "--manifest-path", "xtask/Cargo.toml"]))
-            .arg("--all-targets"),
-    )?;
-    exec(on_host(cargo().args([
-        "test",
-        "--manifest-path",
-        "xtask/Cargo.toml",
-    ])))?;
+    steps.push(Step::new(Name::grouped("clippy", "xtask"), || {
+        clippy(
+            on_host(cargo().args(["clippy", "--manifest-path", "xtask/Cargo.toml"]))
+                .args(["--workspace", "--all-targets"]),
+        )
+    }));
+    steps.push(Step::new(Name::grouped("host tests", "xtask"), || {
+        exec(on_host(cargo().args([
+            "test",
+            "--manifest-path",
+            "xtask/Cargo.toml",
+            "--workspace",
+        ])))
+    }));
 
-    test::test(Arch::X86_64)?;
+    steps.extend(test::steps(Arch::X86_64)?);
     // The host tests just ran; aarch64 adds only its kernel's.
-    test::qemu(Arch::Aarch64)?;
+    steps.push(test::qemu_step(Arch::Aarch64));
     // cargo miri takes host-tuple as a target name and fails to build a
     // sysroot for it, so it gets the host's actual tuple.
     let host = output(Command::new("rustc").args(["--print", "host-tuple"]))?;
-    for manifest in &libs {
-        let mut miri = cargo();
-        // The arch crates reach their page tables, in tests a buffer, by
-        // turning physical addresses into pointers, as the kernel does
-        // through the physical-memory mapping. That needs exposed
-        // provenance, which Miri allows only in permissive mode. There an
-        // access must still land inside an allocation whose address was
-        // exposed, though not necessarily the buffer. Strict mode would need
-        // the tables to carry a pointer in place of the mapping's offset.
-        if manifest.ends_with(test::ARCH_X86_64) || manifest.ends_with(test::ARCH_AARCH64) {
-            miri.env("MIRIFLAGS", "-Zmiri-permissive-provenance");
-        }
-        exec(
-            miri.args(["miri", "test", "--target", host.trim(), "--manifest-path"])
-                .arg(manifest),
-        )?;
+    let host = host.trim().to_owned();
+    for manifest in libs {
+        let host = host.clone();
+        steps.push(Step::new(
+            Name::grouped("miri", test::crate_dir(&manifest)),
+            move || {
+                let mut miri = cargo();
+                // The arch crates reach their page tables, in tests a
+                // buffer, by turning physical addresses into pointers, as
+                // the kernel does through the physical-memory mapping. That
+                // needs exposed provenance, which Miri allows only in
+                // permissive mode. There an access must still land inside an
+                // allocation whose address was exposed, though not
+                // necessarily the buffer. Strict mode would need the tables
+                // to carry a pointer in place of the mapping's offset.
+                if manifest.ends_with(test::ARCH_X86_64) || manifest.ends_with(test::ARCH_AARCH64) {
+                    miri.env("MIRIFLAGS", "-Zmiri-permissive-provenance");
+                }
+                exec(
+                    miri.args(["miri", "test", "--target", &host, "--manifest-path"])
+                        .arg(&manifest),
+                )
+            },
+        ));
     }
 
-    for manifest in ["Cargo.toml", "xtask/Cargo.toml"] {
-        exec(cargo().args([
-            "deny",
-            "--manifest-path",
-            manifest,
-            "--config",
-            "deny.toml",
-            "check",
-        ]))?;
+    for (name, manifest) in [("root", "Cargo.toml"), ("xtask", "xtask/Cargo.toml")] {
+        steps.push(Step::new(Name::grouped("cargo deny", name), move || {
+            exec(cargo().args([
+                "deny",
+                "--manifest-path",
+                manifest,
+                "--config",
+                "deny.toml",
+                "check",
+            ]))
+        }));
     }
 
-    build::build(Arch::X86_64, false, Kernel::Main)?;
-    // Clippy stops before codegen, so only this assembles and links the
-    // aarch64 kernel.
-    build::build(Arch::Aarch64, false, Kernel::Main)?;
-    Ok(())
+    // Clippy stops before codegen, so only the second assembles and links
+    // the aarch64 kernel.
+    for arch in [Arch::X86_64, Arch::Aarch64] {
+        steps.push(Step::new(Name::grouped("build", arch.name()), move || {
+            build::build(arch, false, Kernel::Main).map(|_| ())
+        }));
+    }
+    Ok(steps)
 }
 
 /// Runs `cargo_clippy`, a cargo clippy command, with `-D warnings`, and fails
@@ -125,19 +168,19 @@ pub fn ci() -> Result<()> {
 /// error, but not warnings that aren't lints, such as a `clippy.toml` path
 /// that names nothing.
 fn clippy(cargo_clippy: &mut Command) -> Result<()> {
-    let format = if io::stderr().is_terminal() {
+    let format = if thisos_report::color() {
         "--message-format=json-diagnostic-rendered-ansi"
     } else {
         "--message-format=json"
     };
-    let out = cargo_clippy
-        .args([format, "--", "-D", "warnings"])
-        .stderr(Stdio::inherit())
-        .output()
-        .with_context(|| format!("running {}", show(cargo_clippy)))?;
+    let out = thisos_report::run(
+        cargo_clippy.args([format, "--", "-D", "warnings"]),
+        Stdout::Keep,
+    )
+    .with_context(|| format!("running {}", show(cargo_clippy)))?;
     let messages = String::from_utf8(out.stdout).context("cargo's JSON messages")?;
     let (rendered, warnings) = diagnostics(&messages)?;
-    eprint!("{rendered}");
+    thisos_report::log(&rendered);
     ensure!(
         out.status.success(),
         "{} failed: {}",

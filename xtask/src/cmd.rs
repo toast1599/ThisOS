@@ -4,6 +4,7 @@ use std::io::{self, Write};
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, ensure};
+use thisos_report::Stdout;
 
 use crate::root;
 
@@ -20,11 +21,17 @@ pub fn on_host(cmd: &mut Command) -> &mut Command {
     cmd.args(["--target", "host-tuple"])
 }
 
-/// Runs `cmd` with the terminal attached, and fails if it does.
+/// Runs `cmd` into the running step's log, and fails if it does.
 pub fn exec(cmd: &mut Command) -> Result<()> {
-    let status = cmd
-        .status()
-        .with_context(|| format!("running {}", show(cmd)))?;
+    let out =
+        thisos_report::run(cmd, Stdout::Log).with_context(|| format!("running {}", show(cmd)))?;
+    ensure!(out.status.success(), "{} failed: {}", show(cmd), out.status);
+    Ok(())
+}
+
+/// Runs `cmd` with the terminal to itself, and fails if it does.
+pub fn attached(cmd: &mut Command) -> Result<()> {
+    let status = thisos_report::attached(cmd).with_context(|| format!("running {}", show(cmd)))?;
     ensure!(status.success(), "{} failed: {status}", show(cmd));
     Ok(())
 }
@@ -38,16 +45,15 @@ pub fn output(cmd: &mut Command) -> Result<String> {
 /// Runs `cmd` and returns its standard output, failing if it fails. Standard
 /// input stays on the terminal, so that sudo can ask for a password.
 pub fn output_bytes(cmd: &mut Command) -> Result<Vec<u8>> {
-    let out = cmd
-        .stdin(Stdio::inherit())
-        .output()
+    let out = thisos_report::run(cmd.stdin(Stdio::inherit()), Stdout::Keep)
         .with_context(|| format!("running {}", show(cmd)))?;
-    ensure!(
-        out.status.success(),
-        "{} failed: {}",
-        show(cmd),
-        String::from_utf8_lossy(&out.stderr).trim()
-    );
+    // Inside a step, standard error is in the step's log, which a failure
+    // shows.
+    let why = match &out.stderr {
+        Some(stderr) => String::from_utf8_lossy(stderr).trim().to_owned(),
+        None => out.status.to_string(),
+    };
+    ensure!(out.status.success(), "{} failed: {why}", show(cmd));
     Ok(out.stdout)
 }
 
@@ -57,7 +63,8 @@ pub fn show(cmd: &Command) -> String {
     words.join(" ")
 }
 
-/// Asks a yes/no question; anything but yes is no.
+/// Asks a yes/no question; anything but yes is no. Call it with the screen
+/// hidden, through `thisos_report::suspend`.
 pub fn confirm(prompt: &str) -> Result<bool> {
     print!("{prompt}");
     io::stdout().flush().context("writing the prompt")?;

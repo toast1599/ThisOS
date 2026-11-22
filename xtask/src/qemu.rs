@@ -9,9 +9,10 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use ovmf_prebuilt::{FileType, Prebuilt, Source};
 use thisos_hal::{PANIC_TEST_FILE, TestEnd};
+use thisos_report as report;
 
 use crate::build::{self, Arch, Kernel};
-use crate::cmd::exec;
+use crate::cmd::attached;
 use crate::ramdisk;
 
 const OVMF: Source = Source::EDK2_STABLE202605_R1;
@@ -31,16 +32,25 @@ const TEST_SUCCESS_WITH_MORE: u8 = TestEnd::PassedWithMore.status();
 /// otherwise be booted for good.
 const MAX_BOOTS: u32 = 64;
 
+/// The steps of [`run`], for a run of it alone.
+pub fn steps() -> Vec<String> {
+    let mut steps = build::steps(Kernel::Main);
+    steps.push("QEMU".into());
+    steps
+}
+
 /// Builds, then boots the image in QEMU with a window and serial on the
-/// terminal.
+/// terminal, in the steps [`steps`] names.
 pub fn run(arch: Arch, release: bool, gdb: bool) -> Result<()> {
     let image = build::build(arch, release, Kernel::Main)?;
-    let vars = build::target_dir()?.join(format!("ovmf-vars{}.fd", arch.suffix()));
-    let mut qemu = qemu(arch, &image.path, &vars)?;
-    if gdb {
-        qemu.args(["-s", "-S"]);
-    }
-    exec(&mut qemu)
+    report::step("QEMU", || {
+        let vars = build::target_dir()?.join(format!("ovmf-vars{}.fd", arch.suffix()));
+        let mut qemu = qemu(arch, &image.path, &vars)?;
+        if gdb {
+            qemu.args(["-s", "-S"]);
+        }
+        attached(&mut qemu)
+    })
 }
 
 /// Boots a kernel test ELF headless, with the file at `ramdisk` as the
@@ -150,7 +160,9 @@ fn qemu(arch: Arch, image: &Path, vars: &Path) -> Result<Command> {
         Arch::X86_64 => ovmf_prebuilt::Arch::X64,
         Arch::Aarch64 => ovmf_prebuilt::Arch::Aarch64,
     };
-    let ovmf = Prebuilt::fetch(OVMF, build::target_dir()?.join("ovmf")).context("fetching OVMF")?;
+    let ovmf = report::step("OVMF", || {
+        Prebuilt::fetch(OVMF, build::target_dir()?.join("ovmf")).context("fetching OVMF")
+    })?;
     let code = ovmf.get_file(firmware, FileType::Code);
     fs::copy(ovmf.get_file(firmware, FileType::Vars), vars)
         .with_context(|| format!("copying OVMF vars to {}", vars.display()))?;

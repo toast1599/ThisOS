@@ -3,11 +3,12 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::OnceLock;
 
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
+use thisos_report as report;
 
 use crate::cmd::{cargo, output};
 use crate::{limine, ramdisk, root};
@@ -124,19 +125,33 @@ pub struct Image {
     pub id: String,
 }
 
-/// Builds `kernel` and writes its UEFI disk image.
+/// The steps of [`build`], for a run of it alone.
+pub fn steps(kernel: Kernel) -> Vec<String> {
+    let kernel = match kernel {
+        Kernel::Main => "kernel",
+        Kernel::Tests => "kernel tests",
+    };
+    ["version", kernel, "ramdisk programs", "disk image"]
+        .map(String::from)
+        .into()
+}
+
+/// Builds `kernel` and writes its UEFI disk image, in the steps [`steps`]
+/// names.
 pub fn build(arch: Arch, release: bool, kernel: Kernel) -> Result<Image> {
-    let pkgid = output(cargo().args(["pkgid", "-p", "thisos-kernel"]))?;
-    let version = pkgid
-        .trim()
-        .rsplit(['@', '#'])
-        .next()
-        .with_context(|| format!("no version in cargo pkgid output {pkgid:?}"))?;
-    let build = build_env(release, kernel)?;
-    let id = format!("ThisOS {version} {build}");
+    let (id, build) = report::step("version", || {
+        let pkgid = output(cargo().args(["pkgid", "-p", "thisos-kernel"]))?;
+        let version = pkgid
+            .trim()
+            .rsplit(['@', '#'])
+            .next()
+            .with_context(|| format!("no version in cargo pkgid output {pkgid:?}"))?;
+        let build = build_env(release, kernel)?;
+        Ok((format!("ThisOS {version} {build}"), build))
+    })?;
 
     let (elf, path) = match kernel {
-        Kernel::Main => {
+        Kernel::Main => report::step("kernel", || {
             let mut cargo_build = cargo();
             cargo_build.env("THISOS_BUILD", &build).args([
                 "build",
@@ -148,19 +163,23 @@ pub fn build(arch: Arch, release: bool, kernel: Kernel) -> Result<Image> {
             if release {
                 cargo_build.arg("--release");
             }
-            (
+            Ok((
                 executable(&mut cargo_build, "thisos-kernel", false)?,
                 target_dir()?.join(format!("thisos{}.img", arch.suffix())),
-            )
-        }
-        Kernel::Tests => (
-            test_elf(arch, release, &build)?,
-            target_dir()?.join(format!("thisos{}-tests.img", arch.suffix())),
-        ),
+            ))
+        })?,
+        Kernel::Tests => report::step("kernel tests", || {
+            Ok((
+                test_elf(arch, release, &build)?,
+                target_dir()?.join(format!("thisos{}-tests.img", arch.suffix())),
+            ))
+        })?,
     };
 
-    let ramdisk = arch.ramdisk(release)?;
-    arch.write_image(&elf, ramdisk.as_deref(), Some(&id), &path)?;
+    let ramdisk = report::step("ramdisk programs", || arch.ramdisk(release))?;
+    report::step("disk image", || {
+        arch.write_image(&elf, ramdisk.as_deref(), Some(&id), &path)
+    })?;
     Ok(Image { path, id })
 }
 
@@ -209,9 +228,7 @@ fn executable(cargo_build: &mut Command, name: &str, test: bool) -> Result<PathB
 /// Cargo names them only in its JSON messages, and where it puts them
 /// depends on `CARGO_TARGET_DIR` and cargo's config.
 fn executables(cargo_build: &mut Command, names: &[&str], test: bool) -> Result<Vec<PathBuf>> {
-    cargo_build
-        .arg("--message-format=json-render-diagnostics")
-        .stderr(Stdio::inherit());
+    cargo_build.arg("--message-format=json-render-diagnostics");
     let messages = output(cargo_build)?;
     let mut elfs = vec![Vec::new(); names.len()];
     for line in messages.lines() {

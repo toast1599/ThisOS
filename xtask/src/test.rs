@@ -1,27 +1,50 @@
 //! Running the tests.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
+use thisos_report::{Name, Step};
 
 use crate::build::{self, Arch, Kernel};
 use crate::cmd::{cargo, exec, on_host};
 use crate::root;
 
-/// Runs the host tests of every `lib/*` crate, `thisos-abi`, `thisos-rt`
-/// and both arch crates, then the kernel's tests for `arch` in QEMU.
-pub fn test(arch: Arch) -> Result<()> {
+/// The host tests of every `lib/*` crate, `thisos-abi`, `thisos-rt` and
+/// both arch crates, then the kernel's tests for `arch` in QEMU, a step
+/// each.
+pub fn steps(arch: Arch) -> Result<Vec<Step>> {
+    let mut steps = Vec::new();
     for manifest in libs()? {
-        exec(on_host(
-            cargo().arg("test").arg("--manifest-path").arg(&manifest),
-        ))?;
+        steps.push(Step::new(
+            Name::grouped("host tests", crate_dir(&manifest)),
+            move || {
+                exec(on_host(
+                    cargo().arg("test").arg("--manifest-path").arg(&manifest),
+                ))
+            },
+        ));
     }
-    qemu(arch)
+    steps.push(qemu_step(arch));
+    Ok(steps)
 }
 
-/// Runs the kernel's tests for `arch` in QEMU, without the host tests.
-pub fn qemu(arch: Arch) -> Result<()> {
+/// The kernel's tests for `arch` in QEMU, as a step.
+pub fn qemu_step(arch: Arch) -> Step {
+    Step::new(Name::grouped("QEMU tests", arch.name()), move || qemu(arch))
+}
+
+/// `lib/console` for `lib/console/Cargo.toml`, as step names show a crate.
+pub fn crate_dir(manifest: &Path) -> String {
+    let dir = manifest.parent().unwrap_or(manifest);
+    dir.strip_prefix(root())
+        .unwrap_or(dir)
+        .display()
+        .to_string()
+}
+
+/// Runs the kernel's tests for `arch` in QEMU.
+fn qemu(arch: Arch) -> Result<()> {
     // Set here rather than in .cargo/config.toml: cargo starts the runner in
     // kernel/, where the xtask alias's relative manifest path doesn't resolve.
     let xtask = std::env::current_exe().context("finding the xtask executable")?;

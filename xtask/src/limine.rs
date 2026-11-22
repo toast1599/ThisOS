@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
 use sha2::{Digest, Sha256};
+use thisos_report as report;
 
 use crate::build::{self, BUILD_FILE};
 
@@ -67,6 +68,29 @@ pub fn write_image(
     gpt(&fat, path).with_context(|| format!("writing {}", path.display()))
 }
 
+/// The body at `url`, up to [`MAX_DOWNLOAD`] bytes, reporting how much
+/// has come in.
+fn download(url: &str) -> Result<Vec<u8>> {
+    report::log(&format!("downloading {url}"));
+    let response = ureq::get(url)
+        .call()
+        .with_context(|| format!("downloading {url}"))?;
+    let total = response.body().content_length();
+    let mut body = response.into_body().into_reader().take(MAX_DOWNLOAD);
+    let mut data = Vec::new();
+    let mut buf = [0; 64 << 10];
+    loop {
+        let n = body
+            .read(&mut buf)
+            .with_context(|| format!("downloading {url}"))?;
+        if n == 0 {
+            return Ok(data);
+        }
+        data.extend_from_slice(&buf[..n]);
+        report::bytes(data.len() as u64, total);
+    }
+}
+
 /// `BOOTAA64.EFI` from the pinned release, which the first call downloads
 /// into `limine/<version>/` in cargo's target directory.
 fn loader() -> Result<PathBuf> {
@@ -79,16 +103,7 @@ fn loader() -> Result<PathBuf> {
     let url = format!(
         "https://github.com/limine-bootloader/limine/releases/download/v{VERSION}/limine-binary.tar.xz"
     );
-    println!("downloading {url}");
-    let mut data = Vec::new();
-    ureq::get(&url)
-        .call()
-        .with_context(|| format!("downloading {url}"))?
-        .into_body()
-        .into_reader()
-        .take(MAX_DOWNLOAD)
-        .read_to_end(&mut data)
-        .with_context(|| format!("downloading {url}"))?;
+    let data = report::step("Limine", || download(&url))?;
     let hash: String = Sha256::digest(&data)
         .iter()
         .map(|b| format!("{b:02x}"))
