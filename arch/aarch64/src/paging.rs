@@ -27,12 +27,13 @@ use crate::{ptr_at, to_u64};
 mod cpu {
     use aarch64_cpu::asm::barrier::{self, ISH, ISHST};
     use aarch64_cpu::registers::{
-        DAIF, ID_AA64MMFR1_EL1, MAIR_EL1, Readable, TCR_EL1, TTBR0_EL1, TTBR1_EL1,
+        DAIF, ID_AA64MMFR1_EL1, MAIR_EL1, Readable, SCTLR_EL1, TCR_EL1, TTBR0_EL1, TTBR1_EL1,
     };
 
     pub(super) use crate::sysreg::{
         dc_civac, dc_cvau, enable_pan, invalidate_icache, read_ctr, sync_icache, tlbi_aside1is,
-        tlbi_vaae1is, tlbi_vae1is, tlbi_vmalle1is, write_mair, write_tcr, write_ttbr0, write_ttbr1,
+        tlbi_vaae1is, tlbi_vae1is, tlbi_vmalle1is, write_mair, write_sctlr, write_tcr, write_ttbr0,
+        write_ttbr1,
     };
 
     pub fn interrupts_enabled() -> bool {
@@ -49,6 +50,10 @@ mod cpu {
 
     pub fn mair() -> u64 {
         MAIR_EL1.get()
+    }
+
+    pub fn sctlr() -> u64 {
+        SCTLR_EL1.get()
     }
 
     /// The level 0 table TTBR0 points at.
@@ -123,6 +128,74 @@ const MAIR_NON_CACHEABLE: u64 = 0x44;
 /// `MAIR_EL1`'s attribute 3 as Device-nGnRE: no gathering or reordering,
 /// with early write acknowledgement, as Linux maps device registers.
 const MAIR_DEVICE: u64 = 0x04;
+
+/// What `take` writes to `SCTLR_EL1`: every bit chosen, none left as the
+/// loader had it, since some of them open things to EL0. UMA, UCI, nTWI and
+/// nTWE are clear, so that EL0's writes to DAIF, its cache maintenance, WFI
+/// and WFE trap and end the program. A is clear, since the kernel's target
+/// lets the compiler emit unaligned accesses; SPAN is clear, so that every
+/// exception to EL1 sets PAN; EE and E0E are clear, for little-endian.
+/// ITD, SED, EOS, TSCXT, EIS, nTLSMD and LSMAOE are set: each is RES1 on a
+/// CPU without its feature, and on one with it, set either changes nothing
+/// the kernel relies on or keeps a 32-bit-state or context-number
+/// feature from EL0.
+pub const SCTLR: u64 = sctlr::M
+    | sctlr::C
+    | sctlr::SA
+    | sctlr::SA0
+    | sctlr::ITD
+    | sctlr::SED
+    | sctlr::EOS
+    | sctlr::I
+    | sctlr::DZE
+    | sctlr::UCT
+    | sctlr::WXN
+    | sctlr::TSCXT
+    | sctlr::EIS
+    | sctlr::NTLSMD
+    | sctlr::LSMAOE;
+
+/// The `SCTLR_EL1` bits [`SCTLR`] sets.
+mod sctlr {
+    /// The MMU.
+    pub const M: u64 = 1 << 0;
+    /// The data caches.
+    pub const C: u64 = 1 << 2;
+    /// SP alignment checks at EL1.
+    pub const SA: u64 = 1 << 3;
+    /// SP alignment checks at EL0.
+    pub const SA0: u64 = 1 << 4;
+    pub const ITD: u64 = 1 << 7;
+    pub const SED: u64 = 1 << 8;
+    pub const EOS: u64 = 1 << 11;
+    /// The instruction caches.
+    pub const I: u64 = 1 << 12;
+    /// `dc zva` at EL0, which zeroes only memory EL0 can write.
+    pub const DZE: u64 = 1 << 14;
+    /// `CTR_EL0` reads at EL0.
+    pub const UCT: u64 = 1 << 15;
+    /// Every writable page is execute-never, whatever its entry says.
+    pub const WXN: u64 = 1 << 19;
+    pub const TSCXT: u64 = 1 << 20;
+    pub const EIS: u64 = 1 << 22;
+    pub const NTLSMD: u64 = 1 << 28;
+    pub const LSMAOE: u64 = 1 << 29;
+}
+
+/// `SCTLR_EL1` as the loader left it, which `take` records before writing
+/// [`SCTLR`]; 0 until then.
+static LOADER_SCTLR: AtomicU64 = AtomicU64::new(0);
+
+/// `SCTLR_EL1` as the loader left it, or 0 before `take` ran.
+pub fn loader_sctlr() -> u64 {
+    LOADER_SCTLR.load(Ordering::Relaxed)
+}
+
+/// `SCTLR_EL1` as it is now.
+#[cfg(not(test))]
+pub fn sctlr() -> u64 {
+    cpu::sctlr()
+}
 
 /// The page tables at `level_0`. Whoever makes one is the only user of the
 /// tables while it lives, apart from the CPU's page walker.
@@ -623,10 +696,10 @@ fn kernel_leaf(
 /// letting EL1 execute only the kernel's `text` and making the framebuffer
 /// at `fb` normal non-cacheable memory, and maps the physical `devices` as
 /// device memory in the physical-memory mapping. Then switches to them,
-/// empties the lower half and turns on PAN. Returns `None` after the first
-/// call. Panics if the CPU lacks PAN, if Limine's `TCR_EL1` isn't what this
-/// module assumes, if Limine mapped the boot stack's guard page at `guard`,
-/// or if it mapped any of `devices`.
+/// empties the lower half, writes [`SCTLR`] and turns on PAN. Returns
+/// `None` after the first call. Panics if the CPU lacks PAN, if Limine's
+/// `TCR_EL1` isn't what this module assumes, if Limine mapped the boot
+/// stack's guard page at `guard`, or if it mapped any of `devices`.
 ///
 /// # Safety
 ///
@@ -731,6 +804,15 @@ pub unsafe fn take(
     }
     // The caller guarantees nothing uses the lower half.
     empty_lower_half();
+    LOADER_SCTLR.store(cpu::sctlr(), Ordering::Relaxed);
+    // SAFETY: SCTLR keeps the MMU and caches on and the byte order as they
+    // are, so the kernel's tables translate as before. WXN only takes
+    // execution from writable pages, and the kernel's tables make none of
+    // its code writable. The other bits change only what EL0 may do and
+    // how exceptions to EL1 set PAN.
+    unsafe { cpu::write_sctlr(SCTLR) };
+    // TLB entries may hold WXN's old effect.
+    cpu::tlbi_vmalle1is();
     // SAFETY: PAN only stops EL1 reaching EL0 pages, of which there are
     // none yet; the kernel never reaches one but through user copies, which
     // will clear PSTATE.PAN for it.
@@ -1349,9 +1431,14 @@ mod tests {
         /// replaces.
         pub const MAIR: u64 = 0x1122_3344_5566_04ff;
 
+        /// `SCTLR_EL1` before `take`: the MMU and caches on, with UMA,
+        /// nTWI, nTWE, UCI and SPAN set, all of which `take` clears.
+        pub const SCTLR_BEFORE: u64 = 0x34d5_db85;
+
         pub struct Fake {
             pub tcr: u64,
             pub mair: u64,
+            pub sctlr: u64,
             pub ttbr0: u64,
             pub ttbr1: u64,
             pub pan: bool,
@@ -1373,6 +1460,7 @@ mod tests {
                     + TCR_EL1::TG1::KiB_4)
                     .value,
                 mair: MAIR,
+                sctlr: SCTLR_BEFORE,
                 ttbr0: 0,
                 ttbr1: 0,
                 pan: false,
@@ -1406,6 +1494,17 @@ mod tests {
 
         pub fn mair() -> u64 {
             with(|cpu| cpu.mair)
+        }
+
+        pub fn sctlr() -> u64 {
+            with(|cpu| cpu.sctlr)
+        }
+
+        /// # Safety
+        ///
+        /// None; it is unsafe as the real one is.
+        pub unsafe fn write_sctlr(value: u64) {
+            with(|cpu| cpu.sctlr = value);
         }
 
         pub fn ttbr0() -> u64 {
@@ -2033,11 +2132,14 @@ mod tests {
         cpu::with(|cpu| {
             assert_eq!(cpu.ttbr1, kernel.tables.level_0);
             assert_eq!(cpu.mair, 0x1122_3344_0444_04ff);
+            assert_eq!(cpu.sctlr, SCTLR);
             assert!(cpu.pan);
             let lines: Vec<u64> = (HHDM + 0x20_3000..HHDM + 0x20_6000).step_by(64).collect();
             assert_eq!(cpu.cleaned, lines);
         });
-        assert_eq!(cpu::flushes(), [Flush::All, Flush::User]);
+        assert_eq!(loader_sctlr(), cpu::SCTLR_BEFORE);
+        // The second All drops what WXN changes.
+        assert_eq!(cpu::flushes(), [Flush::All, Flush::User, Flush::All]);
         assert!(!ttbr0_walks());
 
         let at = |addr| descriptor(&kernel.tables, addr);

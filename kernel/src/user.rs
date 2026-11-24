@@ -1260,6 +1260,17 @@ mod tests {
         );
     }
 
+    // User code that masked interrupts would never be preempted, and would
+    // keep the only CPU for good.
+    #[test_case]
+    fn masking_interrupts_kills_the_thread() {
+        let (end, code) = run(UserProgram::MaskInterrupts, |_, _| 0);
+        assert!(
+            matches!(end, End::Killed { trap: Trap::Other { .. }, ip } if ip == code),
+            "{end:?}"
+        );
+    }
+
     // On x86_64 the exception arrives on the stack every user thread's
     // debug exceptions share. ICEBP raises it as a trap, after the
     // instruction, so the CPU reports the byte after it. aarch64's is a

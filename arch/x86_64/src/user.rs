@@ -590,6 +590,13 @@ global_asm!(
     "mov rax, -1",
     "jmp thisos_user_programs + 11 * {slot} + {last_syscall}",
     ".org thisos_user_programs + 12 * {slot}, 0xcc",
+    // MaskInterrupts. With IOPL 0, cli in ring 3 raises #GP.
+    "cli",
+    "xor edi, edi",
+    "mov eax, {exit}",
+    "syscall",
+    "ud2",
+    ".org thisos_user_programs + 13 * {slot}, 0xcc",
     ".popsection",
     exit = const Syscall::Exit.number(),
     user_flags = const USER_FLAGS.bits(),
@@ -643,7 +650,7 @@ const USER_FLAGS: RFlags = RFlags::DIRECTION_FLAG
     .union(RFlags::NESTED_TASK);
 
 unsafe extern "C" {
-    static thisos_user_programs: [u8; 12 * SLOT];
+    static thisos_user_programs: [u8; 13 * SLOT];
 }
 
 /// Writes `program` at the start of `frame`, through the physical-memory
@@ -662,6 +669,7 @@ pub fn write_program(phys_offset: VirtAddr, frame: &mut Frame, program: UserProg
         UserProgram::Channel => 9,
         UserProgram::Wait => 10,
         UserProgram::LastSyscall => 11,
+        UserProgram::MaskInterrupts => 12,
     };
     let source = (&raw const thisos_user_programs)
         .cast::<u8>()

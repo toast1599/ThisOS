@@ -50,24 +50,39 @@ pub(crate) unsafe fn write_mair(value: u64) {
     unsafe { asm!("msr mair_el1, {}", in(reg) value, options(nostack, preserves_flags)) };
 }
 
-/// Sets PSTATE.PAN, and makes every exception taken to EL1 set it too.
+/// Writes `value` to `SCTLR_EL1`, and makes the CPU use it from the next
+/// instruction.
+///
+/// # Safety
+///
+/// `value` must keep the MMU, the caches and the byte order the kernel
+/// runs with, and leave executable everything the kernel executes.
+pub(crate) unsafe fn write_sctlr(value: u64) {
+    // SAFETY: The caller guarantees the kernel runs on as before.
+    unsafe {
+        asm!(
+            "msr sctlr_el1, {}",
+            "isb",
+            in(reg) value,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+/// Sets PSTATE.PAN. Every exception taken to EL1 sets it too while
+/// `SCTLR_EL1.SPAN` is clear, as `paging::SCTLR` has it.
 ///
 /// # Safety
 ///
 /// Nothing at EL1 may be using EL0 pages without clearing PAN itself.
 pub(crate) unsafe fn enable_pan() {
-    // SAFETY: Clearing SCTLR_EL1.SPAN (bit 23) only changes what an
-    // exception does to PSTATE.PAN, and setting PAN only stops EL1 reaching
-    // EL0 pages, which the caller guarantees nothing does.
+    // SAFETY: Setting PAN only stops EL1 reaching EL0 pages, which the
+    // caller guarantees nothing does.
     unsafe {
         asm!(
-            "mrs {tmp}, sctlr_el1",
-            "bic {tmp}, {tmp}, #(1 << 23)",
-            "msr sctlr_el1, {tmp}",
             ".arch_extension pan",
             "msr pan, #1",
             "isb",
-            tmp = out(reg) _,
             options(nostack, preserves_flags),
         );
     }

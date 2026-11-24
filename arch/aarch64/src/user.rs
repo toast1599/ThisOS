@@ -603,6 +603,13 @@ global_asm!(
     "movn x8, #0",
     "b thisos_user_programs + 11 * {slot} + {last_syscall}",
     ".org thisos_user_programs + 12 * {slot}, 0",
+    // MaskInterrupts. With SCTLR_EL1.UMA clear, EL0 writes to DAIF trap.
+    "msr daifset, #2",
+    "mov x0, #0",
+    "mov x8, #{exit}",
+    "svc #0",
+    "udf #0",
+    ".org thisos_user_programs + 13 * {slot}, 0",
     ".popsection",
     exit = const Syscall::Exit.number(),
     write = const Syscall::Write.number(),
@@ -651,7 +658,7 @@ global_asm!(
 );
 
 unsafe extern "C" {
-    static thisos_user_programs: [u8; 12 * SLOT];
+    static thisos_user_programs: [u8; 13 * SLOT];
 }
 
 /// Writes `program` at the start of `frame`, through the physical-memory
@@ -670,6 +677,7 @@ pub fn write_program(phys_offset: u64, frame: &mut Frame, program: UserProgram) 
         UserProgram::Channel => 9,
         UserProgram::Wait => 10,
         UserProgram::LastSyscall => 11,
+        UserProgram::MaskInterrupts => 12,
     };
     let source = (&raw const thisos_user_programs)
         .cast::<u8>()

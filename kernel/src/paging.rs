@@ -42,6 +42,12 @@ pub fn init() {
         space.start,
         space.end
     );
+    #[cfg(target_arch = "aarch64")]
+    log::info!(
+        "SCTLR_EL1: {:#x} from the loader, now {:#x}",
+        thisos_arch_aarch64::loader_sctlr(),
+        thisos_arch_aarch64::sctlr()
+    );
     *PAGE_TABLES.lock() = Some(Kernel { tables });
 }
 
@@ -266,6 +272,18 @@ mod tests {
                 }
             },
             Probe::ReadGuardPage,
+        );
+    }
+
+    // A bit the CPU won't hold reads back different, RES1 bits included,
+    // since SCTLR sets them.
+    #[cfg(target_arch = "aarch64")]
+    #[test_case]
+    fn sctlr_holds_the_kernels_value() {
+        assert_eq!(
+            thisos_arch_aarch64::sctlr(),
+            thisos_arch_aarch64::SCTLR,
+            "SCTLR_EL1"
         );
     }
 

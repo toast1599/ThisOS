@@ -312,6 +312,9 @@ pub enum UserProgram {
     /// the page. Mapped on the last page of user space, that address is
     /// user space's end, where nothing is mapped.
     LastSyscall,
+    /// Masks interrupts, which user code may not do: `cli` on x86_64,
+    /// `msr daifset, #2` on aarch64. Exits with status 0 if that runs.
+    MaskInterrupts,
 }
 
 /// The most frames [`Cpu::backtrace`] reports.

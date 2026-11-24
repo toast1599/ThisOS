@@ -71,7 +71,9 @@ pub use context::Context;
 pub use framebuffer::FramebufferPixels;
 #[cfg(not(test))]
 pub use memory::MemoryMap;
-pub use paging::{KernelPageTables, UserSpace};
+#[cfg(not(test))]
+pub use paging::sctlr;
+pub use paging::{KernelPageTables, SCTLR, UserSpace, loader_sctlr};
 #[cfg(not(test))]
 pub use trap::{TrapFrame, raise_spurious_fiq};
 #[cfg(not(test))]
