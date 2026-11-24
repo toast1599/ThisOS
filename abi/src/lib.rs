@@ -175,15 +175,15 @@ numbered! {
         /// the signals it waits for, and a field the call writes the object's
         /// signals into when it succeeds, for every item. Its value is the
         /// number of items with a wanted signal. A handle may be in more than
-        /// one item. With no items it waits out the time. Fails with
-        /// [`Error::TooLong`], with [`Error::BadAddress`] before it waits for
-        /// items it can't read and write, [`Error::BadHandle`],
-        /// [`Error::WrongType`] for an object that has no signals,
-        /// [`Error::AccessDenied`], with [`Error::BadSignals`] for an item that
-        /// wants no signal, or one its object doesn't have
-        /// ([`Signals::ENDPOINT`], [`Signals::PROCESS`]), [`Error::NoMemory`],
-        /// or with [`Error::TimedOut`] once the time has passed with no wanted
-        /// signal.
+        /// one item. With no items it waits out the time, which can't be for
+        /// good. Fails with [`Error::TooLong`], with [`Error::BadAddress`]
+        /// before it waits for items it can't read and write,
+        /// [`Error::BadHandle`], [`Error::WrongType`] for an object that has
+        /// no signals, [`Error::AccessDenied`], with [`Error::BadSignals`] for
+        /// an item that wants no signal, or one its object doesn't have
+        /// ([`Signals::ENDPOINT`], [`Signals::PROCESS`]), or for no items and
+        /// a timeout of `u64::MAX`, [`Error::NoMemory`], or with
+        /// [`Error::TimedOut`] once the time has passed with no wanted signal.
         Wait = 11,
         /// Makes a process with an empty address space and no thread. Its
         /// value is a handle to it with [`Rights::READ`], [`Rights::WRITE`],
@@ -298,7 +298,7 @@ numbered! {
         /// A wait's time passed with no wanted signal.
         TimedOut = 18,
         /// Wanted signals are none, or have a bit that no signal has, or one
-        /// the object never has.
+        /// the object never has, or a wait for good has no items.
         BadSignals = 19,
         /// The process has started, and the call works only before that.
         Started = 20,

@@ -553,7 +553,7 @@ impl<'a> WaitItem<'a> {
 /// needs [`Rights::READ`]; channel endpoints and processes have signals,
 /// and each item wants at least one, all of them its object's:
 /// [`Signals::ENDPOINT`] or [`Signals::PROCESS`], or the wait fails with
-/// [`Error::BadSignals`].
+/// [`Error::BadSignals`], as it does with no items and no timeout.
 pub fn wait(items: &mut [WaitItem<'_>], timeout: Option<Duration>) -> Result<usize, Error> {
     if items.len() > MAX_WAIT_ITEMS {
         return Err(Error::TooLong);

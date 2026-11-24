@@ -246,6 +246,18 @@ fn waits_ask_for_signals_their_objects_have() {
     ] {
         assert_eq!(process.wait(wanted, now), Err(Error::BadSignals), "{what}");
     }
+    // Nothing could end it, so it fails at once rather than block for good.
+    assert_eq!(
+        thisos_rt::wait(&mut [], None),
+        Err(Error::BadSignals),
+        "no items, for good"
+    );
+    let ten_ms = Some(core::time::Duration::from_millis(10));
+    assert_eq!(
+        thisos_rt::wait(&mut [], ten_ms),
+        Err(Error::TimedOut),
+        "no items for 10 ms"
+    );
 }
 
 fn short_receives_give_the_message_size() {

@@ -681,6 +681,10 @@ fn sizes<T>(message: &Message<T>) -> u64 {
 /// nanoseconds, as the wait syscall does.
 fn wait(items: u64, count_arg: u64, timeout: u64) -> Result<u64, Error> {
     let count = count(count_arg, MAX_WAIT_ITEMS)?;
+    // Nothing could end it, and no syscall ends another process.
+    if count == 0 && timeout == u64::MAX {
+        return Err(Error::BadSignals);
+    }
     let mut raw = [0; WAIT_ITEM_SIZE * MAX_WAIT_ITEMS];
     let raw = &mut raw[..WAIT_ITEM_SIZE * count];
     // Written back unchanged, so that items the call can't write its result
