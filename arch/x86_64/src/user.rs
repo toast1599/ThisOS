@@ -600,6 +600,53 @@ global_asm!(
     "syscall",
     "ud2",
     ".org thisos_user_programs + 13 * {slot}, 0xcc",
+    // ThreadRegisters. RBX holds the argument and R12 the spin's start;
+    // EDI is set to each check's number before it's tested, as in Handles.
+    "mov rbx, rdi",
+    "mov edi, 1",
+    "mov eax, ds",
+    "mov ecx, es",
+    "or eax, ecx",
+    "mov ecx, fs",
+    "or eax, ecx",
+    "mov ecx, gs",
+    "or eax, ecx",
+    "jnz 2f",
+    "mov ds, ebx",
+    "mov es, ebx",
+    "mov fs, ebx",
+    "mov gs, ebx",
+    "rdtsc",
+    "shl rdx, 32",
+    "or rax, rdx",
+    "mov r12, rax",
+    "3:",
+    "pause",
+    "rdtsc",
+    "shl rdx, 32",
+    "or rax, rdx",
+    "sub rax, r12",
+    "cmp rax, {cycles}",
+    "jb 3b",
+    "mov edi, 2",
+    "mov eax, ds",
+    "cmp rax, rbx",
+    "jne 2f",
+    "mov eax, es",
+    "cmp rax, rbx",
+    "jne 2f",
+    "mov eax, fs",
+    "cmp rax, rbx",
+    "jne 2f",
+    "mov eax, gs",
+    "cmp rax, rbx",
+    "jne 2f",
+    "xor edi, edi",
+    "2:",
+    "mov eax, {exit}",
+    "syscall",
+    "ud2",
+    ".org thisos_user_programs + 14 * {slot}, 0xcc",
     ".popsection",
     exit = const Syscall::Exit.number(),
     user_flags = const USER_FLAGS.bits(),
@@ -654,7 +701,7 @@ const USER_FLAGS: RFlags = RFlags::DIRECTION_FLAG
     .union(RFlags::NESTED_TASK);
 
 unsafe extern "C" {
-    static thisos_user_programs: [u8; 13 * SLOT];
+    static thisos_user_programs: [u8; 14 * SLOT];
 }
 
 /// Writes `program` at the start of `frame`, through the physical-memory
@@ -674,6 +721,7 @@ pub fn write_program(phys_offset: VirtAddr, frame: &mut Frame, program: UserProg
         UserProgram::Wait => 10,
         UserProgram::LastSyscall => 11,
         UserProgram::MaskInterrupts => 12,
+        UserProgram::ThreadRegisters => 13,
     };
     let source = (&raw const thisos_user_programs)
         .cast::<u8>()

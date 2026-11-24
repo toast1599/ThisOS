@@ -25,8 +25,10 @@ pub struct Context {
 // thisos_switch takes the stack pointer to resume in rdi, and returns the
 // one it left in rax, in the thread it resumes. It leaves rsi and rdx
 // alone, so the thread that resumes finds in them what the one that left
-// put there: its stack. A new thread's stack holds a Start, so the switch
-// pops entry into r12 and zero into rbp, the end of the frame-pointer
+// put there: its stack. DS, ES, FS and GS go with the thread, since ring 3
+// can load them and would otherwise read what another process left there.
+// A new thread's stack holds a Start, so the switch loads null into the
+// four, pops entry into r12 and zero into rbp, the end of the frame-pointer
 // chain, and returns into thisos_thread_start, which calls start with the
 // stack 16-aligned.
 global_asm!(
@@ -40,8 +42,24 @@ global_asm!(
     "push r13",
     "push r14",
     "push r15",
+    "mov ecx, ds",
+    "push rcx",
+    "mov ecx, es",
+    "push rcx",
+    "mov ecx, fs",
+    "push rcx",
+    "mov ecx, gs",
+    "push rcx",
     "mov rax, rsp",
     "mov rsp, rdi",
+    "pop rcx",
+    "mov gs, ecx",
+    "pop rcx",
+    "mov fs, ecx",
+    "pop rcx",
+    "mov es, ecx",
+    "pop rcx",
+    "mov ds, ecx",
     "pop r15",
     "pop r14",
     "pop r13",
@@ -69,6 +87,10 @@ unsafe extern "C" {
 /// and two words that make the stack 16-aligned at `call start`.
 #[repr(C)]
 struct Start {
+    gs: u64,
+    fs: u64,
+    es: u64,
+    ds: u64,
     r15: u64,
     r14: u64,
     r13: u64,
@@ -92,6 +114,10 @@ pub fn new(stack: Stack, entry: fn(Context) -> !) -> Context {
         .as_mut_ptr::<Start>()
         .wrapping_sub(1);
     let start = Start {
+        gs: 0,
+        fs: 0,
+        es: 0,
+        ds: 0,
         r15: 0,
         r14: 0,
         r13: 0,
@@ -133,11 +159,14 @@ pub fn switch(to: Context) -> Context {
     // SAFETY: to came from new or from a switch, which consumed it, so
     // to.rsp points at a Start or at the registers a switch pushed, on a
     // stack nothing has run on since, and this is the only resumption.
-    // thisos_switch pushes the callee-saved registers on this thread's
-    // stack, and returns here only when a later switch resumes it, with
-    // those registers and rsp as they were; the C ABI clobbers cover the
-    // rest. Interrupts are off, so no handler runs on either stack between
-    // the two halves of the switch.
+    // thisos_switch pushes the callee-saved registers and the four data
+    // segment registers on this thread's stack, and returns here only when
+    // a later switch resumes it, with those registers and rsp as they were;
+    // the C ABI clobbers cover the rest, rcx among them. A selector it loads
+    // is null or one this thread's ring 3 code loaded, which the kernel can
+    // load too, and 64-bit mode uses none of their bases for the kernel's
+    // own accesses. Interrupts are off, so no handler runs on either stack
+    // between the two halves of the switch.
     unsafe {
         asm!(
             "call thisos_switch",

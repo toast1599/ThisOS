@@ -1305,6 +1305,18 @@ mod tests {
         );
     }
 
+    // The second run would start with the value the first left, were they
+    // not kept per thread. 0x1b is x86_64's user data selector, the one
+    // value ring 3 can load that survives an interrupt: returning to ring 3
+    // through iretq zeroes a null selector whatever its RPL.
+    #[test_case]
+    fn thread_registers_stay_with_their_thread() {
+        for run_number in 1..=2 {
+            let (end, _) = run(UserProgram::ThreadRegisters, |_, _| 0x1b);
+            assert_eq!(end, End::Exited(0), "run {run_number}");
+        }
+    }
+
     // On x86_64 the exception arrives on the stack every user thread's
     // debug exceptions share. ICEBP raises it as a trap, after the
     // instruction, so the CPU reports the byte after it. aarch64's is a

@@ -316,6 +316,14 @@ pub enum UserProgram {
     /// Masks interrupts, which user code may not do: `cli` on x86_64,
     /// `msr daifset, #2` on aarch64. Exits with status 0 if that runs.
     MaskInterrupts,
+    /// Checks that the registers user code can write for its thread hold
+    /// 0 (1), loads its argument into them, spins as `Spin` does, through
+    /// many switches, then checks they still hold it (2). They are DS, ES,
+    /// FS and GS on x86_64, where the argument has to be a selector ring 3
+    /// can load that an interrupt's iretq keeps, the user data selector;
+    /// and `TPIDR_EL0` on aarch64. It exits with status 0, or with the number
+    /// of the first check that failed.
+    ThreadRegisters,
 }
 
 /// The most frames [`Cpu::backtrace`] reports.

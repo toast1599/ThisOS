@@ -614,6 +614,31 @@ global_asm!(
     "svc #0",
     "udf #0",
     ".org thisos_user_programs + 13 * {slot}, 0",
+    // ThreadRegisters. x19 holds the argument.
+    "mov x19, x0",
+    "mov x20, #1",
+    "mrs x9, tpidr_el0",
+    "cbnz x9, 2f",
+    "msr tpidr_el0, x19",
+    "mov x11, #{ticks}",
+    "mrs x9, cntvct_el0",
+    "3:",
+    "yield",
+    "mrs x10, cntvct_el0",
+    "sub x10, x10, x9",
+    "cmp x10, x11",
+    "b.lo 3b",
+    "mov x20, #2",
+    "mrs x9, tpidr_el0",
+    "cmp x9, x19",
+    "b.ne 2f",
+    "mov x20, #0",
+    "2:",
+    "mov x0, x20",
+    "mov x8, #{exit}",
+    "svc #0",
+    "udf #0",
+    ".org thisos_user_programs + 14 * {slot}, 0",
     ".popsection",
     exit = const Syscall::Exit.number(),
     write = const Syscall::Write.number(),
@@ -662,7 +687,7 @@ global_asm!(
 );
 
 unsafe extern "C" {
-    static thisos_user_programs: [u8; 13 * SLOT];
+    static thisos_user_programs: [u8; 14 * SLOT];
 }
 
 /// Writes `program` at the start of `frame`, through the physical-memory
@@ -682,6 +707,7 @@ pub fn write_program(phys_offset: u64, frame: &mut Frame, program: UserProgram) 
         UserProgram::Wait => 10,
         UserProgram::LastSyscall => 11,
         UserProgram::MaskInterrupts => 12,
+        UserProgram::ThreadRegisters => 13,
     };
     let source = (&raw const thisos_user_programs)
         .cast::<u8>()
