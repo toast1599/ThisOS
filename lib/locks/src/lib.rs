@@ -12,14 +12,24 @@
 //! [`switch_held`], and an interrupt handler's locks go on the interrupted
 //! thread's list and come off before it returns.
 //!
+//! Locks change the list with interrupts on, since masking them for each
+//! change cost about 55 cycles a lock under KVM, more than the lock itself.
+//! A push grows the length
+//! before it writes the entry, and a removal clears the entry before it
+//! shrinks the length, so an interrupt that comes between finds an empty
+//! entry at worst, and its handler's own pushes and removals, which balance
+//! before it returns, leave the list as they found it. That holds only
+//! while a thread can't move to another CPU partway through a change:
+//! between reading the CPU's index and writing its list.
+//!
 //! Spinning for a lock longer than a second panics in every build, naming
 //! the lock, the spinning CPU and thread, and the holder. A spin past 10 ms
 //! calls the hook set with [`on_long_spin`] once, so the kernel can show
 //! the wait before the panic.
 //!
 //! The [`Platform`] gives the CPU's index, a counter and its rate, and a
-//! way to keep interrupts off while a list changes. The `host` feature
-//! adds one for host tests.
+//! way to keep interrupts off while the scheduler swaps lists. The `host`
+//! feature adds one for host tests.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -34,7 +44,7 @@ use core::fmt;
 use core::hint::spin_loop;
 use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering, compiler_fence};
 
 /// The most CPUs the lists cover.
 pub const MAX_CPUS: usize = 64;
@@ -158,7 +168,7 @@ const NOBODY: usize = usize::MAX;
 const NO_THREAD: u64 = u64::MAX;
 
 /// One CPU's state. Only that CPU changes its list and the rank it spins
-/// for, with interrupts off; any CPU reads them.
+/// for, in the order the module's docs give; any CPU reads them.
 struct PerCpu {
     held: [AtomicU16; MAX_HELD],
     len: AtomicUsize,
@@ -210,8 +220,10 @@ impl PerCpu {
             "taking {rank} with {MAX_HELD} locks held already: {}",
             self.snapshot()
         );
-        self.held[len].store(rank.number, Ordering::Relaxed);
         self.len.store(len + 1, Ordering::Relaxed);
+        // Orders the stores against an interrupt on this CPU.
+        compiler_fence(Ordering::SeqCst);
+        self.held[len].store(rank.number, Ordering::Relaxed);
     }
 
     /// Takes `rank`'s last entry off the list, keeping the order of the
@@ -232,6 +244,7 @@ impl PerCpu {
             self.held[i].store(next, Ordering::Relaxed);
         }
         self.held[len - 1].store(NONE, Ordering::Relaxed);
+        compiler_fence(Ordering::SeqCst);
         self.len.store(len - 1, Ordering::Relaxed);
     }
 
@@ -380,7 +393,7 @@ impl<T, P: Platform> Lock<T, P> {
     /// and after spinning for a second.
     pub fn lock(&self) -> Guard<'_, T, P> {
         if cfg!(debug_assertions) {
-            P::masked(|| self.check_order(&CPUS[P::cpu()]));
+            self.check_order(&CPUS[P::cpu()]);
         }
         let guard = match self.mutex.try_lock() {
             Some(guard) => guard,
@@ -423,11 +436,8 @@ impl<T, P: Platform> Lock<T, P> {
     }
 
     fn listed<'a>(&'a self, guard: spin::MutexGuard<'a, T>) -> Guard<'a, T, P> {
-        let cpu = P::masked(|| {
-            let cpu = P::cpu();
-            CPUS[cpu].push(self.rank);
-            cpu
-        });
+        let cpu = P::cpu();
+        CPUS[cpu].push(self.rank);
         self.holder_thread
             .store(CPUS[cpu].thread.load(Ordering::Relaxed), Ordering::Relaxed);
         self.holder_cpu.store(cpu, Ordering::Relaxed);
@@ -441,11 +451,9 @@ impl<T, P: Platform> Lock<T, P> {
     // The CPU is read afresh each time, since a tick can move the spinning
     // thread, whose spin goes with it.
     fn spin(&self) -> spin::MutexGuard<'_, T> {
-        P::masked(|| {
-            CPUS[P::cpu()]
-                .spinning
-                .store(self.rank.number, Ordering::Relaxed);
-        });
+        CPUS[P::cpu()]
+            .spinning
+            .store(self.rank.number, Ordering::Relaxed);
         let started = P::counter();
         let hz = P::counter_hz().filter(|&hz| hz != 0);
         let mut told = false;
@@ -454,9 +462,7 @@ impl<T, P: Platform> Lock<T, P> {
             if !self.mutex.is_locked()
                 && let Some(guard) = self.mutex.try_lock()
             {
-                P::masked(|| {
-                    CPUS[P::cpu()].spinning.store(NONE, Ordering::Relaxed);
-                });
+                CPUS[P::cpu()].spinning.store(NONE, Ordering::Relaxed);
                 return guard;
             }
             let Some(hz) = hz else {
@@ -548,7 +554,7 @@ impl<T, P: Platform> Drop for Guard<'_, T, P> {
     fn drop(&mut self) {
         if self.listed {
             self.lock.holder_cpu.store(NOBODY, Ordering::Relaxed);
-            P::masked(|| CPUS[P::cpu()].remove(self.lock.rank));
+            CPUS[P::cpu()].remove(self.lock.rank);
         }
     }
 }
