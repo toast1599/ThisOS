@@ -70,9 +70,10 @@ const LINE: usize = 512;
 /// that an interrupt handler can log.
 static RING: Mutex<Ring<RING_SIZE>> = Mutex::new(Ring::new());
 
-/// The ids of the threads whose user writes wait for room in the ring.
-/// Taken with interrupts on, and never by an interrupt handler.
-static WAITERS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+/// The threads whose user writes wait for room in the ring, by id, each
+/// with the room its write needs. Taken with interrupts on, and never by an
+/// interrupt handler.
+static WAITERS: Mutex<Vec<(u64, usize)>> = Mutex::new(Vec::new());
 
 /// Whether the drainer runs, so that records go into the ring.
 static DRAINING: AtomicBool = AtomicBool::new(false);
@@ -150,23 +151,24 @@ fn drain() {
         // A piece at a time with interrupts off, which bounds how long
         // they stay off, and leaves the sinks free for a panic on another
         // thread between pieces.
-        let drew = Arch::without_interrupts(|| {
-            let (dropped, piece) = {
+        let (drew, room) = Arch::without_interrupts(|| {
+            let (dropped, piece, room) = {
                 let mut ring = RING.lock();
-                (ring.take_dropped(), ring.pop())
+                let dropped = ring.take_dropped();
+                let piece = ring.pop();
+                (dropped, piece, ring.room())
             };
             let mut sinks = LOGGER.sinks.lock();
             write_dropped(&mut sinks, dropped);
             if let Some(piece) = &piece {
                 write_piece(&mut sinks, piece);
             }
-            piece.is_some()
+            (piece.is_some(), room)
         });
         // Also before a park, since the ring may have had room made
         // without a piece drawn: a panic's flush, or a test emptying it.
-        for id in WAITERS.lock().drain(..) {
-            thread::unpark(id);
-        }
+        // Then the ring is empty, which every waiting write fits.
+        wake_fitting(room);
         if !drew {
             thread::park();
         }
@@ -207,14 +209,27 @@ pub fn write_user<D: fmt::Display>(lines: impl Iterator<Item = D> + Clone) -> Re
         {
             let mut waiters = WAITERS.lock();
             waiters.try_reserve(1).map_err(|_| Error::NoMemory)?;
-            waiters.push(id);
+            waiters.push((id, size));
         }
         // The drainer may have made room before the id went on the list.
         if Arch::without_interrupts(|| RING.lock().room()) < size {
             thread::park();
         }
-        WAITERS.lock().retain(|&waiter| waiter != id);
+        WAITERS.lock().retain(|&(waiter, _)| waiter != id);
     }
+}
+
+/// Unparks the threads in [`WAITERS`] whose write fits in `room` bytes of
+/// the ring, and takes them off it. Several may fit only one at a time;
+/// the others find too little room, and wait again.
+fn wake_fitting(room: usize) {
+    WAITERS.lock().retain(|&(id, size)| {
+        let fits = size <= room;
+        if fits {
+            thread::unpark(id);
+        }
+        !fits
+    });
 }
 
 /// Writes a panic report: `head` as an Error record, then `body` as it is,
@@ -425,7 +440,7 @@ pub(crate) mod tests {
     use thisos_hal::Cpu;
     use thisos_logring::HEADER;
 
-    use super::{DRAINER, LINE, RING, WAITERS, tag, with_sinks};
+    use super::{DRAINER, LINE, RING, USER, WAITERS, tag, wake_fitting, with_sinks};
     use crate::testing::{ExpectPanic, spin_until};
     use crate::{Arch, thread};
 
@@ -485,6 +500,51 @@ pub(crate) mod tests {
     /// How many threads wait for room in the ring.
     pub fn waiting() -> usize {
         WAITERS.lock().len()
+    }
+
+    // The drainer runs the same check after every piece it draws; here the
+    // test runs it, with the drainer paused, so that the room is exact.
+    #[test_case]
+    fn a_waiting_write_wakes_only_once_it_fits() {
+        static ID: AtomicU64 = AtomicU64::new(u64::MAX);
+        static DONE: AtomicBool = AtomicBool::new(false);
+        const TEXT: &str = "a user write that waits for its room in the ring";
+        DONE.store(false, Ordering::Relaxed);
+        let needed = HEADER + thisos_logring::size(&format_args!("{USER}{TEXT}"));
+        pause();
+        Arch::without_interrupts(|| {
+            let mut ring = RING.lock();
+            // Leaves one byte less than the write needs, in records of at
+            // most a format width's 65535, none left shorter than a header.
+            let mut fill = ring.room() - (needed - 1);
+            while fill > 0 {
+                let len = if fill > 60_000 + 2 * HEADER {
+                    60_000
+                } else {
+                    fill - HEADER
+                };
+                assert!(ring.push(tag(Level::Info), &format_args!("{:len$}", "")));
+                fill -= HEADER + len;
+            }
+        });
+        thread::spawn(|| {
+            ID.store(thread::id(), Ordering::Relaxed);
+            assert!(super::write_user(core::iter::once(TEXT)).is_ok());
+            DONE.store(true, Ordering::Release);
+        });
+        spin_until("the write to wait", || {
+            waiting() == 1 && thread::is_blocked(ID.load(Ordering::Relaxed))
+        });
+        wake_fitting(Arch::without_interrupts(|| RING.lock().room()));
+        assert_eq!(waiting(), 1, "woken with a byte too little");
+        assert!(thread::is_blocked(ID.load(Ordering::Relaxed)));
+        discard();
+        wake_fitting(Arch::without_interrupts(|| RING.lock().room()));
+        spin_until("the write to land", || DONE.load(Ordering::Acquire));
+        assert_eq!(waiting(), 0);
+        thread::wait_for_exits();
+        discard();
+        resume();
     }
 
     #[test_case]
