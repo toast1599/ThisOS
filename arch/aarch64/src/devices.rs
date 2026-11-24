@@ -8,8 +8,8 @@ use thisos_fdt::{Fdt, Node, Region};
 use crate::once::Once;
 
 /// The size of the boot CPU's redistributor, its two 64 KiB frames: the
-/// only part of the redistributor region the kernel maps, since SMP is a
-/// non-goal.
+/// only part of the redistributor region the kernel maps, since aarch64
+/// runs on one CPU (ADR 0006).
 pub const REDISTRIBUTOR_SIZE: u64 = 0x2_0000;
 
 /// The distributor's size.

@@ -97,17 +97,17 @@ global_asm!(
     entry = sym trap_entry,
 );
 
-// SYSCALL leaves RSP as user code had it, and SMP is a non-goal, so the
-// stub parks it in a static and loads the stack top the switch keeps in
-// TSS.RSP0, with no SWAPGS. Then it pushes what an IDT stub's frame holds,
-// with RCX as RIP, R11 as RFLAGS and the syscall's own vector, and calls
-// trap_entry as the IDT stubs do. SFMASK clears IF, DF and AC, so nothing
-// interrupts it before the stack is the kernel's, and it needs no cld or
-// clac. The handler may turn interrupts on, so the stub turns them off
-// before the pops: from pop rsp to sysretq the stack is the user's, and an
-// interrupt there would push its frame onto it in ring 0. trap_entry checks
-// that RIP is no higher than user space's end, since SYSRET needs it
-// canonical.
+// SYSCALL leaves RSP as user code had it, and the kernel runs on one CPU
+// until it has per-CPU state, so the stub parks it in a static and loads
+// the stack top the switch keeps in TSS.RSP0, with no SWAPGS. Then it
+// pushes what an IDT stub's frame holds, with RCX as RIP, R11 as RFLAGS
+// and the syscall's own vector, and calls trap_entry as the IDT stubs do.
+// SFMASK clears IF, DF and AC, so nothing interrupts it before the stack
+// is the kernel's, and it needs no cld or clac. The handler may turn
+// interrupts on, so the stub turns them off before the pops: from pop rsp
+// to sysretq the stack is the user's, and an interrupt there would push
+// its frame onto it in ring 0. trap_entry checks that RIP is no higher
+// than user space's end, since SYSRET needs it canonical.
 global_asm!(
     ".pushsection .text.thisos_syscall, \"ax\", @progbits",
     ".globl thisos_syscall",
@@ -430,7 +430,8 @@ struct Stack(UnsafeCell<[u8; IST_STACK_SIZE]>);
 
 // SAFETY: Rust code only takes the stack's address, which is the same on
 // every thread. The CPU uses the bytes for the one vector whose IST slot
-// holds them, and SMP is a non-goal, so two traps never share one.
+// holds them, and the kernel runs on one CPU until it has per-CPU state,
+// so two traps never share one.
 unsafe impl Sync for Stack {}
 
 impl Stack {

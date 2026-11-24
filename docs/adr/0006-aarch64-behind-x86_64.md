@@ -1,7 +1,7 @@
 # 0006. aarch64 under QEMU, behind x86_64
 
 - **Status:** Accepted
-- **Date:** 2026-11-11, updated 2026-11-21
+- **Date:** 2026-11-11, updated 2026-11-21 and 2026-11-24
 
 ## Context
 
@@ -19,6 +19,7 @@ aarch64 runs behind x86_64, with no deadline to catch up:
 - Every work item keeps aarch64 building and lint-clean, since `cargo xtask ci` builds and lints it.
 - aarch64 gains a feature when a decision round schedules the port.
 - A milestone's closing notes list what aarch64 still lacks.
+- aarch64 runs on one CPU until there is aarch64 hardware to test SMP on (added 2026-11-24, when SMP was scheduled for x86_64). Under TCG on an x86_64 host, aarch64's weaker memory ordering runs on a stronger host, so a missing barrier can't fail any test QEMU can run.
 
 ## Consequences
 

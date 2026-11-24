@@ -4,7 +4,7 @@ ThisOS is a general-purpose operating system written in Rust, built on a microke
 
 ## Status
 
-The design for the first milestones is settled. Milestones 1 to 4 are done on x86_64, in QEMU and on the test laptop: the kernel boots, runs user programs in address spaces of their own, and gives them handles, channels and shared memory. Next is milestone 5 (user-space drivers). aarch64 runs in QEMU only, behind x86_64 ([ADR 0006](docs/adr/0006-aarch64-behind-x86_64.md)), with milestone 4's parity except that it has no serial port.
+The design for the first milestones is settled. Milestones 1 to 4 are done on x86_64, in QEMU and on the test laptop: the kernel boots, runs user programs in address spaces of their own, and gives them handles, channels and shared memory. Next is SMP on x86_64, a milestone of its own before milestone 5 (user-space drivers). aarch64 runs in QEMU only, behind x86_64 ([ADR 0006](docs/adr/0006-aarch64-behind-x86_64.md)), with milestone 4's parity except that it has no serial port, and stays on one CPU until there is aarch64 hardware to test SMP on.
 
 - [docs/design.md](docs/design.md) describes the system and its milestones.
 - [docs/adr/](docs/adr/) holds the decisions that are hard to reverse.
@@ -19,7 +19,8 @@ flowchart TD
     M1["M1: Boot<br/>done"] --> M2["M2: Kernel core<br/>done"]
     M2 --> M3["M3: User mode<br/>done"]
     M3 --> M4["M4: Handles and IPC<br/>done"]
-    M4 --> M5["M5: User-space drivers<br/>next"]
+    M4 --> S["SMP on x86_64<br/>next"]
+    S --> M5["M5: User-space drivers<br/>planned"]
     M5 --> M6["M6: Storage<br/>planned"]
     M6 --> M7["M7: std<br/>planned"]
 
@@ -32,8 +33,8 @@ flowchart TD
     classDef next fill:#fdeca0,stroke:#9a6700,color:#3d2a00
     classDef planned fill:#dde3e9,stroke:#6e7781,color:#1f2328
     class M1,M2,M3,M4,A done
-    class M5 next
-    class M6,M7 planned
+    class S next
+    class M5,M6,M7 planned
 ```
 
 <details>
@@ -79,7 +80,13 @@ Decisions: [ADR 0006](docs/adr/0006-aarch64-behind-x86_64.md), [ADR 0010](docs/a
 </details>
 
 <details>
-<summary>M5: User-space drivers (next)</summary>
+<summary>SMP on x86_64 (next)</summary>
+
+The kernel runs on every core: application processors started from the ACPI MADT, trap state, a run queue and a timer per CPU, one big kernel lock over what the existing object locks don't cover, and TLB shootdown across CPUs. It ends with `init`'s programs spread over every CPU and IPC round trips measured on one CPU and across two. aarch64 stays on one CPU. See [design.md, Milestones](docs/design.md#milestones).
+</details>
+
+<details>
+<summary>M5: User-space drivers (planned)</summary>
 
 Interrupts delivered to user space; handles for MMIO and I/O port ranges; serial and i8042 keyboard drivers in user space; a shell that runs programs from the ramdisk. The name and API of the audited driver crate are still open. See [design.md, User-space drivers](docs/design.md#user-space-drivers).
 </details>

@@ -530,7 +530,8 @@ struct Stack(UnsafeCell<[u8; STACK_SIZE]>);
 const _: () = assert!(align_of::<Stack>() == 2 * STACK_SIZE);
 
 // SAFETY: Rust code only takes the stack's address. The stubs use the
-// bytes, and SMP is a non-goal, so one CPU runs on them at a time.
+// bytes, and aarch64 runs on one CPU (ADR 0006), so no two CPUs run on
+// them at once.
 unsafe impl Sync for Stack {}
 
 static BOOT_OVERFLOW_STACK: Stack = Stack(UnsafeCell::new([0; STACK_SIZE]));
