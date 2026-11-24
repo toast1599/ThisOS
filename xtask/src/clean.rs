@@ -1,6 +1,6 @@
 //! Emptying cargo's target directories.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::os::unix::fs::MetadataExt;
@@ -85,10 +85,14 @@ fn empty(dir: &Path, all: bool) -> Result<u64> {
         }
     }
 
-    let mut seen = HashSet::new();
+    let mut linked = HashMap::new();
     let mut sizes = Vec::new();
-    for path in &doomed {
-        sizes.push(size(path, &mut seen)?);
+    for (i, path) in doomed.iter().enumerate() {
+        sizes.push(size(path, i, &mut linked)?);
+    }
+    // A file with a link outside them stays, and frees nothing.
+    for file in linked.values().filter(|file| file.found == file.links) {
+        sizes[file.last] += file.bytes;
     }
     let total = sizes.iter().sum();
     let mut freed = 0;
@@ -105,20 +109,42 @@ fn empty(dir: &Path, all: bool) -> Result<u64> {
     Ok(freed)
 }
 
-/// The disk space under `path`, counting a file with several links once:
-/// cargo hard-links each binary it builds into the profile's directory.
-fn size(path: &Path, seen: &mut HashSet<(u64, u64)>) -> Result<u64> {
+/// A file with several links, as [`size`] finds them under the paths
+/// `empty` removes: cargo hard-links each binary it builds into the
+/// profile's directory.
+struct Linked {
+    /// The links found so far.
+    found: u64,
+    /// All of its links.
+    links: u64,
+    bytes: u64,
+    /// The index of the path that holds the last link found, which frees
+    /// the file when it goes.
+    last: usize,
+}
+
+/// The disk space under `path`, the `index`th of the paths `empty` removes,
+/// but for files with several links, which it notes in `linked`, by device
+/// and inode, instead.
+fn size(path: &Path, index: usize, linked: &mut HashMap<(u64, u64), Linked>) -> Result<u64> {
     let meta = fs::symlink_metadata(path).with_context(|| format!("reading {}", path.display()))?;
-    let mut bytes = if meta.nlink() > 1 && !meta.is_dir() && !seen.insert((meta.dev(), meta.ino()))
-    {
-        0
-    } else {
-        meta.blocks() * 512
-    };
+    let own = meta.blocks() * 512;
+    if meta.nlink() > 1 && !meta.is_dir() {
+        let file = linked.entry((meta.dev(), meta.ino())).or_insert(Linked {
+            found: 0,
+            links: meta.nlink(),
+            bytes: own,
+            last: index,
+        });
+        file.found += 1;
+        file.last = index;
+        return Ok(0);
+    }
+    let mut bytes = own;
     if meta.is_dir() {
         for entry in fs::read_dir(path).with_context(|| format!("reading {}", path.display()))? {
             let entry = entry.with_context(|| format!("reading {}", path.display()))?;
-            bytes += size(&entry.path(), seen)?;
+            bytes += size(&entry.path(), index, linked)?;
         }
     }
     Ok(bytes)
@@ -154,10 +180,13 @@ mod tests {
         fs::write(dir.join("debug/deps/bin"), vec![1; 1 << 20]).unwrap();
         // A hard link, as cargo makes for each binary, frees nothing more.
         fs::hard_link(dir.join("debug/deps/bin"), dir.join("debug/bin")).unwrap();
+        // One with a link in a kept directory frees nothing at all.
+        fs::write(dir.join("debug/deps/kept"), vec![2; 1 << 20]).unwrap();
+        fs::hard_link(dir.join("debug/deps/kept"), dir.join("limine/kept")).unwrap();
         fs::write(dir.join("thisos.img"), [0; 4096]).unwrap();
 
         let freed = empty(&dir, false).unwrap();
-        // Counting the link twice would free over 2 MiB.
+        // Counting bin twice, or kept at all, would free over 2 MiB.
         assert!((1 << 20..3 << 19).contains(&freed), "freed {freed}");
         let mut left: Vec<_> = fs::read_dir(&dir)
             .unwrap()
