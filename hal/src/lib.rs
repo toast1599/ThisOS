@@ -281,7 +281,8 @@ pub enum UserProgram {
     /// and the process handle on the first succeeds; (4) closing the
     /// process handle then fails with `BadHandle`, since it moved; (5)
     /// sending the second endpoint on the first fails with `Cycle`; (6)
-    /// receiving into a 2-byte buffer fails with `BufferTooSmall`; (7)
+    /// receiving into a 2-byte buffer fails with `BufferTooSmall`, with 3
+    /// bytes and one handle as its value; (7)
     /// receiving then gets 3 bytes, `abc`, and one handle; (8) closing
     /// that handle succeeds; (9) closing the first endpoint succeeds; (10)
     /// sending on the second fails with `PeerClosed`; (11) so does

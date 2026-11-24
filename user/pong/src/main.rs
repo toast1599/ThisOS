@@ -9,7 +9,7 @@ extern crate alloc;
 
 use alloc::vec;
 
-use thisos_rt::{Channel, Error, Handle, MAX_MESSAGE_BYTES, Signals};
+use thisos_rt::{Channel, Error, Handle, MAX_MESSAGE_BYTES, ReceiveError, Signals};
 
 thisos_rt::entry!(main);
 
@@ -23,7 +23,7 @@ fn main(ping: Handle<Channel>) -> u64 {
         // A closed peer's queued messages come first, so none is lost.
         let (len, handles) = match ping.receive_into(&mut bytes) {
             Ok(message) => message,
-            Err(Error::PeerClosed) => return 0,
+            Err(ReceiveError::Other(Error::PeerClosed)) => return 0,
             Err(e) => panic!("receiving a message failed: {e:?}"),
         };
         if let Err((e, _)) = ping.send(&bytes[..len], handles) {

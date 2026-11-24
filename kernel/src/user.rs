@@ -292,13 +292,26 @@ pub fn trap(trap: Trap, frame: &mut <Arch as Platform>::TrapFrame) {
     let (number, args) = frame.syscall();
     match syscall(number, args) {
         Ok(value) => frame.set_syscall_result(0, value),
-        Err(e) => frame.set_syscall_result(e.code(), 0),
+        Err(Failure { error, value }) => frame.set_syscall_result(error.code(), value),
+    }
+}
+
+/// Why a syscall failed, and the value it returns with the error: 0, but
+/// for receive's [`Error::BufferTooSmall`], which gives the sizes it needed.
+struct Failure {
+    error: Error,
+    value: u64,
+}
+
+impl From<Error> for Failure {
+    fn from(error: Error) -> Self {
+        Self { error, value: 0 }
     }
 }
 
 /// Runs the syscall `number` with `args`, and returns its value.
-fn syscall(number: u64, args: [u64; 6]) -> Result<u64, Error> {
-    match Syscall::try_from(number)? {
+fn syscall(number: u64, args: [u64; 6]) -> Result<u64, Failure> {
+    let result = match Syscall::try_from(number)? {
         Syscall::Exit => {
             end(End::Exited(args[0]));
             thread::exit()
@@ -316,7 +329,7 @@ fn syscall(number: u64, args: [u64; 6]) -> Result<u64, Error> {
         Syscall::Unmap => space().unmap(args[0]).map(|_| 0).ok_or(Error::BadAddress),
         Syscall::ChannelCreate => channel_create(),
         Syscall::Send => send(args[0], args[1], args[2], args[3], args[4]),
-        Syscall::Receive => receive(args[0], args[1], args[2], args[3], args[4]),
+        Syscall::Receive => return receive(args[0], args[1], args[2], args[3], args[4]),
         Syscall::Wait => wait(args[0], args[1], args[2]),
         Syscall::ProcessCreate => process_create(),
         Syscall::MapInto => target(args[0], Rights::WRITE)?
@@ -325,7 +338,8 @@ fn syscall(number: u64, args: [u64; 6]) -> Result<u64, Error> {
         Syscall::ProcessEnd => target(args[0], Rights::READ)?.exit_status(),
         Syscall::MemoryRead => memory_read(args[0], args[1], args[2], args[3]),
         Syscall::MemoryWrite => memory_write(args[0], args[1], args[2], args[3]),
-    }
+    };
+    result.map_err(Failure::from)
 }
 
 /// Logs how the running thread's process ended, and records it there.
@@ -613,24 +627,24 @@ fn send(handle_arg: u64, buf: u64, len: u64, handles: u64, count_arg: u64) -> Re
 
 /// Receives the oldest message at the endpoint `handle_arg` names into the
 /// `len` bytes at `buf` and the `count` handles at `handles`, as the
-/// receive syscall does, and returns the byte count in the low 32 bits and
-/// the handle count in the high 32.
-fn receive(handle_arg: u64, buf: u64, len: u64, handles: u64, count: u64) -> Result<u64, Error> {
+/// receive syscall does, and returns the message's sizes; see [`sizes`].
+/// Fails with those sizes as its value if the buffers are too small.
+fn receive(handle_arg: u64, buf: u64, len: u64, handles: u64, count: u64) -> Result<u64, Failure> {
     let endpoint = endpoint(handle_arg, Rights::READ)?;
     let len = usize::try_from(len).unwrap_or(usize::MAX);
     let count = usize::try_from(count).unwrap_or(usize::MAX);
     let process = process();
-    endpoint.receive(|message| {
+    let mut needed = 0;
+    let received = endpoint.receive(|message| {
         if message.bytes.len() > len || message.handles.len() > count {
+            needed = sizes(&message);
             return Err((Error::BufferTooSmall, message));
         }
+        let value = sizes(&message);
         let Message {
             bytes,
             handles: objects,
         } = message;
-        // Both are at most the limits, so they fit 32 bits.
-        let value = u64::try_from(objects.len()).unwrap_or(0) << 32
-            | u64::try_from(bytes.len()).unwrap_or(0);
         process
             .insert_all(objects, |numbers| {
                 let mut raw = [0; 4 * MAX_MESSAGE_HANDLES];
@@ -644,7 +658,23 @@ fn receive(handle_arg: u64, buf: u64, len: u64, handles: u64, count: u64) -> Res
                 }
             })
             .map_err(|(e, handles)| (e, Message { bytes, handles }))
+    });
+    received.map_err(|error| Failure {
+        error,
+        value: if error == Error::BufferTooSmall {
+            needed
+        } else {
+            0
+        },
     })
+}
+
+/// `message`'s byte count in the low 32 bits and its handle count in the
+/// high 32, as receive returns them.
+fn sizes<T>(message: &Message<T>) -> u64 {
+    // Both are at most the limits, so they fit 32 bits.
+    u64::try_from(message.handles.len()).unwrap_or(0) << 32
+        | u64::try_from(message.bytes.len()).unwrap_or(0)
 }
 
 /// Waits on the `count` items at `items` for at most `timeout`

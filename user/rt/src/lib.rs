@@ -386,28 +386,39 @@ impl Handle<Channel> {
 
     /// Receives the oldest message waiting here: its bytes replace what
     /// `bytes` held, and its handles are returned. Needs [`Rights::READ`].
-    /// `bytes` grows to [`MAX_MESSAGE_BYTES`] for the call, zeroing what
-    /// grows, and is left empty on failure; a loop that receives many
-    /// messages calls [`receive_into`](Self::receive_into) instead.
+    /// `bytes` first takes all of its capacity, zeroing what grows, and
+    /// grows to the message's size if that is too little, so a loop that
+    /// reuses one `Vec` allocates only for a larger message than before. It
+    /// is left empty on failure.
     pub fn receive(&self, bytes: &mut Vec<u8>) -> Result<Vec<Handle<Unknown>>, Error> {
-        bytes.resize(MAX_MESSAGE_BYTES, 0);
-        match self.receive_into(bytes) {
+        bytes.resize(bytes.capacity(), 0);
+        let received = match self.receive_into(bytes) {
+            Err(ReceiveError::TooSmall { bytes: needed, .. }) => {
+                bytes.resize(needed, 0);
+                self.receive_into(bytes)
+            }
+            received => received,
+        };
+        match received {
             Ok((len, handles)) => {
                 bytes.truncate(len);
                 Ok(handles)
             }
             Err(e) => {
                 bytes.clear();
-                Err(e)
+                Err(e.into())
             }
         }
     }
 
     /// Receives the oldest message waiting here into the start of `bytes`,
     /// and returns its length and its handles. Needs [`Rights::READ`].
-    /// Fails with [`Error::BufferTooSmall`], leaving the message queued,
+    /// Fails with [`ReceiveError::TooSmall`], leaving the message queued,
     /// when `bytes` is shorter than the message.
-    pub fn receive_into(&self, bytes: &mut [u8]) -> Result<(usize, Vec<Handle<Unknown>>), Error> {
+    pub fn receive_into(
+        &self,
+        bytes: &mut [u8],
+    ) -> Result<(usize, Vec<Handle<Unknown>>), ReceiveError> {
         let mut values = [0u32; MAX_MESSAGE_HANDLES];
         // SAFETY: By `Syscall::Receive`'s docs, receive writes at most
         // bytes.len() bytes at bytes.as_mut_ptr() and at most
@@ -426,13 +437,17 @@ impl Handle<Channel> {
                 ],
             )
         };
-        let value = result(code, value)?;
-        let (Ok(len), Ok(count)) = (
-            usize::try_from(value & 0xffff_ffff),
-            usize::try_from(value >> 32),
-        ) else {
-            unreachable!("ThisOS's addresses are 64 bits");
-        };
+        let (len, count) = counts(value);
+        match result(code, value) {
+            Ok(_) => {}
+            Err(Error::BufferTooSmall) => {
+                return Err(ReceiveError::TooSmall {
+                    bytes: len,
+                    handles: count,
+                });
+            }
+            Err(e) => return Err(ReceiveError::Other(e)),
+        }
         let Some(values) = values.get(..count) else {
             panic!("the kernel received {count} handles, more than a message holds");
         };
@@ -441,6 +456,41 @@ impl Handle<Channel> {
             values.iter().map(|&value| Handle::new(value)).collect(),
         ))
     }
+}
+
+/// Why [`Handle::receive_into`] failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReceiveError {
+    /// The buffer is too short for the message, which stays queued.
+    TooSmall {
+        /// The message's byte count.
+        bytes: usize,
+        /// The message's handle count.
+        handles: usize,
+    },
+    /// Any other failure, which [`Handle::receive`] would also report.
+    Other(Error),
+}
+
+impl From<ReceiveError> for Error {
+    fn from(e: ReceiveError) -> Error {
+        match e {
+            ReceiveError::TooSmall { .. } => Error::BufferTooSmall,
+            ReceiveError::Other(e) => e,
+        }
+    }
+}
+
+/// The byte count in the low 32 bits of a receive's value and the handle
+/// count in the high 32.
+fn counts(value: u64) -> (usize, usize) {
+    let (Ok(len), Ok(count)) = (
+        usize::try_from(value & 0xffff_ffff),
+        usize::try_from(value >> 32),
+    ) else {
+        unreachable!("ThisOS's addresses are 64 bits");
+    };
+    (len, count)
 }
 
 impl<T> Handle<T> {

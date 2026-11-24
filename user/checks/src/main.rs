@@ -1,7 +1,7 @@
-//! Checks the process-building, memory-copy and wait syscalls from Rust: what
-//! they do, and how they fail. A kernel test runs it as the kernel runs
-//! init, and a check that fails panics, which exits with status 101 after
-//! logging where. A normal boot never runs it.
+//! Checks the process-building, memory-copy, receive and wait syscalls from
+//! Rust: what they do, and how they fail. A kernel test runs it as the
+//! kernel runs init, and a check that fails panics, which exits with status
+//! 101 after logging where. A normal boot never runs it.
 
 #![no_std]
 #![no_main]
@@ -9,9 +9,12 @@
 
 extern crate alloc;
 
+use alloc::vec;
 use alloc::vec::Vec;
 
-use thisos_rt::{Channel, Error, Handle, Memory, Process, Rights, Signals, USER_SPACE_END};
+use thisos_rt::{
+    Channel, Error, Handle, Memory, Process, ReceiveError, Rights, Signals, USER_SPACE_END,
+};
 
 thisos_rt::entry!(main);
 
@@ -50,6 +53,7 @@ fn main(kernel: Handle<Channel>) -> u64 {
     starting_a_process();
     process_ends();
     waits_ask_for_signals_their_objects_have();
+    short_receives_give_the_message_size();
     0
 }
 
@@ -242,4 +246,23 @@ fn waits_ask_for_signals_their_objects_have() {
     ] {
         assert_eq!(process.wait(wanted, now), Err(Error::BadSignals), "{what}");
     }
+}
+
+fn short_receives_give_the_message_size() {
+    let (first, second) = channel();
+    let (carried, _peer) = channel();
+    ok(first
+        .send(b"hello", vec![carried.into_unknown()])
+        .map_err(|(e, _)| e));
+    let short = second.receive_into(&mut [0; 2]).map(|_| ());
+    let sizes = ReceiveError::TooSmall {
+        bytes: 5,
+        handles: 1,
+    };
+    assert_eq!(short, Err(sizes), "a receive into 2 bytes");
+    // An empty Vec has room for nothing, so this takes receive's retry.
+    let mut bytes = Vec::new();
+    let handles = ok(second.receive(&mut bytes));
+    assert_eq!(&bytes, b"hello", "the message after a short receive");
+    assert_eq!(handles.len(), 1, "its handles");
 }

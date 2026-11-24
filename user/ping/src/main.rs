@@ -18,7 +18,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::mem;
 
-use thisos_rt::{Channel, Handle, MAX_MESSAGE_BYTES, Memory, Signals, Unknown, cycles};
+use thisos_rt::{Channel, Error, Handle, MAX_MESSAGE_BYTES, Memory, Signals, Unknown, cycles};
 
 thisos_rt::entry!(main);
 
@@ -102,7 +102,7 @@ fn round_trip(
     if let Err(e) = pong.wait(Signals::READABLE | Signals::PEER_CLOSED, None) {
         panic!("waiting for pong's answer failed: {e:?}");
     }
-    let (len, handles) = match pong.receive_into(received) {
+    let (len, handles) = match pong.receive_into(received).map_err(Error::from) {
         Ok(message) => message,
         Err(e) => panic!("receiving pong's answer failed: {e:?}"),
     };

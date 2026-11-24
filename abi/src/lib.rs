@@ -160,9 +160,11 @@ numbered! {
         /// its high 32. Fails with [`Error::BadHandle`], [`Error::WrongType`],
         /// [`Error::AccessDenied`], with [`Error::ShouldWait`] if no message
         /// waits, with [`Error::PeerClosed`] if none waits and the other
-        /// endpoint is closed, with [`Error::BufferTooSmall`],
+        /// endpoint is closed, with [`Error::BufferTooSmall`], whose value
+        /// holds the message's byte and handle counts as a success's does,
         /// [`Error::BadAddress`], [`Error::NoHandles`] or [`Error::NoMemory`],
-        /// and then leaves the message waiting.
+        /// and then leaves the message waiting. Every other failure's value is
+        /// 0.
         Receive = 10,
         /// Waits until an object of one of the items at the address in its
         /// first argument, as many as its second, at most [`MAX_WAIT_ITEMS`],
