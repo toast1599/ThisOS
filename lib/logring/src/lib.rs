@@ -1,6 +1,7 @@
-//! The kernel log's buffer: a ring of records, each a one-byte tag and a
-//! line of text, which writers append whole and one reader takes back in
-//! pieces of at most [`PIECE`] bytes, never splitting a character. The
+//! The kernel log's buffer: a ring of records, each a one-byte tag, the
+//! index of the CPU that wrote it and a line of text, which writers append
+//! whole and one reader takes back in pieces of at most [`PIECE`] bytes,
+//! never splitting a character. The
 //! kernel adds the lock, what a tag means and the thread that draws the
 //! pieces. [`Line`] is a fixed buffer that formats a record before it goes
 //! in, cutting it short when it doesn't fit.
@@ -11,9 +12,9 @@
 use core::fmt::{self, Write};
 use core::str;
 
-/// The bytes a record takes in the ring besides its text: the tag and the
-/// text's length.
-pub const HEADER: usize = 5;
+/// The bytes a record takes in the ring besides its text: the tag, the
+/// CPU and the text's length.
+pub const HEADER: usize = 6;
 
 /// The most text one [`Ring::pop`] gives.
 pub const PIECE: usize = 32;
@@ -37,6 +38,8 @@ pub struct Ring<const N: usize> {
 pub struct Piece {
     /// The record's tag, when this piece starts it.
     pub tag: Option<u8>,
+    /// The CPU that wrote the record, when this piece starts it.
+    pub cpu: Option<u8>,
     /// Whether this piece ends the record.
     pub end: bool,
     bytes: [u8; PIECE],
@@ -75,9 +78,10 @@ impl<const N: usize> Ring<N> {
         N - self.len
     }
 
-    /// Appends a record of `tag` and `text`, and returns whether it fit. A
-    /// record that doesn't, or whose formatting fails, changes nothing.
-    pub fn push(&mut self, tag: u8, text: &dyn fmt::Display) -> bool {
+    /// Appends a record of `tag`, written on `cpu`, and `text`, and returns
+    /// whether it fit. A record that doesn't, or whose formatting fails,
+    /// changes nothing.
+    pub fn push(&mut self, tag: u8, cpu: u8, text: &dyn fmt::Display) -> bool {
         if self.room() < HEADER {
             return false;
         }
@@ -98,7 +102,8 @@ impl<const N: usize> Ring<N> {
         };
         let mut header = [0; HEADER];
         header[0] = tag;
-        header[1..].copy_from_slice(&length.to_le_bytes());
+        header[1] = cpu;
+        header[2..].copy_from_slice(&length.to_le_bytes());
         for (i, byte) in header.into_iter().enumerate() {
             self.bytes[(at + i) % N] = byte;
         }
@@ -124,13 +129,15 @@ impl<const N: usize> Ring<N> {
             return None;
         }
         let mut tag = None;
+        let mut cpu = None;
         if self.left == 0 {
             let mut header = [0; HEADER];
             for byte in &mut header {
                 *byte = self.take_byte();
             }
-            let [first, length @ ..] = header;
+            let [first, writer, length @ ..] = header;
             tag = Some(first);
+            cpu = Some(writer);
             // Fits: push wrote it from a usize.
             self.left = usize::try_from(u32::from_le_bytes(length)).unwrap_or(0);
         }
@@ -147,6 +154,7 @@ impl<const N: usize> Ring<N> {
         self.left -= len;
         Some(Piece {
             tag,
+            cpu,
             end: self.left == 0,
             bytes,
             len,
@@ -281,16 +289,17 @@ mod tests {
 
     /// Pops everything, joining each record's pieces, and checks that no
     /// piece is longer than [`PIECE`] or empty but for an empty record.
-    fn drain<const N: usize>(ring: &mut Ring<N>) -> Vec<(u8, String)> {
-        let mut records: Vec<(u8, String)> = Vec::new();
+    fn drain<const N: usize>(ring: &mut Ring<N>) -> Vec<(u8, u8, String)> {
+        let mut records: Vec<(u8, u8, String)> = Vec::new();
         while let Some(piece) = ring.pop() {
             assert!(piece.text().len() <= PIECE);
-            if let Some(tag) = piece.tag {
-                records.push((tag, String::new()));
+            if let (Some(tag), Some(cpu)) = (piece.tag, piece.cpu) {
+                records.push((tag, cpu, String::new()));
             } else {
+                assert_eq!((piece.tag, piece.cpu), (None, None));
                 assert!(!piece.text().is_empty(), "{piece:?}");
             }
-            let Some((_, text)) = records.last_mut() else {
+            let Some((_, _, text)) = records.last_mut() else {
                 panic!("a piece before any record's start");
             };
             text.push_str(piece.text());
@@ -304,9 +313,9 @@ mod tests {
         for round in 0..20 {
             let first = std::format!("record {round}");
             let second = "x".repeat(round);
-            assert!(ring.push(1, &first));
-            assert!(ring.push(2, &second));
-            assert_eq!(drain(&mut ring), [(1, first), (2, second)]);
+            assert!(ring.push(1, 0, &first));
+            assert!(ring.push(2, 63, &second));
+            assert_eq!(drain(&mut ring), [(1, 0, first), (2, 63, second)]);
             assert!(ring.is_empty());
             assert_eq!(ring.room(), 64);
         }
@@ -314,15 +323,19 @@ mod tests {
 
     #[test]
     fn a_record_that_doesnt_fit_changes_nothing() {
+        // Leaves room for a header and two bytes.
         let mut ring = Ring::<32>::new();
-        assert!(ring.push(1, &"a".repeat(20)));
-        assert_eq!(ring.room(), 32 - HEADER - 20);
-        assert!(!ring.push(2, &"bbb"));
-        assert_eq!(ring.room(), 32 - HEADER - 20);
-        assert!(ring.push(2, &"b".repeat(2)));
+        assert!(ring.push(1, 0, &"a".repeat(18)));
+        assert_eq!(ring.room(), HEADER + 2);
+        assert!(!ring.push(2, 0, &"bbb"));
+        assert_eq!(ring.room(), HEADER + 2);
+        assert!(ring.push(2, 5, &"b".repeat(2)));
         assert_eq!(ring.room(), 0);
-        assert!(!ring.push(3, &""));
-        assert_eq!(drain(&mut ring), [(1, "a".repeat(20)), (2, "bb".into())]);
+        assert!(!ring.push(3, 0, &""));
+        assert_eq!(
+            drain(&mut ring),
+            [(1, 0, "a".repeat(18)), (2, 5, "bb".into())]
+        );
     }
 
     #[test]
@@ -331,15 +344,15 @@ mod tests {
         // text starts one byte in.
         let text = std::format!("a{}", "é".repeat(40));
         let mut ring = Ring::<128>::new();
-        assert!(ring.push(7, &text));
+        assert!(ring.push(7, 3, &text));
         let first = ring.pop().unwrap_or_else(|| panic!("empty"));
-        assert_eq!(first.tag, Some(7));
+        assert_eq!((first.tag, first.cpu), (Some(7), Some(3)));
         assert!(!first.end);
         assert_eq!(first.text().len(), PIECE - 1);
         assert_eq!(ring.room(), 128 - (text.len() - (PIECE - 1)));
         let mut rest = String::new();
         while let Some(piece) = ring.pop() {
-            assert_eq!(piece.tag, None);
+            assert_eq!((piece.tag, piece.cpu), (None, None));
             rest.push_str(piece.text());
             assert_eq!(piece.end, ring.is_empty());
         }
@@ -349,9 +362,12 @@ mod tests {
     #[test]
     fn an_empty_record_is_one_empty_piece() {
         let mut ring = Ring::<16>::new();
-        assert!(ring.push(4, &""));
+        assert!(ring.push(4, 1, &""));
         let piece = ring.pop().unwrap_or_else(|| panic!("empty"));
-        assert_eq!((piece.tag, piece.end, piece.text()), (Some(4), true, ""));
+        assert_eq!(
+            (piece.tag, piece.cpu, piece.end, piece.text()),
+            (Some(4), Some(1), true, "")
+        );
         assert_eq!(ring.pop(), None);
     }
 

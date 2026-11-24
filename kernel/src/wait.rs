@@ -119,12 +119,12 @@ mod tests {
     use alloc::vec::Vec;
     use core::sync::atomic::{AtomicBool, Ordering};
 
-    use spin::Mutex;
     use thisos_channels::Message;
+    use thisos_locks::Rank;
 
     use super::*;
-    use crate::channel;
     use crate::testing::spin_until;
+    use crate::{Lock, channel};
 
     fn ping(endpoint: &Endpoint) {
         let sent = endpoint.send(|| {
@@ -141,7 +141,7 @@ mod tests {
         static STARTED: AtomicBool = AtomicBool::new(false);
         static DONE: AtomicBool = AtomicBool::new(false);
         type Outcome = (Result<usize, Error>, [Signals; 2]);
-        static RESULT: Mutex<Option<Outcome>> = Mutex::new(None);
+        static RESULT: Lock<Option<Outcome>> = Lock::new(Rank::TEST_OUTER, None);
         let (a, b) = channel::pair();
         let (a, b) = (Arc::new(a), Arc::new(b));
         let (c, _d) = channel::pair();

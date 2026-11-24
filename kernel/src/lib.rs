@@ -14,6 +14,7 @@
 extern crate alloc;
 
 mod channel;
+mod cpu;
 mod frames;
 mod heap;
 mod logger;
@@ -21,6 +22,7 @@ mod memory;
 mod paging;
 mod panic;
 mod process;
+mod status;
 #[cfg(test)]
 mod testing;
 mod thread;
@@ -49,6 +51,10 @@ pub type Arch = thisos_arch_aarch64::Aarch64;
 #[cfg(target_arch = "aarch64")]
 pub use thisos_arch_aarch64::entry;
 
+/// The kernel's lock: ranked, and limited in how long anyone spins for it
+/// (`thisos-locks`).
+type Lock<T> = thisos_locks::Lock<T, Arch>;
+
 #[cfg(test)]
 entry!(test_kmain, trap);
 
@@ -71,6 +77,10 @@ fn init(boot: BootInfo<Arch>) {
         log::info!("framebuffer is write-combining");
     } else {
         log::warn!("framebuffer isn't write-combining, so the console may be slow");
+    }
+    match <Arch as thisos_locks::Platform>::counter_hz() {
+        Some(hz) => log::info!("lock spins panic after 1 s of a {hz} Hz counter"),
+        None => log::warn!("the counter's frequency is unknown, so lock spins have no limit"),
     }
     frames::init(boot.memory);
     paging::init();

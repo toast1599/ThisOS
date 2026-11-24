@@ -109,6 +109,7 @@ dependencies = [
  "thisos-fdt",
  "thisos-frames",
  "thisos-hal",
+ "thisos-locks",
  "thisos-regions",
 ]
 
@@ -122,6 +123,7 @@ dependencies = [
  "thisos-abi",
  "thisos-frames",
  "thisos-hal",
+ "thisos-locks",
  "thisos-regions",
  "uart_16550",
  "x86_64",
@@ -212,9 +214,17 @@ dependencies = [
  "thisos-frames",
  "thisos-hal",
  "thisos-handles",
+ "thisos-locks",
  "thisos-logring",
  "thisos-regions",
  "thisos-ustar",
+]
+
+[[package]]
+name = "thisos-locks"
+version = "0.0.0"
+dependencies = [
+ "spin",
 ]
 
 [[package]]

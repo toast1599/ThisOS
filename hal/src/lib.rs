@@ -74,22 +74,24 @@ pub struct Framebuffer<M> {
 /// The memory of a [`Framebuffer`], written one pixel or two at a time
 /// and never read: firmware often maps it uncached, where every access is a
 /// bus transaction. A pixel is 4 bytes, stored as a little-endian word, and
-/// an index counts pixels from the start of the first row.
+/// an index counts pixels from the start of the first row. Stores take
+/// `&self`, so CPUs can draw disjoint parts through one shared handle
+/// without a lock.
 #[expect(
     clippy::len_without_is_empty,
     reason = "the console only needs the length to clear the screen"
 )]
-pub trait Pixels: Send {
+pub trait Pixels: Send + Sync {
     /// The number of pixels.
     fn len(&self) -> usize;
 
     /// Stores `pixel` at `index`. Panics if `index` is out of range.
-    fn store(&mut self, index: usize, pixel: u32);
+    fn store(&self, index: usize, pixel: u32);
 
     /// Stores the low half of `pixels` at `index` and the high half after
     /// it, in one 8-byte store. Panics unless `index` is even and both
     /// pixels are in range.
-    fn store_pair(&mut self, index: usize, pixels: u64);
+    fn store_pair(&self, index: usize, pixels: u64);
 }
 
 /// The byte order of a framebuffer pixel. The fourth byte is unused.
@@ -434,6 +436,11 @@ pub trait Platform {
     /// no framebuffer. Anything still drawing through the first mixes its
     /// pixels with this one's.
     fn panic_framebuffer() -> Option<Framebuffer<Self::Pixels>>;
+
+    /// A third handle to the framebuffer in [`BootInfo`], for the CPUs'
+    /// status cells, which each CPU draws without a lock. It returns `Some`
+    /// at most once, and `None` when there is no framebuffer.
+    fn status_framebuffer() -> Option<Framebuffer<Self::Pixels>>;
 
     /// The kernel heap's counters. It takes the heap's lock, so trap
     /// handlers never call it.

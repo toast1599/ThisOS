@@ -1,9 +1,9 @@
 [workspace]
 resolver = "3"
-members = ["kernel", "hal", "abi", "arch/x86_64", "arch/aarch64", "lib/console", "lib/elf", "lib/fdt", "lib/frames", "lib/handles", "lib/regions", "lib/channels", "lib/ustar", "lib/logring", "user/rt", "user/init", "user/hello", "user/fault", "user/ping", "user/pong", "user/checks"]
+members = ["kernel", "hal", "abi", "arch/x86_64", "arch/aarch64", "lib/console", "lib/elf", "lib/fdt", "lib/frames", "lib/handles", "lib/regions", "lib/channels", "lib/ustar", "lib/logring", "lib/locks", "user/rt", "user/init", "user/hello", "user/fault", "user/ping", "user/pong", "user/checks"]
 # The aarch64 arch crate builds only for aarch64, so a plain cargo build at
 # the root, which targets x86_64-unknown-none, leaves it out.
-default-members = ["kernel", "hal", "abi", "arch/x86_64", "lib/console", "lib/elf", "lib/fdt", "lib/frames", "lib/handles", "lib/regions", "lib/channels", "lib/ustar", "lib/logring", "user/rt", "user/init", "user/hello", "user/fault", "user/ping", "user/pong", "user/checks"]
+default-members = ["kernel", "hal", "abi", "arch/x86_64", "lib/console", "lib/elf", "lib/fdt", "lib/frames", "lib/handles", "lib/regions", "lib/channels", "lib/ustar", "lib/logring", "lib/locks", "user/rt", "user/init", "user/hello", "user/fault", "user/ping", "user/pong", "user/checks"]
 
 [workspace.package]
 version = "0.0.0"
@@ -26,6 +26,7 @@ thisos-regions = { path = "lib/regions" }
 thisos-channels = { path = "lib/channels" }
 thisos-ustar = { path = "lib/ustar" }
 thisos-logring = { path = "lib/logring" }
+thisos-locks = { path = "lib/locks" }
 thisos-rt = { path = "user/rt" }
 
 [workspace.lints.rust]

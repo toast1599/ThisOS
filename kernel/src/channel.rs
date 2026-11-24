@@ -6,10 +6,11 @@
 
 use alloc::sync::Arc;
 
-use spin::Mutex;
 use thisos_abi::{Error, Rights, Signals};
 use thisos_channels::{Channel, Message, Side};
+use thisos_locks::Rank;
 
+use crate::Lock;
 use crate::process::Object;
 use crate::thread;
 
@@ -24,7 +25,7 @@ pub struct Endpoint {
     /// Taken with interrupts on, and never by a trap handler: sending and
     /// receiving allocate, and take a process's handle-table lock inside
     /// it, and unparking takes the scheduler's.
-    channel: Arc<Mutex<Channel<Carried>>>,
+    channel: Arc<Lock<Channel<Carried>>>,
     /// The next endpoint on the stack of closed ones a drop drains, while
     /// this one is on it.
     next: Option<Arc<Endpoint>>,
@@ -32,7 +33,8 @@ pub struct Endpoint {
 
 /// A new channel's two endpoints. Fails with [`Error::NoMemory`].
 pub fn create() -> Result<(Endpoint, Endpoint), Error> {
-    let channel = Arc::try_new(Mutex::new(Channel::new())).map_err(|_| Error::NoMemory)?;
+    let channel =
+        Arc::try_new(Lock::new(Rank::CHANNEL, Channel::new())).map_err(|_| Error::NoMemory)?;
     let first = Endpoint {
         side: Side::First,
         channel: Arc::clone(&channel),
@@ -117,7 +119,7 @@ impl Drop for Endpoint {
 /// pushed on, closed. Takes one message at a time, so that its objects
 /// drop after the channel's lock.
 fn drain(
-    channel: &Mutex<Channel<Carried>>,
+    channel: &Lock<Channel<Carried>>,
     side: Side,
     mut stack: Option<Arc<Endpoint>>,
 ) -> Option<Arc<Endpoint>> {
@@ -170,7 +172,10 @@ mod tests {
         let [(Object::Channel(c), _)] = &message.handles[..] else {
             panic!("the message lost its endpoint");
         };
-        assert!(c.send(|| Ok(carry(pair().0))).is_ok());
+        // Made and its peer dropped outside send, which holds the lock.
+        let (carried, peer) = pair();
+        drop(peer);
+        assert!(c.send(|| Ok(carry(carried))).is_ok());
         drop(message);
         // d drains what c sent before it closed.
         assert!(d.receive(Ok).is_ok());

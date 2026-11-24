@@ -16,7 +16,8 @@
 //! while holding it: a tick can preempt a thread that holds the heap's lock,
 //! and the heap would then spin with interrupts off for good. Making a
 //! thread reserves room in the queues for it, so moving one never
-//! allocates.
+//! allocates. A switch also swaps the CPU's list of held locks
+//! (`thisos_locks::switch_held`), so each thread's list goes with it.
 
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
@@ -25,10 +26,12 @@ use alloc::vec::Vec;
 use core::mem;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use spin::Mutex;
 use thisos_abi::Error;
 use thisos_hal::{AddressSpace as _, Cpu, Platform};
+use thisos_locks::{Rank, Saved};
 
+use crate::Lock;
+use crate::cpu::{self, State};
 use crate::process::Process;
 use crate::{Arch, paging, timer};
 
@@ -57,6 +60,9 @@ struct Thread {
     /// unpark or a deadline that comes while it is blocked, and by an
     /// unpark that comes before it parks.
     wake: Option<Wake>,
+    /// The locks it held when it last left the CPU, which the CPU's list
+    /// holds while it runs.
+    held: Saved,
 }
 
 impl Thread {
@@ -75,6 +81,7 @@ impl Thread {
             process,
             deadline: None,
             wake: None,
+            held: Saved::default(),
         }
     }
 }
@@ -132,7 +139,7 @@ struct Scheduler {
     reaper: u64,
 }
 
-static SCHEDULER: Mutex<Option<Scheduler>> = Mutex::new(None);
+static SCHEDULER: Lock<Option<Scheduler>> = Lock::new(Rank::SCHEDULER, None);
 
 /// Runs `f` on the scheduler with interrupts off. `f` must not allocate or
 /// free.
@@ -169,6 +176,7 @@ pub fn init() {
         None,
     ));
     let boot = Box::new(Thread::new(None, None, None, None));
+    thisos_locks::running::<Arch>(boot.id);
     let mut scheduler = Scheduler {
         running: Some(boot),
         ready: VecDeque::with_capacity(2),
@@ -482,15 +490,18 @@ fn switch(place: Place) {
         let Some(to) = next.context.take() else {
             panic!("a thread that isn't running has no context");
         };
+        let held = thisos_locks::switch_held::<Arch>(&next.held);
+        thisos_locks::running::<Arch>(next.id);
         // The timer's handler runs this too, so the kernel's tables come
         // through the HAL call that takes no lock.
         match &next.space {
             Some(space) => space.activate(),
             None => Arch::activate_kernel_tables(),
         }
-        let Some(leaving) = scheduler.running.replace(next) else {
+        let Some(mut leaving) = scheduler.running.replace(next) else {
             panic!("no thread was running");
         };
+        leaving.held = held;
         scheduler.leaving = Some((leaving, place));
         Some(to)
     });
@@ -502,6 +513,7 @@ fn switch(place: Place) {
 /// Puts the thread that switched to this one in its place, with `from`, the
 /// context it left. Every thread runs this first when it resumes.
 fn arrived(from: Context) {
+    cpu::set_state(State::Kernel);
     with(|scheduler| {
         let Some((mut thread, place)) = scheduler.leaving.take() else {
             panic!("a thread resumed with none leaving");
@@ -555,7 +567,10 @@ fn start(from: Context) -> ! {
     Arch::enable_interrupts();
     match entry {
         Some(Entry::Kernel(run)) => run(),
-        Some(Entry::User { ip, sp, arg }) => Arch::enter_user(ip, sp, arg),
+        Some(Entry::User { ip, sp, arg }) => {
+            cpu::set_state(State::User);
+            Arch::enter_user(ip, sp, arg)
+        }
         None => {}
     }
     exit()
@@ -577,6 +592,7 @@ fn idle(from: Context) -> ! {
     arrived(from);
     Arch::enable_interrupts();
     loop {
+        cpu::set_state(State::Idle);
         Arch::wait_for_interrupt();
     }
 }
@@ -620,7 +636,44 @@ mod tests {
 
     use super::*;
     use crate::frames;
-    use crate::testing::{self, spin_until};
+    use crate::testing::{self, ExpectPanic, spin_until};
+
+    static OUTER: Lock<()> = Lock::new(Rank::TEST_OUTER, ());
+    static INNER: Lock<()> = Lock::new(Rank::TEST_INNER, ());
+
+    #[test_case]
+    const AN_ORDER_INVERSION_PANICS: ExpectPanic = ExpectPanic {
+        name: "thisos_kernel::thread::tests::an_order_inversion_panics",
+        run: || {
+            let _inner = INNER.lock();
+            let _outer = OUTER.lock();
+        },
+        message: "taking TEST_OUTER (1) while holding TEST_INNER (2): held [TEST_INNER]",
+        after: None,
+    };
+
+    // The holder parks with the lock, so ticks switch between it and the
+    // spinner, and each keeps its own held list and spin.
+    #[test_case]
+    const A_LOCK_HELD_PAST_THE_SPIN_LIMIT_PANICS: ExpectPanic = ExpectPanic {
+        name: "thisos_kernel::thread::tests::a_lock_held_past_the_spin_limit_panics",
+        run: || {
+            static HELD: AtomicBool = AtomicBool::new(false);
+            spawn(|| {
+                let _held = OUTER.lock();
+                HELD.store(true, Ordering::Release);
+                loop {
+                    park();
+                }
+            });
+            spin_until("the holder to take the lock", || {
+                HELD.load(Ordering::Acquire)
+            });
+            drop(OUTER.lock());
+        },
+        message: "spun 1 s for TEST_OUTER (1) on CPU 0, thread ",
+        after: Some(|| thisos_locks::spinning(0) == Some(Rank::TEST_OUTER)),
+    };
 
     // Neither the spawned threads nor this one yields, so all three make
     // progress only if ticks preempt them.
@@ -708,7 +761,7 @@ mod tests {
         static DONE: AtomicBool = AtomicBool::new(false);
         static GUARD: AtomicU64 = AtomicU64::new(0);
         static FRAMES: AtomicUsize = AtomicUsize::new(0);
-        static END: spin::Mutex<Option<BacktraceEnd>> = spin::Mutex::new(None);
+        static END: Lock<Option<BacktraceEnd>> = Lock::new(Rank::TEST_OUTER, None);
         spawn(|| {
             GUARD.store(Arch::guard_page(), Ordering::Relaxed);
             let mut frames = 0;
@@ -767,7 +820,7 @@ mod tests {
     // interrupts being off in this thread guarantees.
     #[test_case]
     fn an_unpark_before_the_park_isnt_lost() {
-        static WAKE: spin::Mutex<Option<Wake>> = spin::Mutex::new(None);
+        static WAKE: Lock<Option<Wake>> = Lock::new(Rank::TEST_OUTER, None);
         Arch::without_interrupts(|| {
             spawn(|| *WAKE.lock() = Some(park()));
             let Some(id) = with(|scheduler| scheduler.ready.back().map(|thread| thread.id)) else {
@@ -802,7 +855,7 @@ mod tests {
     fn a_tick_wakes_only_the_threads_whose_deadline_passed() {
         static DEADLINE: AtomicU64 = AtomicU64::new(0);
         static IDS: [AtomicU64; 3] = [const { AtomicU64::new(u64::MAX) }; 3];
-        static WAKES: spin::Mutex<[Option<Wake>; 3]> = spin::Mutex::new([None; 3]);
+        static WAKES: Lock<[Option<Wake>; 3]> = Lock::new(Rank::TEST_OUTER, [None; 3]);
         // Far more than three spawns and parks take under TCG.
         DEADLINE.store(timer::ticks() + 50, Ordering::Relaxed);
         for (i, id) in IDS.iter().enumerate() {

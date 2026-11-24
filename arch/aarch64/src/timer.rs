@@ -55,8 +55,13 @@ pub fn rearm() {
     barrier::isb(barrier::SY);
 }
 
+/// The virtual count's frequency, or `None` where `CNTFRQ_EL0` gives none.
+pub fn count_hz() -> Option<u64> {
+    Some(CNTFRQ_EL0.get()).filter(|&hz| hz != 0)
+}
+
 /// The virtual count now.
-fn count() -> u64 {
+pub fn count() -> u64 {
     // Without it, the read may happen earlier than the code before it.
     barrier::isb(barrier::SY);
     CNTVCT_EL0.get()

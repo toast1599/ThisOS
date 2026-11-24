@@ -97,8 +97,14 @@ unsafe extern "C" {
     safe static __text_end: u8;
 }
 
-/// The second framebuffer handle, until a panic takes it.
+/// The second framebuffer handle, until a panic takes it. A plain spin lock,
+/// not a ranked one: the panic path takes no checked lock.
 pub(crate) static PANIC_FRAMEBUFFER: spin::Mutex<Option<Framebuffer<FramebufferPixels>>> =
+    spin::Mutex::new(None);
+
+/// The third framebuffer handle, until the kernel takes it for the status
+/// cells. Taken once at boot, so a plain spin lock does.
+pub(crate) static STATUS_FRAMEBUFFER: spin::Mutex<Option<Framebuffer<FramebufferPixels>>> =
     spin::Mutex::new(None);
 
 /// Builds the kernel's [`BootInfo`] from Limine's answers, and sets up the
@@ -240,7 +246,7 @@ fn framebuffer(fb: &limine::framebuffer::Framebuffer) -> Option<Framebuffer<Fram
     // reads or writes the framebuffer's frames through the physical-memory
     // mapping. The limine crate's as_slice functions, which would make
     // references to it, are never called.
-    let [pixels, panic_pixels] =
+    let [pixels, panic_pixels, status_pixels] =
         unsafe { FramebufferPixels::new(start..start.wrapping_add(size))? };
     let framebuffer = |pixels| Framebuffer {
         pixels,
@@ -250,5 +256,6 @@ fn framebuffer(fb: &limine::framebuffer::Framebuffer) -> Option<Framebuffer<Fram
         format,
     };
     *PANIC_FRAMEBUFFER.lock() = Some(framebuffer(panic_pixels));
+    *STATUS_FRAMEBUFFER.lock() = Some(framebuffer(status_pixels));
     Some(framebuffer(pixels))
 }

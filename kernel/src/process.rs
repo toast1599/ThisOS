@@ -9,11 +9,12 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::mem;
 
-use spin::Mutex;
 use thisos_abi::{Error, Rights, Signals};
 use thisos_hal::{AddressSpace as _, Cpu, Trap};
 use thisos_handles::Table;
+use thisos_locks::Rank;
 
+use crate::Lock;
 use crate::channel::Endpoint;
 use crate::memory::MemoryObject;
 use crate::paging::Space;
@@ -53,14 +54,14 @@ pub enum End {
 pub struct Process {
     /// Taken with interrupts on, and never by a trap handler, since making
     /// a handle can allocate.
-    handles: Mutex<Table<Object>>,
+    handles: Lock<Table<Object>>,
     /// Taken only with interrupts off, since the trap handler that kills a
     /// thread sets it.
-    end: Mutex<Option<End>>,
+    end: Lock<Option<End>>,
     /// Taken with interrupts on, and never by a trap handler: starting the
     /// process and mapping into it allocate. Taken before the process's
     /// and its creator's handle-table locks.
-    life: Mutex<Life>,
+    life: Lock<Life>,
 }
 
 /// Where a process is in its life, and who waits for its end.
@@ -80,14 +81,17 @@ impl Process {
     /// [`Error::NoMemory`].
     pub fn new(space: Arc<Space>) -> Result<Arc<Self>, Error> {
         Arc::try_new(Self {
-            handles: Mutex::new(Table::new()),
-            end: Mutex::new(None),
-            life: Mutex::new(Life {
-                space: Some(space),
-                started: false,
-                ended: false,
-                waiters: Vec::new(),
-            }),
+            handles: Lock::new(Rank::HANDLES, Table::new()),
+            end: Lock::new(Rank::PROCESS_END, None),
+            life: Lock::new(
+                Rank::LIFE,
+                Life {
+                    space: Some(space),
+                    started: false,
+                    ended: false,
+                    waiters: Vec::new(),
+                },
+            ),
         })
         .map_err(|_| Error::NoMemory)
     }

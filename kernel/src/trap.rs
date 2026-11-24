@@ -2,7 +2,8 @@
 
 use thisos_hal::{Platform, Trap, TrapFrame as _};
 
-use crate::{Arch, paging, panic, thread, timer, user};
+use crate::cpu::{self, State};
+use crate::{Arch, paging, panic, status, thread, timer, user};
 
 /// Moves the stacks the CPU switches to for some traps, x86_64's for
 /// double faults, NMIs and machine checks and aarch64's for a stack
@@ -26,6 +27,15 @@ pub fn init() {
 /// switches to the next ready thread; any other trap is a kernel bug, and
 /// panics.
 pub fn trap(trap: Trap, frame: &mut <Arch as Platform>::TrapFrame) {
+    // Restored on the way out, so a tick shows what it interrupted. A
+    // thread a tick switches away from restores its own when it resumes.
+    let interrupted = cpu::state(cpu::id());
+    cpu::set_state(State::Kernel);
+    handle(trap, frame, interrupted);
+    cpu::set_state(interrupted);
+}
+
+fn handle(trap: Trap, frame: &mut <Arch as Platform>::TrapFrame, interrupted: State) {
     if frame.raised_by_user() {
         return user::trap(trap, frame);
     }
@@ -39,6 +49,7 @@ pub fn trap(trap: Trap, frame: &mut <Arch as Platform>::TrapFrame) {
             #[cfg(test)]
             crate::testing::watchdog(frame);
             timer::tick();
+            status::tick(interrupted);
             thread::tick();
         }
         _ => panic::trap(trap, frame),

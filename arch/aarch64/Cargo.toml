@@ -19,7 +19,11 @@ thisos-abi.workspace = true
 thisos-fdt.workspace = true
 thisos-frames.workspace = true
 thisos-hal.workspace = true
+thisos-locks.workspace = true
 thisos-regions.workspace = true
+
+[dev-dependencies]
+thisos-locks = { workspace = true, features = ["host"] }
 
 [lints]
 workspace = true

@@ -120,6 +120,25 @@ impl Cpu for X86_64 {
     }
 }
 
+impl thisos_locks::Platform for X86_64 {
+    // One CPU until SMP starts the others.
+    fn cpu() -> usize {
+        0
+    }
+
+    fn counter() -> u64 {
+        tsc::read()
+    }
+
+    fn counter_hz() -> Option<u64> {
+        tsc::rate()
+    }
+
+    fn masked<R>(f: impl FnOnce() -> R) -> R {
+        x86_64::instructions::interrupts::without_interrupts(f)
+    }
+}
+
 impl Platform for X86_64 {
     type Serial = Com1;
     type Pixels = FramebufferPixels;
@@ -229,6 +248,10 @@ impl Platform for X86_64 {
 
     fn panic_framebuffer() -> Option<Framebuffer<FramebufferPixels>> {
         PANIC_FRAMEBUFFER.try_lock()?.take()
+    }
+
+    fn status_framebuffer() -> Option<Framebuffer<FramebufferPixels>> {
+        STATUS_FRAMEBUFFER.lock().take()
     }
 
     fn panic_serial() -> Option<Com1> {
@@ -348,6 +371,8 @@ pub unsafe fn boot_info(
     unsafe {
         pic::disable();
     }
+    // Before anything spins for a lock, so the spin limit has a clock.
+    tsc::measure();
     // SAFETY: The caller runs this once, before anything else touches COM1's
     // eight ports, and the port moves into the BootInfo, so it is the only
     // user of those ports from here on.
@@ -415,7 +440,7 @@ fn framebuffer(mut fb: FrameBuffer) -> Option<Framebuffer<FramebufferPixels>> {
     // boot_info, which runs once, takes this FrameBuffer from the loader's
     // BootInfo and hands it to nothing else, and no kernel code reads or
     // writes the framebuffer's frames through the physical-memory mapping.
-    let [pixels, panic_pixels] =
+    let [pixels, panic_pixels, status_pixels] =
         unsafe { FramebufferPixels::new(fb.buffer_mut().as_mut_ptr_range())? };
     let framebuffer = |pixels| Framebuffer {
         pixels,
@@ -425,11 +450,18 @@ fn framebuffer(mut fb: FrameBuffer) -> Option<Framebuffer<FramebufferPixels>> {
         format,
     };
     *PANIC_FRAMEBUFFER.lock() = Some(framebuffer(panic_pixels));
+    *STATUS_FRAMEBUFFER.lock() = Some(framebuffer(status_pixels));
     Some(framebuffer(pixels))
 }
 
-/// The second framebuffer handle, until a panic takes it.
+/// The second framebuffer handle, until a panic takes it. A plain spin lock,
+/// not a ranked one: the panic path takes no checked lock.
 static PANIC_FRAMEBUFFER: spin::Mutex<Option<Framebuffer<FramebufferPixels>>> =
+    spin::Mutex::new(None);
+
+/// The third framebuffer handle, until the kernel takes it for the status
+/// cells. Taken once at boot, so a plain spin lock does.
+static STATUS_FRAMEBUFFER: spin::Mutex<Option<Framebuffer<FramebufferPixels>>> =
     spin::Mutex::new(None);
 
 /// Defines the kernel's entry point: `entry!(kmain, trap)` makes the boot

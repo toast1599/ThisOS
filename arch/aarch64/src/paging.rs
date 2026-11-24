@@ -11,9 +11,9 @@ use core::ptr;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use aarch64_cpu::registers::{ID_AA64MMFR1_EL1, TCR_EL1};
-use spin::Mutex;
 use thisos_frames::Frame;
 use thisos_hal::{MapError, MapErrorKind, Protection, Translation};
+use thisos_locks::{Lock, Rank};
 use thisos_regions::{InsertError, Regions};
 
 use crate::heap::{self, Heap};
@@ -81,6 +81,13 @@ mod cpu {
 
 #[cfg(test)]
 use tests::cpu;
+
+/// What the mappings lock runs on: this CPU, or in host tests a stand-in
+/// that gives each test thread a CPU slot of its own.
+#[cfg(not(test))]
+type LockPlatform = crate::Aarch64;
+#[cfg(test)]
+type LockPlatform = thisos_locks::host::Host;
 
 // Descriptor bits, for the 4 KiB granule.
 const VALID: u64 = 1 << 0;
@@ -1015,7 +1022,7 @@ impl thisos_hal::PageTables for KernelPageTables {
                 level_0,
             },
             kernel: self.tables.level_0,
-            mappings: Mutex::new(Regions::new()),
+            mappings: Lock::new(Rank::MAPPINGS, Regions::new()),
         })
     }
 
@@ -1034,7 +1041,7 @@ pub struct UserSpace<O> {
     /// Every page mapped in the lower half is in one of these, and maps a
     /// frame of its object. Map and unmap change the tables only while
     /// they hold this lock.
-    mappings: Mutex<Regions<O>>,
+    mappings: Lock<Regions<O>, LockPlatform>,
 }
 
 impl<O> UserSpace<O> {

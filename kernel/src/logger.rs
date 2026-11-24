@@ -9,20 +9,21 @@ use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use log::{Level, LevelFilter, Log, Metadata, Record};
-use spin::Mutex;
 use thisos_abi::{Error, MAX_WRITE};
 use thisos_console::{Color, Console};
 use thisos_hal::{Cpu, Framebuffer, Platform};
+use thisos_locks::Rank;
 use thisos_logring::{HEADER, Line, Piece, Ring};
 
-use crate::{Arch, thread};
+use crate::Lock;
+use crate::{Arch, cpu, status, thread};
 
 type Serial = <Arch as Platform>::Serial;
 type Pixels = <Arch as Platform>::Pixels;
 
 struct Logger {
     // One lock for both, so that records reach them in the same order.
-    sinks: Mutex<Sinks>,
+    sinks: Lock<Sinks>,
 }
 
 struct Sinks {
@@ -31,10 +32,13 @@ struct Sinks {
 }
 
 static LOGGER: Logger = Logger {
-    sinks: Mutex::new(Sinks {
-        serial: None,
-        console: Console::new(),
-    }),
+    sinks: Lock::new(
+        Rank::SINKS,
+        Sinks {
+            serial: None,
+            console: Console::new(),
+        },
+    ),
 };
 
 /// Whether `init` has given the logger its sinks.
@@ -44,7 +48,7 @@ static READY: AtomicBool = AtomicBool::new(false);
 /// handle and a console on a second framebuffer handle. The first panic
 /// that needs them sets them up. A static, because the console's grid is
 /// too large for the stack.
-static PANIC_SINKS: Mutex<Sinks> = Mutex::new(Sinks {
+static PANIC_SINKS: spin::Mutex<Sinks> = spin::Mutex::new(Sinks {
     serial: None,
     console: Console::new(),
 });
@@ -68,12 +72,12 @@ const LINE: usize = 512;
 
 /// The records the drainer hasn't drawn yet. Taken with interrupts off, so
 /// that an interrupt handler can log.
-static RING: Mutex<Ring<RING_SIZE>> = Mutex::new(Ring::new());
+static RING: Lock<Ring<RING_SIZE>> = Lock::new(Rank::RING, Ring::new());
 
 /// The threads whose user writes wait for room in the ring, by id, each
 /// with the room its write needs. Taken with interrupts on, and never by an
 /// interrupt handler.
-static WAITERS: Mutex<Vec<(u64, usize)>> = Mutex::new(Vec::new());
+static WAITERS: Lock<Vec<(u64, usize)>> = Lock::new(Rank::WAITERS, Vec::new());
 
 /// Whether the drainer runs, so that records go into the ring.
 static DRAINING: AtomicBool = AtomicBool::new(false);
@@ -93,11 +97,14 @@ fn with_sinks<R>(f: impl FnOnce(&mut Sinks) -> R) -> R {
 /// has none yet or its lock is held: then the panic came before
 /// `logger::init`, or from inside the logger, where the console may be half
 /// updated. Once a panic has used the panic sinks, every later report of
-/// that panic finds the logger's lock still held and uses them too.
+/// that panic finds the logger's lock still held and uses them too. Its
+/// locks stay off the held list, so the report never panics over a full
+/// one, and the panic sinks' is a plain spin lock, since only this takes
+/// it.
 fn report_sinks<R>(f: impl FnOnce(&mut Sinks) -> R) -> Option<R> {
     Arch::without_interrupts(|| {
         if READY.load(Ordering::Acquire)
-            && let Some(mut sinks) = LOGGER.sinks.try_lock()
+            && let Some(mut sinks) = LOGGER.sinks.try_lock_unlisted()
         {
             return Some(f(&mut sinks));
         }
@@ -114,10 +121,11 @@ fn report_sinks<R>(f: impl FnOnce(&mut Sinks) -> R) -> Option<R> {
 
 /// Installs the logger. Only `kernel::init` calls this, once.
 pub fn init(serial: Option<Serial>, framebuffer: Option<Framebuffer<Pixels>>) {
+    let top = Arch::status_framebuffer().map_or(0, status::init);
     with_sinks(|sinks| {
         sinks.serial = serial;
         if let Some(framebuffer) = framebuffer {
-            sinks.console.attach(framebuffer);
+            sinks.console.attach_below(framebuffer, top);
         }
     });
     READY.store(true, Ordering::Release);
@@ -198,7 +206,11 @@ pub fn write_user<D: fmt::Display>(lines: impl Iterator<Item = D> + Clone) -> Re
                 return false;
             }
             for line in lines.clone() {
-                ring.push(tag(Level::Info), &format_args!("{USER}{line}"));
+                ring.push(
+                    tag(Level::Info),
+                    cpu::id_byte(),
+                    &format_args!("{USER}{line}"),
+                );
             }
             true
         });
@@ -241,20 +253,21 @@ pub fn panic(head: fmt::Arguments, body: &dyn fmt::Display) {
         .target(env!("CARGO_CRATE_NAME"))
         .args(head)
         .build();
+    let cpu = cpu::id_byte();
     report_sinks(|sinks| {
         flush(sinks);
         let Sinks { serial, console } = sinks;
         if let Some(serial) = serial {
-            write_serial(serial, &record, body);
+            write_serial(serial, cpu, &record, body);
         }
-        write_console(console, &record, body);
+        write_console(console, cpu, &record, body);
     });
 }
 
 /// Draws what is left in the ring to `sinks`, unless the ring is locked:
 /// then the panic that called this came from code holding it.
 fn flush(sinks: &mut Sinks) {
-    let Some(mut ring) = RING.try_lock() else {
+    let Some(mut ring) = RING.try_lock_unlisted() else {
         return;
     };
     write_dropped(sinks, ring.take_dropped());
@@ -292,44 +305,48 @@ pub fn test_summary(full: &dyn fmt::Display, brief: &dyn fmt::Display, pass: boo
 
 // A record that fails to format has nowhere else to be reported, so this
 // and write_console drop the results of their writes.
-fn write_serial(serial: &mut Serial, record: &Record, body: &dyn fmt::Display) {
+fn write_serial(serial: &mut Serial, cpu: u8, record: &Record, body: &dyn fmt::Display) {
     let _ = write!(
         serial,
-        "{} {}: {}\n{body}",
+        "{cpu} {} {}: {}\n{body}",
         record.level(),
         record.target(),
         record.args()
     );
 }
 
-fn write_console(console: &mut Console<Pixels>, record: &Record, body: &dyn fmt::Display) {
+fn write_console(console: &mut Console<Pixels>, cpu: u8, record: &Record, body: &dyn fmt::Display) {
+    console.set_color(Color::Gray);
+    let _ = write!(console, "{cpu} ");
     console.set_color(color(record.level()));
     let _ = write!(console, "{}", record.level());
     console.set_color(Color::Gray);
     let _ = write!(console, " {}: {}\n{body}", record.target(), record.args());
 }
 
-/// Writes a piece of a record from the ring: the level first when the
-/// piece starts the record, and a newline when it ends it.
+/// Writes a piece of a record from the ring: the CPU and the level first
+/// when the piece starts the record, and a newline when it ends it.
 fn write_piece(Sinks { serial, console }: &mut Sinks, piece: &Piece) {
-    let level = piece.tag.map(level);
+    let start = piece.cpu.zip(piece.tag.map(level));
     if let Some(serial) = serial {
-        if let Some(level) = level {
-            let _ = write!(serial, "{level} ");
+        if let Some((cpu, level)) = start {
+            let _ = write!(serial, "{cpu} {level} ");
         }
         let _ = serial.write_str(piece.text());
         if piece.end {
             let _ = serial.write_char('\n');
         }
     }
-    if let Some(level) = level {
+    if let Some((cpu, level)) = start {
+        console.set_color(Color::Gray);
+        let _ = write!(console, "{cpu} ");
         console.set_color(color(level));
         let _ = write!(console, "{level}");
     }
     // On every piece, since a panic report may have changed the color
     // since the last one.
     console.set_color(Color::Gray);
-    if level.is_some() {
+    if start.is_some() {
         let _ = console.write_char(' ');
     }
     let _ = console.write_str(piece.text());
@@ -350,10 +367,11 @@ fn write_dropped(Sinks { serial, console }: &mut Sinks, dropped: u64) {
         .target(module_path!())
         .args(args)
         .build();
+    let cpu = cpu::id_byte();
     if let Some(serial) = serial {
-        write_serial(serial, &record, &"");
+        write_serial(serial, cpu, &record, &"");
     }
-    write_console(console, &record, &"");
+    write_console(console, cpu, &record, &"");
     #[cfg(test)]
     tests::DROPS_LOGGED.fetch_add(dropped, Ordering::Relaxed);
 }
@@ -404,11 +422,12 @@ impl Log for Logger {
             if DRAINING.load(Ordering::Acquire) {
                 return false;
             }
+            let cpu = cpu::id_byte();
             with_sinks(|Sinks { serial, console }| {
                 if let Some(serial) = serial {
-                    write_serial(serial, record, &"");
+                    write_serial(serial, cpu, record, &"");
                 }
-                write_console(console, record, &"");
+                write_console(console, cpu, record, &"");
             });
             true
         });
@@ -421,7 +440,7 @@ impl Log for Logger {
         let _ = write!(line, "{}: {}", record.target(), record.args());
         Arch::without_interrupts(|| {
             let mut ring = RING.lock();
-            if !ring.push(tag(record.level()), &line.as_str()) {
+            if !ring.push(tag(record.level()), cpu::id_byte(), &line.as_str()) {
                 ring.count_dropped();
             }
         });
@@ -442,7 +461,7 @@ pub(crate) mod tests {
 
     use super::{DRAINER, LINE, RING, USER, WAITERS, tag, wake_fitting, with_sinks};
     use crate::testing::{ExpectPanic, spin_until};
-    use crate::{Arch, thread};
+    use crate::{Arch, cpu, thread};
 
     /// Whether the drainer leaves the ring alone.
     pub(super) static PAUSED: AtomicBool = AtomicBool::new(false);
@@ -482,7 +501,7 @@ pub(crate) mod tests {
             let mut ring = RING.lock();
             // Below a header's size nothing fits already.
             if let Some(rest) = ring.room().checked_sub(HEADER) {
-                assert!(ring.push(tag(Level::Info), &format_args!("{:rest$}", "")));
+                assert!(ring.push(tag(Level::Info), 0, &format_args!("{:rest$}", "")));
             }
         });
         log::info!("dropped");
@@ -495,6 +514,26 @@ pub(crate) mod tests {
             let mut ring = RING.lock();
             while ring.pop().is_some() {}
         });
+    }
+
+    #[test_case]
+    fn records_carry_the_cpu_they_were_logged_on() {
+        pause();
+        log::info!("logged on this CPU");
+        let start = Arch::without_interrupts(|| {
+            let mut ring = RING.lock();
+            let start = ring.pop();
+            while ring.pop().is_some_and(|piece| !piece.end) {}
+            start
+        });
+        resume();
+        let Some(start) = start else {
+            panic!("the record didn't go in the ring");
+        };
+        assert_eq!(
+            (start.tag, start.cpu),
+            (Some(tag(Level::Info)), Some(cpu::id_byte()))
+        );
     }
 
     /// How many threads wait for room in the ring.
@@ -523,7 +562,7 @@ pub(crate) mod tests {
                 } else {
                     fill - HEADER
                 };
-                assert!(ring.push(tag(Level::Info), &format_args!("{:len$}", "")));
+                assert!(ring.push(tag(Level::Info), 0, &format_args!("{:len$}", "")));
                 fill -= HEADER + len;
             }
         });

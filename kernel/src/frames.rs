@@ -6,11 +6,12 @@
 #[cfg(test)]
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use spin::Mutex;
 use thisos_frames::{Frame, Frames};
 use thisos_hal::{MemoryKind, Platform};
+use thisos_locks::Rank;
 
 use crate::Arch;
+use crate::Lock;
 
 type MemoryMap = <Arch as Platform>::MemoryMap;
 
@@ -18,10 +19,10 @@ type MemoryMap = <Arch as Platform>::MemoryMap;
 /// a word. That is a 2 MiB bitmap.
 const WORDS: usize = (64 << 30) / 4096 / 64;
 
-static FRAMES: Mutex<Frames<WORDS>> = Mutex::new(Frames::new());
+static FRAMES: Lock<Frames<WORDS>> = Lock::new(Rank::FRAMES, Frames::new());
 
 /// The memory map, for reading it again after `init`.
-static MEMORY: Mutex<Option<MemoryMap>> = Mutex::new(None);
+static MEMORY: Lock<Option<MemoryMap>> = Lock::new(Rank::MEMORY, None);
 
 /// The free frames right after `init`, before the page tables took some.
 #[cfg(test)]
@@ -84,7 +85,8 @@ mod tests {
 
     const BATCH: usize = 4096;
 
-    static HELD: Mutex<[Option<Frame>; BATCH]> = Mutex::new([const { None }; BATCH]);
+    static HELD: Lock<[Option<Frame>; BATCH]> =
+        Lock::new(Rank::TEST_OUTER, [const { None }; BATCH]);
 
     #[test_case]
     fn seeded_frames_match_the_memory_map() {

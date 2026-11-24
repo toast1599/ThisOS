@@ -6,7 +6,6 @@ use alloc::vec::Vec;
 use core::ops::Range;
 use core::{fmt, str};
 
-use spin::Mutex;
 use thisos_abi::{
     Error, MAX_MESSAGE_BYTES, MAX_MESSAGE_HANDLES, MAX_WAIT_ITEMS, MAX_WRITE, Rights, Signals,
     Syscall, WAIT_ITEM_SIZE,
@@ -16,7 +15,9 @@ use thisos_elf::Elf;
 use thisos_hal::{
     AddressSpace as _, Cpu, MapErrorKind, Platform, Protection, Trap, TrapFrame as _,
 };
+use thisos_locks::Rank;
 
+use crate::Lock;
 use crate::channel::{self, ENDPOINT_RIGHTS, Endpoint};
 use crate::memory::{Mapping, MemoryObject};
 use crate::paging::Space;
@@ -35,10 +36,13 @@ const RAMDISK_RIGHTS: Rights = Rights::READ
 /// The records the last write syscall logged, joined by newlines, for
 /// tests. Taken with interrupts off.
 #[cfg(test)]
-static WRITTEN: Mutex<Written> = Mutex::new(Written {
-    bytes: [0; WRITTEN_SIZE],
-    len: 0,
-});
+static WRITTEN: Lock<Written> = Lock::new(
+    Rank::TEST_OUTER,
+    Written {
+        bytes: [0; WRITTEN_SIZE],
+        len: 0,
+    },
+);
 
 /// Escapes make a record up to six bytes per byte of text, as `\u{1b}`.
 #[cfg(test)]
@@ -70,7 +74,7 @@ struct Ramdisk {
     object: Arc<MemoryObject>,
 }
 
-static RAMDISK: Mutex<Option<Ramdisk>> = Mutex::new(None);
+static RAMDISK: Lock<Option<Ramdisk>> = Lock::new(Rank::RAMDISK, None);
 
 /// Logs the size of the loader's ramdisk, copies it into a memory object,
 /// and keeps both for [`start_init`]. Panics if there is no memory for the

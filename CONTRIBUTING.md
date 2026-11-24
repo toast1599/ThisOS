@@ -99,7 +99,7 @@ Values:
 
 Concurrency, handlers and escape hatches:
 
-- **A lock shared with a handler.** A trap or interrupt handler never takes a lock that ordinary code holds while traps or interrupts can arrive, because the handler then spins forever. The panic path's `try_lock` is how the trap report avoids it, and the logger holds its ring's and its sinks' locks only with interrupts off, so that interrupt handlers can log. Logging unparks the logger's drainer, which takes the scheduler's lock, so nothing logs while holding that lock. Caught in review.
+- **A lock shared with a handler.** A trap or interrupt handler never takes a lock that ordinary code holds while traps or interrupts can arrive, because the handler then spins forever. The panic path's `try_lock_unlisted` is how the trap report avoids it, and the logger holds its ring's and its sinks' locks only with interrupts off, so that interrupt handlers can log. Logging unparks the logger's drainer, which takes the scheduler's lock, so nothing logs while holding that lock. Caught in review, and in debug builds by the ranks (Locks).
 - **`unsafe impl Send` or `Sync` on a type that doesn't encode the invariant.** Only a type that wraps one resource and says in its SAFETY comment why sharing or moving it is sound, like `Once`, the IST `Stack` and `FramebufferPixels`; never a plain data struct, to get it into a static. Caught in review.
 - **`#[allow]`.** Silence a lint with `#[expect(lint, reason = "...")]`, so that an exception nobody needs any more fails the build. Caught by `clippy::allow_attributes` and `clippy::allow_attributes_without_reason`.
 - **Unsafe attributes outside the arch crates**: `no_mangle`, `export_name`, `link_section`. They appear only in the arch crates and `thisos-rt`, or in their macros' expansions. Caught by `forbid(unsafe_code)`, which counts them as unsafe code, except inside other crates' macro expansions, as described above.
@@ -107,6 +107,17 @@ Concurrency, handlers and escape hatches:
 Formatting:
 
 - **Comment lines over 80 columns.** A line that holds only a `//`, `///` or `//!` comment fits in 80 columns, indentation included; rustfmt doesn't wrap comments, so reflow the paragraph by hand when an edit lengthens it. Caught by the xtask check.
+
+## Locks
+
+Every lock in the kernel, and each user space's mappings lock in the arch crates, is a `thisos_locks::Lock`, which the kernel names `Lock<T>`. Four stay plain `spin::Mutex`es, each with its reason at the definition: talc's heap lock, which talc owns, the panic framebuffer handle and the panic sinks, which only the panic path takes, and the status framebuffer handle, taken once at boot.
+
+- Every lock has a `Rank` from the table in `lib/locks`, and `lock()` takes it only when its rank is above every lock the thread holds. Debug and test builds panic otherwise, naming both. A new lock gets a rank between the locks taken around it, and two locks that nest need different ranks.
+- Locks that a trap or interrupt handler takes (the scheduler, the log's sinks and ring, a process's end) rank above every lock taken with interrupts on, since the handler can arrive while any of those is held.
+- `try_lock()` skips the rank check, since it can't wait, but its lock goes on the held list like any other.
+- A thread holds at most 8 locks, and a ninth panics.
+- `try_lock_unlisted()` is for the panic path and the test harness's handlers alone. It leaves the held list and the holder record alone, so a report never panics over them.
+- Spinning more than 1 s panics in every build, naming the lock, the spinning CPU and thread, and the holder.
 
 ## Lints
 

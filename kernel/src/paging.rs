@@ -7,12 +7,13 @@ use core::ops::{Deref, Range};
 #[cfg(test)]
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use spin::Mutex;
 use thisos_frames::Frame;
 #[cfg(test)]
 use thisos_hal::Translation;
 use thisos_hal::{AddressSpace as _, MapError, PageTables as _, Platform};
+use thisos_locks::Rank;
 
+use crate::Lock;
 use crate::memory::Mapping;
 use crate::{Arch, frames};
 
@@ -20,7 +21,7 @@ type PageTables = <Arch as Platform>::PageTables;
 /// A user address space, whose mappings hold memory objects.
 pub type AddressSpace = <PageTables as thisos_hal::PageTables>::AddressSpace<Mapping>;
 
-static PAGE_TABLES: Mutex<Option<Kernel>> = Mutex::new(None);
+static PAGE_TABLES: Lock<Option<Kernel>> = Lock::new(Rank::PAGE_TABLES, None);
 
 /// The kernel's page tables.
 struct Kernel {

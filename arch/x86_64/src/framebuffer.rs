@@ -10,7 +10,7 @@ use x86_64::VirtAddr;
 
 /// The framebuffer's pixels. Only `new` makes one, so `base` is aligned
 /// and the `len` pixels from it are the framebuffer, mapped for the rest of
-/// the kernel's life and reached through nothing but the two handles `new`
+/// the kernel's life and reached through nothing but the handles `new`
 /// makes. It points at pixel pairs, which have the strictest alignment of
 /// the stores.
 #[derive(Debug)]
@@ -19,23 +19,29 @@ pub struct FramebufferPixels {
     len: usize,
 }
 
-// SAFETY: The pixels are reached only through this value and the one other
-// handle `new` makes, through volatile stores alone, so moving either to
-// another thread moves no reference with it.
+// SAFETY: The pixels are reached only through the handles `new` makes,
+// through volatile stores alone, so moving one to another thread moves no
+// reference with it.
 unsafe impl Send for FramebufferPixels {}
 
+// SAFETY: A shared handle only stores, with volatile stores of whole pixels
+// or aligned pixel pairs, and never reads, so stores from several threads
+// interleave pixels but never tear one or make a reference to the memory.
+unsafe impl Sync for FramebufferPixels {}
+
 impl FramebufferPixels {
-    /// Two handles to the pixels in `range`: one for the kernel's console
-    /// and one for a panic that can't use it. `None` when the range doesn't
-    /// start 8-byte aligned, which pair stores need. Both only store, so
-    /// two of them interleave pixels but never break each other's stores.
+    /// Three handles to the pixels in `range`: one for the kernel's
+    /// console, one for a panic that can't use it and one for the CPUs'
+    /// status cells. `None` when the range doesn't
+    /// start 8-byte aligned, which pair stores need. All only store, so
+    /// they interleave pixels but never break each other's stores.
     ///
     /// # Safety
     ///
     /// `range` is the framebuffer, mapped for the rest of the kernel's life,
     /// and nothing else in the kernel reads or writes it, through this
     /// mapping or any other. Call this at most once.
-    pub unsafe fn new(range: Range<*mut u8>) -> Option<[Self; 2]> {
+    pub unsafe fn new(range: Range<*mut u8>) -> Option<[Self; 3]> {
         if range.start.addr() % 8 != 0 {
             return None;
         }
@@ -44,7 +50,7 @@ impl FramebufferPixels {
             base: range.start.cast(),
             len,
         };
-        Some([pixels(), pixels()])
+        Some([pixels(), pixels(), pixels()])
     }
 
     /// The pixels' virtual addresses.
@@ -59,15 +65,15 @@ impl Pixels for FramebufferPixels {
         self.len
     }
 
-    fn store(&mut self, index: usize, pixel: u32) {
+    fn store(&self, index: usize, pixel: u32) {
         assert!(
             index < self.len,
             "pixel {index} outside the framebuffer's {}",
             self.len
         );
         // SAFETY: index is in range, so the pixel is inside the framebuffer,
-        // which new's caller says is mapped and reached only through this,
-        // and 4-byte aligned, as base is.
+        // which new's caller says is mapped and reached only through new's
+        // handles, and 4-byte aligned, as base is.
         unsafe {
             self.base
                 .cast::<u32>()
@@ -76,7 +82,7 @@ impl Pixels for FramebufferPixels {
         }
     }
 
-    fn store_pair(&mut self, index: usize, pixels: u64) {
+    fn store_pair(&self, index: usize, pixels: u64) {
         assert!(
             index % 2 == 0 && index + 1 < self.len,
             "pixel pair {index} misaligned or outside the framebuffer's {}",

@@ -9,14 +9,15 @@ use core::fmt::{self, Write};
 use core::hint::spin_loop;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use spin::Mutex;
 use thisos_hal::{Cpu, PANIC_TEST_FILE, Platform, Probe, TestEnd, Trap, TrapFrame};
+use thisos_locks::Rank;
 
+use crate::Lock;
 use crate::{Arch, logger, panic, timer, user};
 
 /// The tests and the index of the one running, or of none once all passed,
 /// for the panic handler's summary. `None` until the tests start.
-static RUN: Mutex<Option<Run>> = Mutex::new(None);
+static RUN: Lock<Option<Run>> = Lock::new(Rank::TEST_RUN, None);
 
 #[derive(Clone, Copy)]
 struct Run {
@@ -39,7 +40,7 @@ static STARTED: AtomicUsize = AtomicUsize::new(0);
 const LIMIT: u64 = 10;
 
 /// What ends the probe the running test runs, set while it runs.
-static EXPECTED: Mutex<Option<Expectation>> = Mutex::new(None);
+static EXPECTED: Lock<Option<Expectation>> = Lock::new(Rank::TEST_EXPECTED, None);
 
 /// Whether the trap handler that stopped the last [`expect_timeout`]
 /// probe found user access blocked.
@@ -189,7 +190,8 @@ pub fn fail() -> ! {
 /// holds if it has one, and no tick arrives, which also makes it the last,
 /// and with failure otherwise.
 pub fn panicked(message: &dyn fmt::Display) -> ! {
-    let passed = RUN.try_lock().is_some_and(|mut run| {
+    // The panic path takes no checked lock: it must not panic again.
+    let passed = RUN.try_lock_unlisted().is_some_and(|mut run| {
         let Some(run) = run.as_mut() else {
             return false;
         };
@@ -322,9 +324,10 @@ fn catch(expectation: Expectation, probe: Probe) {
 /// Abandons the running probe when `trap` is what its test expects, and
 /// returns whether it did. The kernel's trap handler calls this first.
 /// Through `try_lock`, because a timer interrupt can come while `catch`
-/// holds the lock; no probe runs then.
+/// holds the lock; no probe runs then. Unlisted, since a handler's try
+/// must not panic over the interrupted code's held list.
 pub(crate) fn caught(trap: Trap, frame: &mut <Arch as Platform>::TrapFrame) -> bool {
-    let Some(expected) = EXPECTED.try_lock().and_then(|expected| *expected) else {
+    let Some(expected) = EXPECTED.try_lock_unlisted().and_then(|expected| *expected) else {
         return false;
     };
     let matches = match expected {
@@ -354,16 +357,17 @@ pub(crate) fn watchdog(frame: &<Arch as Platform>::TrapFrame) {
 
 /// The running test, if it has run past the watchdog's limit. Through
 /// `try_lock`, because it runs in the timer's handler, which may interrupt
-/// `run` holding the lock; that tick then doesn't check.
+/// `run` holding the lock; that tick then doesn't check. Unlisted, as in
+/// `caught`.
 fn overdue() -> Option<&'static dyn Test> {
-    let run = (*RUN.try_lock()?)?;
+    let run = (*RUN.try_lock_unlisted()?)?;
     let test = *run.tests.get(run.current)?;
     let limit = LIMIT * u64::from(timer::HZ);
     (timer::ticks() - run.started >= limit).then_some(test)
 }
 
 fn finish(pass: bool) -> ! {
-    if let Some(run) = RUN.try_lock().map(|run| *run) {
+    if let Some(run) = RUN.try_lock_unlisted().map(|run| *run) {
         if let Some(test) = run
             .and_then(|run| run.tests.get(run.current))
             .filter(|_| !pass)

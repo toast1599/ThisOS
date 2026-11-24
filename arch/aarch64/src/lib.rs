@@ -156,6 +156,26 @@ impl Cpu for Aarch64 {
 }
 
 #[cfg(not(test))]
+impl thisos_locks::Platform for Aarch64 {
+    // aarch64 stays on one CPU (ADR 0006).
+    fn cpu() -> usize {
+        0
+    }
+
+    fn counter() -> u64 {
+        timer::count()
+    }
+
+    fn counter_hz() -> Option<u64> {
+        timer::count_hz()
+    }
+
+    fn masked<R>(f: impl FnOnce() -> R) -> R {
+        <Self as Cpu>::without_interrupts(f)
+    }
+}
+
+#[cfg(not(test))]
 impl Platform for Aarch64 {
     type Serial = NoSerial;
     type Pixels = FramebufferPixels;
@@ -222,6 +242,10 @@ impl Platform for Aarch64 {
 
     fn panic_framebuffer() -> Option<Framebuffer<FramebufferPixels>> {
         boot::PANIC_FRAMEBUFFER.try_lock()?.take()
+    }
+
+    fn status_framebuffer() -> Option<Framebuffer<FramebufferPixels>> {
+        boot::STATUS_FRAMEBUFFER.lock().take()
     }
 
     fn heap_stats() -> HeapStats {

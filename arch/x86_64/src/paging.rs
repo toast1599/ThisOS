@@ -8,9 +8,9 @@ use core::ops::{Deref, Range};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::{ptr, slice};
 
-use spin::Mutex;
 use thisos_frames::Frame;
 use thisos_hal::{MapError, MapErrorKind, Protection, Translation};
+use thisos_locks::{Lock, Rank};
 use thisos_regions::{InsertError, Regions};
 use x86_64::VirtAddr;
 use x86_64::registers::control::{Cr4, Cr4Flags};
@@ -79,6 +79,13 @@ mod cpu {
 
 #[cfg(test)]
 use tests::cpu;
+
+/// What the mappings lock runs on: this CPU, or in host tests a stand-in
+/// that gives each test thread a CPU slot of its own.
+#[cfg(not(test))]
+type LockPlatform = crate::X86_64;
+#[cfg(test)]
+type LockPlatform = thisos_locks::host::Host;
 
 /// The page tables at `level_4`. Whoever makes one is the only user of the
 /// tables while it lives, apart from the CPU's page walker, and apart from
@@ -774,7 +781,7 @@ impl thisos_hal::PageTables for KernelPageTables {
                 level_4,
             },
             kernel: self.tables.level_4,
-            mappings: Mutex::new(Regions::new()),
+            mappings: Lock::new(Rank::MAPPINGS, Regions::new()),
         })
     }
 
@@ -793,7 +800,7 @@ pub struct UserSpace<O> {
     /// Every page mapped in the lower half is in one of these, and maps a
     /// frame of its object. Map and unmap change the tables only while
     /// they hold this lock.
-    mappings: Mutex<Regions<O>>,
+    mappings: Lock<Regions<O>, LockPlatform>,
 }
 
 impl<O: Deref<Target = [Frame]> + Send + Sync> thisos_hal::AddressSpace<O> for UserSpace<O> {

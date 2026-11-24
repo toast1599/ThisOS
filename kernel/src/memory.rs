@@ -8,19 +8,20 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ops::Deref;
 
-use spin::Mutex;
 use thisos_abi::Error;
 use thisos_frames::Frame;
 use thisos_hal::{Cpu, Platform, Protection};
+use thisos_locks::Rank;
 use thisos_regions::Uses;
 
+use crate::Lock;
 use crate::{Arch, frames};
 
 pub struct MemoryObject {
     frames: Vec<Frame>,
     /// Taken with interrupts on, and never by a trap handler: mapping and
     /// unmapping take it.
-    uses: Mutex<Uses>,
+    uses: Lock<Uses>,
 }
 
 impl MemoryObject {
@@ -29,7 +30,7 @@ impl MemoryObject {
     pub fn new(pages: usize) -> Result<Self, Error> {
         let mut object = Self {
             frames: Vec::new(),
-            uses: Mutex::new(Uses::default()),
+            uses: Lock::new(Rank::USES, Uses::default()),
         };
         object
             .frames
