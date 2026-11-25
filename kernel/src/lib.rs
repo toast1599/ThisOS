@@ -28,8 +28,14 @@ mod testing;
 mod thread;
 mod timer;
 mod trap;
+#[cfg_attr(
+    all(target_arch = "x86_64", not(test)),
+    expect(dead_code, reason = "the warm-reset spike runs in place of init")
+)]
 mod user;
 mod wait;
+#[cfg(all(target_arch = "x86_64", not(test)))]
+mod warm;
 
 use thisos_hal::BootInfo;
 #[cfg(test)]
@@ -82,6 +88,9 @@ fn init(boot: BootInfo<Arch>) {
         Some(hz) => log::info!("lock spins panic after 1 s of a {hz} Hz counter"),
         None => log::warn!("the counter's frequency is unknown, so lock spins have no limit"),
     }
+    // Before anything can take the experiment's blocks.
+    #[cfg(all(target_arch = "x86_64", not(test)))]
+    warm::check(boot.memory.clone());
     frames::init(boot.memory);
     paging::init();
     trap::init();
@@ -96,8 +105,13 @@ fn init(boot: BootInfo<Arch>) {
 /// The kernel binary's main function.
 pub fn kmain(boot: BootInfo<Arch>) -> ! {
     init(boot);
-    user::start_init();
-    thread::exit()
+    #[cfg(all(target_arch = "x86_64", not(test)))]
+    warm::act();
+    #[cfg(not(all(target_arch = "x86_64", not(test))))]
+    {
+        user::start_init();
+        thread::exit()
+    }
 }
 
 #[cfg(test)]

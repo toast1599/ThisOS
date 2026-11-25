@@ -25,6 +25,7 @@ mod pit;
 mod trap;
 mod tsc;
 mod user;
+pub mod warm;
 
 use core::arch::asm;
 use core::fmt;
