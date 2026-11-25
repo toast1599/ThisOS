@@ -98,6 +98,10 @@ name = "thisos-abi"
 version = "0.0.0"
 
 [[package]]
+name = "thisos-acpi"
+version = "0.0.0"
+
+[[package]]
 name = "thisos-arch-aarch64"
 version = "0.0.0"
 dependencies = [
@@ -121,6 +125,7 @@ dependencies = [
  "spin",
  "talc",
  "thisos-abi",
+ "thisos-acpi",
  "thisos-frames",
  "thisos-hal",
  "thisos-locks",

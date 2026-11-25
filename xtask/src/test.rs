@@ -11,9 +11,9 @@ use crate::cmd::{cargo, exec, on_host};
 use crate::root;
 
 /// The host tests of every `lib/*` crate, `thisos-abi`, `thisos-rt` and
-/// both arch crates, then the kernel's tests for `arch` in QEMU, a step
-/// each.
-pub fn steps(arch: Arch) -> Result<Vec<Step>> {
+/// both arch crates, then the kernel's tests for `arch` in QEMU on `cpus`
+/// CPUs, a step each.
+pub fn steps(arch: Arch, cpus: u32) -> Result<Vec<Step>> {
     let mut steps = Vec::new();
     for manifest in libs()? {
         steps.push(Step::new(
@@ -25,13 +25,15 @@ pub fn steps(arch: Arch) -> Result<Vec<Step>> {
             },
         ));
     }
-    steps.push(qemu_step(arch));
+    steps.push(qemu_step(arch, cpus));
     Ok(steps)
 }
 
-/// The kernel's tests for `arch` in QEMU, as a step.
-pub fn qemu_step(arch: Arch) -> Step {
-    Step::new(Name::grouped("QEMU tests", arch.name()), move || qemu(arch))
+/// The kernel's tests for `arch` in QEMU on `cpus` CPUs, as a step.
+pub fn qemu_step(arch: Arch, cpus: u32) -> Step {
+    Step::new(Name::grouped("QEMU tests", arch.name()), move || {
+        qemu(arch, cpus)
+    })
 }
 
 /// `lib/console` for `lib/console/Cargo.toml`, as step names show a crate.
@@ -43,8 +45,8 @@ pub fn crate_dir(manifest: &Path) -> String {
         .to_string()
 }
 
-/// Runs the kernel's tests for `arch` in QEMU.
-fn qemu(arch: Arch) -> Result<()> {
+/// Runs the kernel's tests for `arch` in QEMU on `cpus` CPUs.
+fn qemu(arch: Arch, cpus: u32) -> Result<()> {
     // Set here rather than in .cargo/config.toml: cargo starts the runner in
     // kernel/, where the xtask alias's relative manifest path doesn't resolve.
     let xtask = std::env::current_exe().context("finding the xtask executable")?;
@@ -57,7 +59,7 @@ fn qemu(arch: Arch) -> Result<()> {
         "CARGO_TARGET_{}_RUNNER",
         arch.target().to_uppercase().replace('-', "_")
     );
-    let mut command = format!("{xtask} qemu-test --arch {}", arch.name());
+    let mut command = format!("{xtask} qemu-test --arch {} --cpus {cpus}", arch.name());
     if let Some(ramdisk) = arch.ramdisk(false)? {
         let ramdisk = ramdisk.to_str().context("the ramdisk path isn't UTF-8")?;
         ensure!(

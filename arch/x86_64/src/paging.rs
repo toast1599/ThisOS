@@ -509,6 +509,60 @@ pub fn activate_kernel() {
     unsafe { load(level_4) };
 }
 
+/// The kernel's level 4 table. Panics before `take`.
+pub fn kernel_level_4() -> u64 {
+    let Some(&level_4) = KERNEL_LEVEL_4.get() else {
+        panic!("the kernel's page tables aren't taken yet");
+    };
+    level_4
+}
+
+/// Makes the frames at `level_4`, `level_3` and `level_2` the tables an AP
+/// turns paging on with: the kernel's upper half, and the low 2 MiB
+/// identity mapped by one page, where the AP's trampoline runs.
+///
+/// # Safety
+///
+/// `phys_offset` must be where the loader mapped all physical memory. The
+/// caller must hold the three frames, which no CPU may use as tables
+/// meanwhile.
+pub unsafe fn write_ap_tables(phys_offset: VirtAddr, level_4: u64, level_3: u64, level_2: u64) {
+    let tables = PageTables {
+        phys_offset,
+        level_4: kernel_level_4(),
+    };
+    for table in [level_4, level_3, level_2] {
+        for index in (0..512).map(PageTableIndex::new) {
+            // SAFETY: The caller holds the frame, which no CPU walks.
+            unsafe { tables.entry(table, index).store(0) };
+        }
+    }
+    for index in (UPPER_HALF..512).map(PageTableIndex::new) {
+        let value = tables.entry(tables.level_4, index).load();
+        // SAFETY: As above.
+        unsafe { tables.entry(level_4, index).store(value) };
+    }
+    let zero = PageTableIndex::new(0);
+    // SAFETY: As above.
+    unsafe {
+        tables
+            .entry(level_4, zero)
+            .store(level_3 | PRESENT | WRITABLE);
+    }
+    // SAFETY: As above.
+    unsafe {
+        tables
+            .entry(level_3, zero)
+            .store(level_2 | PRESENT | WRITABLE);
+    }
+    // SAFETY: As above.
+    unsafe {
+        tables
+            .entry(level_2, zero)
+            .store(PRESENT | WRITABLE | PS_OR_PAT);
+    }
+}
+
 /// Copies the loader's upper half into new tables made from `alloc`'s
 /// frames, switches to them, turns on global pages, SMEP and SMAP, and
 /// returns them. Returns `None` after the first call.

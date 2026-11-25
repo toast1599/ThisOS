@@ -108,9 +108,9 @@ pub fn steps() -> Result<Vec<Step>> {
         ])))
     }));
 
-    steps.extend(test::steps(Arch::X86_64)?);
+    steps.extend(test::steps(Arch::X86_64, 1)?);
     // The host tests just ran; aarch64 adds only its kernel's.
-    steps.push(test::qemu_step(Arch::Aarch64));
+    steps.push(test::qemu_step(Arch::Aarch64, 1));
     // cargo miri takes host-tuple as a target name and fails to build a
     // sysroot for it, so it gets the host's actual tuple.
     let host = output(Command::new("rustc").args(["--print", "host-tuple"]))?;

@@ -6,7 +6,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use ovmf_prebuilt::{FileType, Prebuilt, Source};
 use thisos_hal::{PANIC_TEST_FILE, TestEnd};
 use thisos_report as report;
@@ -41,11 +41,11 @@ pub fn steps() -> Vec<String> {
 
 /// Builds, then boots the image in QEMU with a window and serial on the
 /// terminal, in the steps [`steps`] names.
-pub fn run(arch: Arch, release: bool, gdb: bool) -> Result<()> {
+pub fn run(arch: Arch, release: bool, gdb: bool, cpus: u32) -> Result<()> {
     let image = build::build(arch, release, Kernel::Main)?;
     report::step("QEMU", || {
         let vars = build::target_dir()?.join(format!("ovmf-vars{}.fd", arch.suffix()));
-        let mut qemu = qemu(arch, &image.path, &vars)?;
+        let mut qemu = qemu(arch, &image.path, &vars, cpus)?;
         if gdb {
             qemu.args(["-s", "-S"]);
         }
@@ -58,8 +58,10 @@ pub fn run(arch: Arch, release: bool, gdb: bool) -> Result<()> {
 /// success before the timeout. A kernel test runs one panic-expecting test
 /// per boot, so while the kernel reports another to run, this boots it
 /// again with a copy of the ramdisk that names the next.
-pub fn test(arch: Arch, ramdisk: Option<&Path>, elf: &Path) -> Result<()> {
-    boot_all(elf, |panic_test| boot_test(arch, ramdisk, elf, panic_test))
+pub fn test(arch: Arch, ramdisk: Option<&Path>, cpus: u32, elf: &Path) -> Result<()> {
+    boot_all(elf, |panic_test| {
+        boot_test(arch, ramdisk, cpus, elf, panic_test)
+    })
 }
 
 /// Calls `boot` for panic-expecting test 0, 1 and so on while it returns
@@ -85,7 +87,13 @@ fn boot_all(elf: &Path, mut boot: impl FnMut(u32) -> Result<bool>) -> Result<()>
 
 /// Boots a kernel test ELF to run panic-expecting test `panic_test`, and
 /// returns whether the kernel reports another to run.
-fn boot_test(arch: Arch, ramdisk: Option<&Path>, elf: &Path, panic_test: u32) -> Result<bool> {
+fn boot_test(
+    arch: Arch,
+    ramdisk: Option<&Path>,
+    cpus: u32,
+    elf: &Path,
+    panic_test: u32,
+) -> Result<bool> {
     let ramdisk = match (ramdisk, panic_test) {
         (ramdisk, 0) => ramdisk.map(Path::to_path_buf),
         (Some(ramdisk), _) => {
@@ -111,7 +119,7 @@ fn boot_test(arch: Arch, ramdisk: Option<&Path>, elf: &Path, panic_test: u32) ->
     let image = with_extension(elf, "img");
     arch.write_image(elf, ramdisk.as_deref(), None, &image)?;
 
-    let mut qemu = qemu(arch, &image, &with_extension(elf, "vars.fd"))?;
+    let mut qemu = qemu(arch, &image, &with_extension(elf, "vars.fd"), cpus)?;
     qemu.args(["-display", "none"]);
     match arch {
         Arch::X86_64 => qemu.args(["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"]),
@@ -152,10 +160,15 @@ fn boot_test(arch: Arch, ramdisk: Option<&Path>, elf: &Path, panic_test: u32) ->
     }
 }
 
-/// A QEMU command that boots `image` under OVMF, with serial on standard
-/// output. The firmware writes its variables, so each boot starts from a
-/// fresh copy at `vars`.
-fn qemu(arch: Arch, image: &Path, vars: &Path) -> Result<Command> {
+/// A QEMU command that boots `image` under OVMF on `cpus` CPUs, with
+/// serial on standard output. The firmware writes its variables, so each
+/// boot starts from a fresh copy at `vars`.
+fn qemu(arch: Arch, image: &Path, vars: &Path, cpus: u32) -> Result<Command> {
+    ensure!(
+        cpus == 1 || arch == Arch::X86_64,
+        "{} runs on one CPU (ADR 0006)",
+        arch.name()
+    );
     let firmware = match arch {
         Arch::X86_64 => ovmf_prebuilt::Arch::X64,
         Arch::Aarch64 => ovmf_prebuilt::Arch::Aarch64,
@@ -191,7 +204,7 @@ fn qemu(arch: Arch, image: &Path, vars: &Path) -> Result<Command> {
             qemu
         }
     };
-    qemu.args(["-m", "512M", "-smp", "1"])
+    qemu.args(["-m", "512M", "-smp", &cpus.to_string()])
         .arg("-drive")
         .arg(format!(
             "if=pflash,format=raw,readonly=on,file={}",

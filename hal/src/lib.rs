@@ -452,6 +452,17 @@ pub trait Platform {
     /// or nothing gives its frequency.
     fn start_timer(hz: u32) -> TimerFrequency;
 
+    /// Starts every other CPU the firmware lists as ready, one at a time,
+    /// each on a stack from `stack`, which it calls with the size in bytes
+    /// and keeps for good. A started CPU parks with interrupts off. Tells
+    /// `report` what happens as it goes, so that the caller can log each
+    /// step before the next wait. Returns how many CPUs run, the caller's
+    /// included. Call it once, after [`Platform::start_timer`].
+    fn start_cpus(
+        stack: &mut dyn FnMut(usize) -> Stack<Self>,
+        report: &mut dyn FnMut(CpuStart),
+    ) -> usize;
+
     /// The timer's frequency from each source the architecture has: the
     /// one the CPU reports, and one measured again against another clock,
     /// with the timer stopped meanwhile. For tests.
@@ -674,6 +685,49 @@ pub struct HeapStats {
     /// Bytes [`PageTables::grow_heap`] has given the heap, less what
     /// alignment cost.
     pub claimed: usize,
+}
+
+/// A step of [`Platform::start_cpus`]. A CPU's `id` is its hardware ID:
+/// its APIC ID on x86_64.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CpuStart {
+    /// The firmware lists a CPU that is off but may be started, which is
+    /// for hot-adding; it stays off.
+    Skipped {
+        /// The CPU's ID.
+        id: u32,
+    },
+    /// The firmware lists `listed` CPUs ready to start besides the caller,
+    /// and each gets up to `timeout_ms` to check in.
+    Starting {
+        /// How many there are.
+        listed: usize,
+        /// How long each may take, in milliseconds.
+        timeout_ms: u32,
+    },
+    /// CPU number `cpu` checked in and parked.
+    Up {
+        /// Its index among the running CPUs.
+        cpu: usize,
+        /// The ID the firmware lists.
+        id: u32,
+        /// The ID the CPU itself read.
+        reported: u32,
+        /// How long it took from the first signal, in microseconds.
+        micros: u64,
+    },
+    /// The CPU didn't check in, and was stopped.
+    Silent {
+        /// Its ID.
+        id: u32,
+    },
+    /// A CPU trapped on `vector` while CPU `id` was starting, and halted.
+    Trapped {
+        /// The ID of the CPU being started.
+        id: u32,
+        /// The trap's vector.
+        vector: u8,
+    },
 }
 
 /// How fast the timer counts, as [`Platform::start_timer`] found it.

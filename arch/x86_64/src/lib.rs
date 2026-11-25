@@ -22,6 +22,7 @@ mod paging;
 mod pat;
 mod pic;
 mod pit;
+mod smp;
 mod trap;
 mod tsc;
 mod user;
@@ -37,8 +38,8 @@ use bootloader_api::info::{FrameBuffer, PixelFormat};
 use once::Once;
 use thisos_frames::Frame;
 use thisos_hal::{
-    BacktraceEnd, BootInfo, Cpu, Framebuffer, HeapStats, Platform, Probe, Serial, Stack, TestEnd,
-    TimerFrequencies, TimerFrequency, Translation, TrapHandler, UserProgram,
+    BacktraceEnd, BootInfo, Cpu, CpuStart, Framebuffer, HeapStats, Platform, Probe, Serial, Stack,
+    TestEnd, TimerFrequencies, TimerFrequency, Translation, TrapHandler, UserProgram,
 };
 use uart_16550::backend::PioBackend;
 use uart_16550::{BaudRate, Config, Uart16550Tty};
@@ -186,6 +187,13 @@ impl Platform for X86_64 {
 
     fn start_timer(hz: u32) -> TimerFrequency {
         apic::start(hz)
+    }
+
+    fn start_cpus(
+        stack: &mut dyn FnMut(usize) -> Stack<Self>,
+        report: &mut dyn FnMut(CpuStart),
+    ) -> usize {
+        smp::start(stack, report)
     }
 
     fn timer_frequencies() -> TimerFrequencies {
@@ -398,6 +406,7 @@ pub unsafe fn boot_info(
     // Nothing writes the loader's structure after this, so the rest is
     // read through a shared reference.
     let boot: &'static bootloader_api::BootInfo = boot;
+    smp::record(&boot.memory_regions, boot.rsdp_addr.into_option());
     BootInfo {
         serial,
         framebuffer,

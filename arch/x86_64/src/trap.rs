@@ -547,33 +547,10 @@ pub unsafe fn init(handler: TrapHandler<X86_64>) {
     // x86_64 crate keeps each entry in an atomic, so that write doesn't
     // break the shared reference's rules.
     let gdt = GDT.init(gdt);
-    gdt.load();
-    // SAFETY: code selects the 64-bit kernel code segment of the GDT just
-    // loaded, which is what the kernel already runs as, only in the
-    // loader's GDT.
+    // SAFETY: The caller runs this before anything uses the segment
+    // registers.
     unsafe {
-        CS::set_reg(code);
-    }
-    // SAFETY: Ring 0 may run with a null SS in 64-bit mode. The loader's
-    // selector would index this GDT, where it may name the TSS, and iretq
-    // reloads SS from the trap frame.
-    unsafe {
-        SS::set_reg(SegmentSelector::NULL);
-    }
-    // The loader's selectors in these index this GDT too, and name whatever
-    // its layout puts there.
-    // SAFETY: 64-bit mode ignores DS and ES, and nothing in the kernel
-    // addresses memory through FS or GS, so a null selector in each changes
-    // nothing the kernel relies on.
-    unsafe {
-        asm!(
-            "mov ds, {0:e}",
-            "mov es, {0:e}",
-            "mov fs, {0:e}",
-            "mov gs, {0:e}",
-            in(reg) 0u32,
-            options(nostack, preserves_flags),
-        );
+        load_gdt(gdt, code);
     }
     // SAFETY: tss_selector selects the TSS descriptor of the GDT just
     // loaded, for a TSS that lives for the rest of the kernel's life.
@@ -652,6 +629,59 @@ pub unsafe fn init(handler: TrapHandler<X86_64>) {
         install(&mut idt[vector], vector);
     }
     IDT.init(idt).load();
+}
+
+/// Loads `gdt` and the segment registers, with `code` in CS.
+///
+/// # Safety
+///
+/// `code` must select the 64-bit kernel code segment of `gdt`, and nothing
+/// may rely on the segment registers' old values.
+unsafe fn load_gdt(gdt: &'static GlobalDescriptorTable, code: SegmentSelector) {
+    gdt.load();
+    // SAFETY: The caller guarantees code, which is what the kernel already
+    // runs as, maybe in another GDT.
+    unsafe {
+        CS::set_reg(code);
+    }
+    // SAFETY: Ring 0 may run with a null SS in 64-bit mode. The loader's
+    // selector would index this GDT, where it may name the TSS, and iretq
+    // reloads SS from the trap frame.
+    unsafe {
+        SS::set_reg(SegmentSelector::NULL);
+    }
+    // Old selectors in these index this GDT too, and name whatever its
+    // layout puts there.
+    // SAFETY: 64-bit mode ignores DS and ES, and nothing in the kernel
+    // addresses memory through FS or GS, so a null selector in each changes
+    // nothing the kernel relies on.
+    unsafe {
+        asm!(
+            "mov ds, {0:e}",
+            "mov es, {0:e}",
+            "mov fs, {0:e}",
+            "mov gs, {0:e}",
+            in(reg) 0u32,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+/// Loads the kernel's GDT and its segments on an AP, but not the TSS,
+/// which is already busy on the BSP.
+///
+/// # Safety
+///
+/// Call it on an AP before anything there uses the segment registers.
+pub unsafe fn load_gdt_on_ap() {
+    let Some(gdt) = GDT.get() else {
+        panic!("an AP started before the GDT was built");
+    };
+    // SAFETY: init asserted that KERNEL_CODE selects the GDT's code
+    // segment; the caller guarantees the rest.
+    unsafe {
+        load_gdt(gdt, SegmentSelector(KERNEL_CODE));
+    }
 }
 
 /// Points `entry`, the IDT entry for `vector`, at that vector's stub.

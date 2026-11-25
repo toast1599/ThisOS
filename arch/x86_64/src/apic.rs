@@ -2,6 +2,7 @@
 //! registers through MSRs, so it needs no MMIO mapping, and it works
 //! whether the firmware left the APIC in xAPIC or in x2APIC mode.
 
+use core::arch::asm;
 use core::hint::spin_loop;
 use thisos_hal::{TimerFrequencies, TimerFrequency};
 
@@ -23,9 +24,11 @@ const ENABLED: u64 = 1 << 11;
 const X2APIC_MODE: u64 = 1 << 10;
 
 // Each x2APIC register is MSR 0x800 plus its xAPIC offset divided by 16.
+const ID: u32 = 0x802;
 const TASK_PRIORITY: u32 = 0x808;
 const EOI: u32 = 0x80b;
 const SPURIOUS: u32 = 0x80f;
+const ICR: u32 = 0x830;
 const LVT_TIMER: u32 = 0x832;
 const INITIAL_COUNT: u32 = 0x838;
 const CURRENT_COUNT: u32 = 0x839;
@@ -35,6 +38,10 @@ const SOFTWARE_ENABLE: u64 = 1 << 8;
 const MASKED: u64 = 1 << 16;
 const PERIODIC: u64 = 1 << 17;
 const DIVIDE_BY_1: u64 = 0b1011;
+
+// The interrupt command register's delivery modes, with the level asserted.
+const INIT: u64 = 0x4500;
+const STARTUP: u64 = 0x4600;
 
 /// How long a measurement against the PIT counts: 50 ms.
 const PIT_TICKS: u16 = 59_659;
@@ -219,4 +226,51 @@ pub fn eoi() {
     if let Some(apic) = APIC.get() {
         apic.write(EOI, 0);
     }
+}
+
+/// This CPU's APIC ID. Panics before [`start`].
+pub fn id() -> u32 {
+    let Some(&apic) = APIC.get() else {
+        panic!("the APIC isn't enabled");
+    };
+    x2apic_id(apic)
+}
+
+fn x2apic_id(apic: X2Apic) -> u32 {
+    let Ok(id) = u32::try_from(apic.read(ID)) else {
+        unreachable!("the x2APIC ID register is 32 bits");
+    };
+    id
+}
+
+/// Puts an AP's APIC in x2APIC mode as [`start`] does the BSP's, timer
+/// masked, and returns the AP's APIC ID.
+pub fn enable_on_ap() -> u32 {
+    x2apic_id(X2Apic::enable())
+}
+
+/// Sends INIT to the CPU with APIC ID `id`, which resets it to wait for
+/// a startup IPI. Panics before [`start`].
+pub fn send_init(id: u32) {
+    send(id, INIT);
+}
+
+/// Sends a startup IPI to the CPU with APIC ID `id`, which starts it in
+/// real mode at physical address `page` * 4 KiB. Panics before [`start`].
+pub fn send_startup(id: u32, page: u8) {
+    send(id, STARTUP | u64::from(page));
+}
+
+fn send(id: u32, command: u64) {
+    let Some(&apic) = APIC.get() else {
+        panic!("the APIC isn't enabled");
+    };
+    // A write to the x2APIC's ICR doesn't wait for earlier stores, so the
+    // CPU it starts could miss what was written for it. The SDM's fence.
+    // SAFETY: mfence and lfence only order memory accesses and
+    // instructions; they change no state the kernel relies on.
+    unsafe {
+        asm!("mfence", "lfence", options(nostack, preserves_flags));
+    }
+    apic.write(ICR, u64::from(id) << 32 | command);
 }

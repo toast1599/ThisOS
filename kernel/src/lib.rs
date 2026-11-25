@@ -66,7 +66,8 @@ const BUILD: &str = match option_env!("THISOS_BUILD") {
 
 /// Starts logging to the devices in `boot`, and logs the build ID first.
 /// Ends by starting the timer, with interrupts on, then the logger's
-/// drainer. Every entry point calls this once, first.
+/// drainer, then the other CPUs, which park. Every entry point calls this
+/// once, first.
 fn init(boot: BootInfo<Arch>) {
     let has_framebuffer = boot.framebuffer.is_some();
     logger::init(boot.serial, boot.framebuffer);
@@ -91,6 +92,9 @@ fn init(boot: BootInfo<Arch>) {
     thread::init();
     timer::init();
     logger::start();
+    // After the drainer, so that each CPU's line shows before the next
+    // one's wait.
+    cpu::start();
 }
 
 /// The kernel binary's main function.

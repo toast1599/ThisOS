@@ -74,6 +74,9 @@ enum Command {
         /// Start QEMU's gdb stub on TCP port 1234, with the CPU paused.
         #[arg(long)]
         gdb: bool,
+        /// How many CPUs QEMU gives the machine; aarch64 runs on one.
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=64))]
+        cpus: u32,
     },
     /// Build, then write the image to a USB stick, verify it and power the
     /// stick off.
@@ -92,6 +95,9 @@ enum Command {
         /// The architecture to build for.
         #[arg(long, value_enum, default_value = "x86_64")]
         arch: Arch,
+        /// How many CPUs QEMU gives the machine; aarch64 runs on one.
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=64))]
+        cpus: u32,
     },
     /// Run locally everything CI runs.
     Ci,
@@ -114,6 +120,8 @@ enum Command {
         arch: Arch,
         #[arg(long)]
         ramdisk: Option<PathBuf>,
+        #[arg(long, default_value_t = 1)]
+        cpus: u32,
         elf: PathBuf,
     },
 }
@@ -141,8 +149,14 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     // The runner cargo starts for each kernel test binary: its output is
     // the output of the step that runs `cargo test`.
-    if let Command::QemuTest { arch, ramdisk, elf } = &cli.command {
-        return thisos_report::finish(&qemu::test(*arch, ramdisk.as_deref(), elf));
+    if let Command::QemuTest {
+        arch,
+        ramdisk,
+        cpus,
+        elf,
+    } = &cli.command
+    {
+        return thisos_report::finish(&qemu::test(*arch, ramdisk.as_deref(), *cpus, elf));
     }
     let mode = cli.output.map(|output| match output {
         Output::Interactive => Mode::Interactive,
@@ -175,9 +189,14 @@ fn run(command: Command) -> Result<()> {
             report::suspend(|| println!("{}\n{}", image.path.display(), image.id));
             Ok(())
         }
-        Command::Run { arch, release, gdb } => {
+        Command::Run {
+            arch,
+            release,
+            gdb,
+            cpus,
+        } => {
             report::start(&format!("run {}", arch.name()), names(qemu::steps()), &logs)?;
-            qemu::run(arch, release, gdb)
+            qemu::run(arch, release, gdb, cpus)
         }
         Command::Flash {
             release,
@@ -187,8 +206,8 @@ fn run(command: Command) -> Result<()> {
             report::start("flash", names(flash::STEPS), &logs)?;
             flash::flash(release, tests.kernel(), device.as_deref())
         }
-        Command::Test { arch } => {
-            let steps = test::steps(arch)?;
+        Command::Test { arch, cpus } => {
+            let steps = test::steps(arch, cpus)?;
             let plan = steps.iter().map(|step| step.name.clone()).collect();
             report::start(&format!("test {}", arch.name()), plan, &logs)?;
             report::all(steps)

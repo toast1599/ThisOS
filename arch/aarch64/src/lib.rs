@@ -61,8 +61,8 @@ use aarch64_cpu::registers::{DAIF, ReadWriteable, Readable, Writeable};
 use thisos_frames::Frame;
 #[cfg(not(test))]
 use thisos_hal::{
-    BacktraceEnd, Cpu, Framebuffer, HeapStats, Platform, Probe, Stack, TestEnd, TimerFrequencies,
-    TimerFrequency, Translation, UserProgram,
+    BacktraceEnd, Cpu, CpuStart, Framebuffer, HeapStats, Platform, Probe, Stack, TestEnd,
+    TimerFrequencies, TimerFrequency, Translation, UserProgram,
 };
 
 #[cfg(not(test))]
@@ -256,6 +256,15 @@ impl Platform for Aarch64 {
         let devices = devices::get();
         gic::init(boot::phys_offset(), &devices);
         timer::start(hz, devices.timer)
+    }
+
+    // aarch64 runs on one CPU until there is hardware to test SMP on
+    // (ADR 0006).
+    fn start_cpus(
+        _stack: &mut dyn FnMut(usize) -> Stack<Self>,
+        _report: &mut dyn FnMut(CpuStart),
+    ) -> usize {
+        1
     }
 
     // CNTFRQ_EL0 is all there is: QEMU's virt machine has no second clock
