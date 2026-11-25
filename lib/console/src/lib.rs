@@ -391,9 +391,10 @@ mod tests {
     extern crate std;
 
     use core::fmt::Write;
-    use core::sync::atomic::{AtomicU32, Ordering};
     use std::boxed::Box;
     use std::string::String;
+    use std::sync::Mutex;
+    use std::vec;
     use std::vec::Vec;
 
     use super::*;
@@ -403,31 +404,31 @@ mod tests {
     const HEIGHT: usize = 32;
 
     /// Framebuffer memory that panics on the stores the real one can't
-    /// take, so that the tests catch them.
+    /// take, so that the tests catch them. Behind one lock, not an atomic
+    /// per pixel, which made Miri take 20 minutes over these tests.
     #[derive(Debug)]
-    struct Memory(Vec<AtomicU32>);
+    struct Memory(Mutex<Vec<u32>>);
 
     impl Memory {
         fn filled(pixel: u32, len: usize) -> Self {
-            Self((0..len).map(|_| AtomicU32::new(pixel)).collect())
+            Self(Mutex::new(vec![pixel; len]))
         }
     }
 
     impl Pixels for Memory {
         fn len(&self) -> usize {
-            self.0.len()
+            self.0.lock().unwrap().len()
         }
 
         fn store(&self, index: usize, pixel: u32) {
-            self.0[index].store(pixel, Ordering::Relaxed);
+            self.0.lock().unwrap()[index] = pixel;
         }
 
         fn store_pair(&self, index: usize, pixels: u64) {
             assert!(index % 2 == 0, "pair stored at odd index {index}");
             let low = u32::try_from(pixels & 0xFFFF_FFFF).unwrap();
             let high = u32::try_from(pixels >> 32).unwrap();
-            self.0[index].store(low, Ordering::Relaxed);
-            self.0[index + 1].store(high, Ordering::Relaxed);
+            self.0.lock().unwrap()[index..index + 2].copy_from_slice(&[low, high]);
         }
     }
 
@@ -458,11 +459,16 @@ mod tests {
     }
 
     fn pixels(console: &Console<Memory>) -> Vec<u32> {
-        let memory = &console.screen.as_ref().unwrap().fb.pixels.0;
-        memory
-            .iter()
-            .map(|pixel| pixel.load(Ordering::Relaxed))
-            .collect()
+        console
+            .screen
+            .as_ref()
+            .unwrap()
+            .fb
+            .pixels
+            .0
+            .lock()
+            .unwrap()
+            .clone()
     }
 
     #[test]
