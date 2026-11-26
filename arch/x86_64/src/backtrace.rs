@@ -8,9 +8,11 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use thisos_hal::{BacktraceEnd, MAX_FRAMES};
 use x86_64::VirtAddr;
 
-// Zero until init, so a walk before then stops at its first frame.
-static STACK_START: AtomicU64 = AtomicU64::new(0);
-static STACK_END: AtomicU64 = AtomicU64::new(0);
+use crate::percpu;
+
+// The running thread's stack is in each CPU's block, zero until init or
+// until the CPU's first switch, so a walk before then stops at its first
+// frame.
 static IMAGE_OFFSET: AtomicU64 = AtomicU64::new(0);
 
 /// Records the boot stack's addresses and where the loader put the kernel
@@ -22,14 +24,16 @@ pub fn init(stack: Range<u64>, image_offset: u64) {
 
 /// The running thread's stack.
 pub fn stack() -> Range<u64> {
-    STACK_START.load(Ordering::Relaxed)..STACK_END.load(Ordering::Relaxed)
+    let block = percpu::this();
+    block.stack_start.load(Ordering::Relaxed)..block.stack_end.load(Ordering::Relaxed)
 }
 
 /// Makes `stack` the one walks stay inside and the guard page is under,
 /// for the thread a switch is about to run.
 pub fn set_stack(stack: Range<u64>) {
-    STACK_START.store(stack.start, Ordering::Relaxed);
-    STACK_END.store(stack.end, Ordering::Relaxed);
+    let block = percpu::this();
+    block.stack_start.store(stack.start, Ordering::Relaxed);
+    block.stack_end.store(stack.end, Ordering::Relaxed);
 }
 
 /// The link address of `address`, an address in the loaded kernel image.
@@ -41,7 +45,7 @@ pub fn link_address(address: u64) -> u64 {
 /// `map_stack` for the other threads, leave the page below it unmapped, as
 /// a guard page.
 pub fn stack_bottom() -> u64 {
-    STACK_START.load(Ordering::Relaxed)
+    percpu::this().stack_start.load(Ordering::Relaxed)
 }
 
 /// A frame pointer whose two words, the caller's rbp and the return
@@ -84,7 +88,7 @@ impl Frame {
 
 /// Walks the frames from `rbp` outwards; see `Cpu::backtrace`.
 pub fn walk(mut rbp: u64, mut f: impl FnMut(u64)) -> BacktraceEnd {
-    let stack = STACK_START.load(Ordering::Relaxed)..STACK_END.load(Ordering::Relaxed);
+    let stack = stack();
     for _ in 0..MAX_FRAMES {
         let frame = match Frame::new(rbp, &stack) {
             Ok(frame) => frame,

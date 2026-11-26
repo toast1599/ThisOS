@@ -1,9 +1,7 @@
 //! Which CPU the kernel runs on, and what each CPU is doing, for the log
-//! and the status cells. There is one CPU until SMP starts the others.
+//! and the status cells.
 
-#[cfg(test)]
-use core::sync::atomic::AtomicUsize;
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 use thisos_hal::{CpuStart, Platform};
 use thisos_locks::MAX_CPUS;
@@ -75,17 +73,20 @@ pub fn state(cpu: usize) -> State {
     State::from_byte(STATES[cpu].load(Ordering::Relaxed))
 }
 
-/// How many CPUs run the kernel.
+/// How many CPUs run the kernel: 1 until [`start`] has started the rest.
 pub fn count() -> usize {
-    1
+    RUNNING.load(Ordering::Relaxed)
 }
 
-/// The CPUs the firmware listed as ready besides the boot CPU, and the
-/// CPUs running, the boot CPU included, as [`start`] found them.
+/// The CPUs running, the boot CPU included, as [`start`] found them.
+static RUNNING: AtomicUsize = AtomicUsize::new(1);
+
+/// The CPUs the firmware listed as ready besides the boot CPU.
 #[cfg(test)]
 static LISTED: AtomicUsize = AtomicUsize::new(0);
+/// The CPUs that read back an index other than the one they were given.
 #[cfg(test)]
-static RUNNING: AtomicUsize = AtomicUsize::new(0);
+static MISNUMBERED: AtomicUsize = AtomicUsize::new(0);
 
 /// Starts the other CPUs, which park, and logs each step as it happens.
 /// `kernel::init` calls this once, after the timer and the logger's
@@ -114,34 +115,30 @@ pub fn start() {
                 cpu,
                 id,
                 reported,
+                reported_cpu,
                 micros,
-            } if reported == id => {
+            } => {
+                if reported != id {
+                    log::warn!("cpu {cpu}: listed as id {id} but reads id {reported}");
+                }
+                if reported_cpu != cpu {
+                    log::warn!("cpu {cpu}: reads its own index as {reported_cpu}");
+                    #[cfg(test)]
+                    MISNUMBERED.fetch_add(1, Ordering::Relaxed);
+                }
                 log::info!("cpu {cpu}: id {id} up and parked after {micros} us");
             }
-            CpuStart::Up {
-                cpu,
-                id,
-                reported,
-                micros,
-            } => log::warn!(
-                "cpu {cpu}: listed as id {id} but reads id {reported}, up and parked after {micros} us"
-            ),
             CpuStart::Silent { id } => {
                 log::warn!("cpu: id {id} didn't check in, so it was stopped");
             }
-            CpuStart::Trapped { id, vector } => log::warn!(
-                "cpu: a CPU trapped on vector {vector} and halted while id {id} was starting"
-            ),
         },
     );
+    RUNNING.store(running, Ordering::Relaxed);
     if listed > 0 {
         log::info!("cpu: {running} of {} running", listed + 1);
     }
     #[cfg(test)]
-    {
-        LISTED.store(listed, Ordering::Relaxed);
-        RUNNING.store(running, Ordering::Relaxed);
-    }
+    LISTED.store(listed, Ordering::Relaxed);
 }
 
 #[cfg(test)]
@@ -151,6 +148,12 @@ mod tests {
     #[test_case]
     fn every_listed_cpu_started() {
         let listed = LISTED.load(Ordering::Relaxed);
-        assert_eq!(RUNNING.load(Ordering::Relaxed), listed + 1);
+        assert_eq!(count(), listed + 1);
+    }
+
+    #[test_case]
+    fn every_cpu_reads_its_own_index() {
+        assert_eq!(MISNUMBERED.load(Ordering::Relaxed), 0);
+        assert_eq!(id(), 0, "tests run on the boot CPU");
     }
 }

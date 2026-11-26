@@ -27,6 +27,9 @@ pub struct Context {
 // alone, so the thread that resumes finds in them what the one that left
 // put there: its stack. DS, ES, FS and GS go with the thread, since ring 3
 // can load them and would otherwise read what another process left there.
+// Loading GS's selector clears its base on Intel, so the load lands on user
+// code's base, between two SWAPGS; interrupts are off, and an NMI or #MC
+// meanwhile swaps by IA32_GS_BASE (see percpu).
 // A new thread's stack holds a Start, so the switch loads null into the
 // four, pops entry into r12 and zero into rbp, the end of the frame-pointer
 // chain, and returns into thisos_thread_start, which calls start with the
@@ -53,7 +56,9 @@ global_asm!(
     "mov rax, rsp",
     "mov rsp, rdi",
     "pop rcx",
+    "swapgs",
     "mov gs, ecx",
+    "swapgs",
     "pop rcx",
     "mov fs, ecx",
     "pop rcx",
@@ -164,9 +169,11 @@ pub fn switch(to: Context) -> Context {
     // a later switch resumes it, with those registers and rsp as they were;
     // the C ABI clobbers cover the rest, rcx among them. A selector it loads
     // is null or one this thread's ring 3 code loaded, which the kernel can
-    // load too, and 64-bit mode uses none of their bases for the kernel's
-    // own accesses. Interrupts are off, so no handler runs on either stack
-    // between the two halves of the switch.
+    // load too. The kernel's own accesses use only GS's base, which the GS
+    // load leaves alone, since it lands between two SWAPGS on user code's.
+    // Interrupts are off, so no handler runs on either stack between the
+    // two halves of the switch, and only an NMI, #MC or #DB can come
+    // between the SWAPGS, whose stubs swap by IA32_GS_BASE.
     unsafe {
         asm!(
             "call thisos_switch",

@@ -5,20 +5,16 @@
 //! loops, so the only frame abandoned is theirs, which holds nothing.
 
 use core::arch::{asm, global_asm};
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use thisos_hal::{Platform, Probe, TrapFrame as _};
 use x86_64::VirtAddr;
 use x86_64::instructions::interrupts;
 use x86_64::registers::control::{Cr4, Cr4Flags};
 
-use crate::X86_64;
 use crate::paging::USER_SPACE;
 use crate::trap::TrapFrame;
-
-/// The stack pointer `thisos_catch` saved the registers at while a catch
-/// runs, and 0 otherwise.
-static SAVED_RSP: AtomicU64 = AtomicU64::new(0);
+use crate::{X86_64, apic, percpu};
 
 // thisos_catch takes the probe's number in rdi and its target's address in
 // rsi. It returns only through thisos_catch_landing, where abandon sends a
@@ -48,7 +44,7 @@ global_asm!(
     "push r13",
     "push r14",
     "push r15",
-    "mov qword ptr [rip + {saved}], rsp",
+    "mov qword ptr gs:[{saved}], rsp",
     "cmp rdi, 0",
     "je 2f",
     "cmp rdi, 1",
@@ -59,6 +55,8 @@ global_asm!(
     "je 5f",
     "cmp rdi, 5",
     "je 6f",
+    "cmp rdi, 6",
+    "je 7f",
     "1:",
     "pause",
     "jmp 1b",
@@ -78,12 +76,29 @@ global_asm!(
     "6:",
     "stac",
     "jmp 1b",
+    // rsi holds the ICR's value for an NMI to this CPU.
+    "7:",
+    "swapgs",
+    "mov ecx, {icr}",
+    "mov eax, esi",
+    "mov rdx, rsi",
+    "shr rdx, 32",
+    "wrmsr",
+    "jmp 1b",
     ".globl thisos_catch_landing",
     ".hidden thisos_catch_landing",
     "thisos_catch_landing:",
-    // iretq brought back the AC the probe ran with.
+    // iretq brought back the AC the probe ran with, and the GS base, which
+    // the NMI probe left as user code's.
     "clac",
-    "mov qword ptr [rip + {saved}], 0",
+    "mov ecx, {gs_base}",
+    "rdmsr",
+    "test edx, edx",
+    "js 8f",
+    "swapgs",
+    "mov byte ptr [rip + {landed_on_user_gs}], 1",
+    "8:",
+    "mov qword ptr gs:[{saved}], 0",
     "pop r15",
     "pop r14",
     "pop r13",
@@ -92,8 +107,14 @@ global_asm!(
     "pop rbp",
     "ret",
     ".popsection",
-    saved = sym SAVED_RSP,
+    saved = const percpu::SAVED_RSP,
+    icr = const apic::ICR,
+    gs_base = const percpu::IA32_GS_BASE,
+    landed_on_user_gs = sym LANDED_ON_USER_GS,
 );
+
+/// Whether the last catch's landing found user code's GS base active.
+static LANDED_ON_USER_GS: AtomicBool = AtomicBool::new(false);
 
 unsafe extern "C" {
     static thisos_catch_landing: u8;
@@ -104,7 +125,7 @@ unsafe extern "C" {
 /// Runs `probe` until a trap handler abandons it.
 pub fn catch(probe: Probe) {
     assert_eq!(
-        SAVED_RSP.load(Ordering::Relaxed),
+        percpu::this().saved_rsp.load(Ordering::Relaxed),
         0,
         "a catch is running already"
     );
@@ -115,6 +136,7 @@ pub fn catch(probe: Probe) {
         Probe::WriteReadOnly => 3,
         Probe::ExecuteNoExecute | Probe::ExecuteUser => 4,
         Probe::SpinUserAccessOpen => 5,
+        Probe::NmiWithUserGs => 6,
     };
     if probe == Probe::ExecuteUser {
         assert!(
@@ -122,6 +144,11 @@ pub fn catch(probe: Probe) {
             "ExecuteUser before SMEP is on"
         );
     }
+    let arg = match probe {
+        // Delivery mode NMI, asserted, to this CPU's APIC ID.
+        Probe::NmiWithUserGs => u64::from(apic::id()) << 32 | 0x4400,
+        _ => target(probe).unwrap_or(0),
+    };
     let run = || {
         // SAFETY: thisos_catch saves and restores every callee-saved
         // register, and returns, through thisos_catch_landing, to the
@@ -133,22 +160,27 @@ pub fn catch(probe: Probe) {
         // the ret, which only returns; and the user probe page, which the
         // read can't change, and which the call can't run, since SMEP is on.
         // The spin with AC set reaches no memory, and the landing clears AC
-        // again; trap::init checked that the CPU has stac and clac. The C
-        // ABI clobbers cover rax and the flags.
+        // again; trap::init checked that the CPU has stac and clac. The NMI
+        // probe runs with interrupts off and reaches no memory after its
+        // SWAPGS, so nothing but its NMI, whose stub swaps by IA32_GS_BASE,
+        // runs on user code's base, and the landing swaps the kernel's back
+        // in. The C ABI clobbers cover rax, rcx, rdx and the flags.
         unsafe {
             asm!(
                 "call thisos_catch",
                 in("rdi") number,
-                in("rsi") target(probe).unwrap_or(0),
+                in("rsi") arg,
                 clobber_abi("C"),
             );
         }
     };
     match probe {
-        // Interrupt handlers run on the stack the probe fills, so one that
-        // came near the guard page would overflow there itself, and abandon
-        // would give up the handler along with the probe.
-        Probe::OverflowStack => interrupts::without_interrupts(run),
+        // Interrupt handlers run on the stack the overflow probe fills, so
+        // one that came near the guard page would overflow there itself, and
+        // abandon would give up the handler along with the probe. Nothing
+        // but the NMI may trap while the NMI probe has user code's GS base
+        // active.
+        Probe::OverflowStack | Probe::NmiWithUserGs => interrupts::without_interrupts(run),
         Probe::ReadGuardPage
         | Probe::Spin
         | Probe::SpinUserAccessOpen
@@ -157,6 +189,12 @@ pub fn catch(probe: Probe) {
         | Probe::ReadUser
         | Probe::ExecuteUser => run(),
     }
+    let landed_on_user_gs = LANDED_ON_USER_GS.swap(false, Ordering::Relaxed);
+    assert_eq!(
+        landed_on_user_gs,
+        probe == Probe::NmiWithUserGs,
+        "the catch's landing found the wrong GS base after {probe:?}"
+    );
 }
 
 /// The address whose page fault ends `probe`; see `Platform::probe_target`.
@@ -166,7 +204,9 @@ pub fn target(probe: Probe) -> Option<u64> {
         Probe::WriteReadOnly => Some(address(&raw const thisos_probe_read_only)),
         Probe::ExecuteNoExecute => Some(address(&raw const thisos_probe_ret)),
         Probe::ReadUser | Probe::ExecuteUser => Some(USER_SPACE.start),
-        Probe::OverflowStack | Probe::Spin | Probe::SpinUserAccessOpen => None,
+        Probe::OverflowStack | Probe::Spin | Probe::SpinUserAccessOpen | Probe::NmiWithUserGs => {
+            None
+        }
     }
 }
 
@@ -177,7 +217,7 @@ fn address(byte: *const u8) -> u64 {
 /// Sends `frame` to the running catch's landing. Returns `false` when no
 /// catch is running.
 pub fn abandon(frame: &mut TrapFrame) -> bool {
-    let rsp = SAVED_RSP.load(Ordering::Relaxed);
+    let rsp = percpu::this().saved_rsp.load(Ordering::Relaxed);
     if rsp == 0 {
         return false;
     }

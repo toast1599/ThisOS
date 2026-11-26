@@ -11,10 +11,11 @@ use x86_64::instructions::tlb;
 use x86_64::registers::model_specific::Msr;
 use x86_64::structures::paging::{Page, Size4KiB};
 
+use crate::once::Once;
 use crate::paging::{PCD, PS_OR_PAT, PWT, PageTables};
 
 const IA32_MTRRCAP: u32 = 0xfe;
-const IA32_PAT: u32 = 0x277;
+pub const IA32_PAT: u32 = 0x277;
 const IA32_MTRR_DEF_TYPE: u32 = 0x2ff;
 const IA32_MTRR_PHYSBASE0: u32 = 0x200;
 
@@ -96,7 +97,16 @@ impl Msrs {
         // page selects entry 1, so no memory changes type under a mapping
         // and nothing cached needs flushing first.
         unsafe { Msr::new(IA32_PAT).write(pat) };
+        WRITTEN.init(pat);
     }
+}
+
+/// The PAT the boot CPU wrote, which the APs copy.
+static WRITTEN: Once<u64> = Once::new();
+
+/// The PAT `write_combine` wrote, or `None` if it left the power-on one.
+pub fn written() -> Option<u64> {
+    WRITTEN.get().copied()
 }
 
 /// Makes `page` select PAT entry 1, by setting PWT and clearing PCD and

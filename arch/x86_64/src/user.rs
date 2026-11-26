@@ -25,8 +25,12 @@ pub fn enter_user(ip: u64, sp: u64, arg: u64) -> ! {
     // this never returns, so nothing on that stack is used again: the next
     // trap from ring 3 starts at its top. Every general register but rdi,
     // which holds arg, is cleared, so no kernel value reaches user code.
+    // SWAPGS gives user code its GS base and keeps the kernel's for the
+    // next trap from ring 3, with interrupts off from there to iretq, so no
+    // interrupt from ring 0 finds user code's base.
     unsafe {
         asm!(
+            "cli",
             "push {ss}",
             "push rsi",
             "push {rflags}",
@@ -46,6 +50,7 @@ pub fn enter_user(ip: u64, sp: u64, arg: u64) -> ! {
             "xor r13d, r13d",
             "xor r14d, r14d",
             "xor r15d, r15d",
+            "swapgs",
             "iretq",
             ss = const USER_DATA,
             rflags = const 0x202,
@@ -647,6 +652,21 @@ global_asm!(
     "syscall",
     "ud2",
     ".org thisos_user_programs + 14 * {slot}, 0xcc",
+    // DescriptorTable. CPUID leaf 7 reports UMIP in ECX bit 2.
+    "mov eax, 7",
+    "xor ecx, ecx",
+    "cpuid",
+    "mov edi, 2",
+    "test ecx, 4",
+    "jz 2f",
+    "sub rsp, 16",
+    "sgdt [rsp]",
+    "xor edi, edi",
+    "2:",
+    "mov eax, {exit}",
+    "syscall",
+    "ud2",
+    ".org thisos_user_programs + 15 * {slot}, 0xcc",
     ".popsection",
     exit = const Syscall::Exit.number(),
     user_flags = const USER_FLAGS.bits(),
@@ -701,7 +721,7 @@ const USER_FLAGS: RFlags = RFlags::DIRECTION_FLAG
     .union(RFlags::NESTED_TASK);
 
 unsafe extern "C" {
-    static thisos_user_programs: [u8; 14 * SLOT];
+    static thisos_user_programs: [u8; 15 * SLOT];
 }
 
 /// Writes `program` at the start of `frame`, through the physical-memory
@@ -722,6 +742,7 @@ pub fn write_program(phys_offset: VirtAddr, frame: &mut Frame, program: UserProg
         UserProgram::LastSyscall => 11,
         UserProgram::MaskInterrupts => 12,
         UserProgram::ThreadRegisters => 13,
+        UserProgram::DescriptorTable => 14,
     };
     let source = (&raw const thisos_user_programs)
         .cast::<u8>()

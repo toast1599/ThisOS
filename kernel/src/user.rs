@@ -1309,6 +1309,22 @@ mod tests {
         );
     }
 
+    // A descriptor table's address tells user code where the kernel keeps
+    // each CPU's state. x86_64 hides it only where the CPU has UMIP, which
+    // CI's CPU model and the test laptop do.
+    #[test_case]
+    fn reading_a_descriptor_table_kills_the_thread() {
+        let (end, code) = run(UserProgram::DescriptorTable, |_, _| 0);
+        if end == End::Exited(2) {
+            log::warn!("the CPU has no UMIP, so user code can read the GDT's address");
+            return;
+        }
+        assert!(
+            matches!(end, End::Killed { trap: Trap::Other { .. }, ip } if ip >= code),
+            "{end:?}"
+        );
+    }
+
     // The second run would start with the value the first left, were they
     // not kept per thread. 0x1b is x86_64's user data selector, the one
     // value ring 3 can load that survives an interrupt: returning to ring 3

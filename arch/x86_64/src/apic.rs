@@ -28,7 +28,7 @@ const ID: u32 = 0x802;
 const TASK_PRIORITY: u32 = 0x808;
 const EOI: u32 = 0x80b;
 const SPURIOUS: u32 = 0x80f;
-const ICR: u32 = 0x830;
+pub const ICR: u32 = 0x830;
 const LVT_TIMER: u32 = 0x832;
 const INITIAL_COUNT: u32 = 0x838;
 const CURRENT_COUNT: u32 = 0x839;
@@ -244,9 +244,9 @@ fn x2apic_id(apic: X2Apic) -> u32 {
 }
 
 /// Puts an AP's APIC in x2APIC mode as [`start`] does the BSP's, timer
-/// masked, and returns the AP's APIC ID.
-pub fn enable_on_ap() -> u32 {
-    x2apic_id(X2Apic::enable())
+/// masked.
+pub fn enable_on_ap() {
+    X2Apic::enable();
 }
 
 /// Sends INIT to the CPU with APIC ID `id`, which resets it to wait for

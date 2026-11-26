@@ -20,6 +20,7 @@ mod memory;
 mod once;
 mod paging;
 mod pat;
+mod percpu;
 mod pic;
 mod pit;
 mod smp;
@@ -122,9 +123,8 @@ impl Cpu for X86_64 {
 }
 
 impl thisos_locks::Platform for X86_64 {
-    // One CPU until SMP starts the others.
     fn cpu() -> usize {
-        0
+        percpu::index()
     }
 
     fn counter() -> u64 {
@@ -362,6 +362,12 @@ pub unsafe fn boot_info(
     boot: &'static mut bootloader_api::BootInfo,
     trap: TrapHandler<X86_64>,
 ) -> BootInfo<X86_64> {
+    // First, so that a lock or a panic from here on finds its CPU index.
+    // SAFETY: The loader runs the kernel on the boot CPU alone, which is
+    // CPU 0.
+    unsafe {
+        percpu::set_gs(0);
+    }
     backtrace::init(
         boot.kernel_stack_bottom..boot.kernel_stack_bottom + boot.kernel_stack_len,
         boot.kernel_image_offset,

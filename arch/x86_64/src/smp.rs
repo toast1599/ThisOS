@@ -1,9 +1,10 @@
 //! Starting the APs, the CPUs besides the one the firmware booted. The MADT
 //! lists them. Each starts in real mode at a trampoline in a frame below
 //! 1 MiB, which takes it through protected mode into long mode on low page
-//! tables that hold the kernel's upper half, and on into the kernel. Until
-//! per-CPU state exists, an AP takes no lock and logs nothing: it stores its
-//! APIC ID in its slot, where the BSP finds it, and parks.
+//! tables that hold the kernel's upper half, and on into the kernel, where
+//! it sets up its own state. Until the scheduler gives it work, an AP takes
+//! no lock and logs nothing: it stores its index and APIC ID in its slot,
+//! where the BSP finds them, and parks.
 
 use core::arch::global_asm;
 use core::mem::offset_of;
@@ -15,12 +16,9 @@ use thisos_acpi::{HEADER_SIZE, Madt, RSDP_SIZE, State, Xsdt};
 use thisos_hal::{Cpu as _, CpuStart};
 use thisos_locks::MAX_CPUS;
 use x86_64::VirtAddr;
-use x86_64::registers::control::{Cr0, Cr4};
-use x86_64::registers::model_specific::{Efer, Msr};
-use x86_64::structures::idt::{Entry, InterruptDescriptorTable};
 
 use crate::once::Once;
-use crate::{X86_64, apic, paging, phys_offset, trap, tsc};
+use crate::{X86_64, apic, paging, percpu, phys_offset, trap, tsc};
 
 /// Each AP's stack, the size of a kernel thread's.
 const STACK_SIZE: usize = 64 * 1024;
@@ -33,9 +31,10 @@ const STARTUP_WAIT_US: u64 = 200;
 const LOW_END: u64 = 0xa_0000;
 /// Where [`Data`] sits in the trampoline's page, after the code.
 const DATA: usize = 0x800;
-/// A slot's value once its AP checked in, with the APIC ID below it.
+/// A slot's value once its AP checked in, with the APIC ID below it and
+/// the index it read from its own block at [`INDEX_SHIFT`].
 const CHECKED_IN: u64 = 1 << 32;
-const IA32_PAT: u32 = 0x277;
+const INDEX_SHIFT: u32 = 40;
 
 // The trampoline's GDT: flat 32-bit code and data, and 64-bit code.
 const CODE32: u16 = 0x08;
@@ -63,10 +62,6 @@ struct Data {
     low_cr3: u64,
     /// What the AP takes from the BSP once it runs in the upper half.
     kernel_cr3: u64,
-    cr0: u64,
-    cr4: u64,
-    efer: u64,
-    pat: u64,
     stack: u64,
     /// Where the AP jumps into the upper half: `thisos_ap_high`.
     high: u64,
@@ -146,10 +141,9 @@ global_asm!(
 );
 
 // The AP's first code in the upper half, in the kernel's image. It reads
-// everything it needs from the trampoline's page, then takes the BSP's
-// PAT, EFER, CR4 and CR0, and last the kernel's tables, which don't map
-// the trampoline's page. The stack's top is 16-byte aligned, as the call
-// wants.
+// everything it needs from the trampoline's page, then loads the kernel's
+// tables, which don't map that page. The stack's top is 16-byte aligned, as
+// the call wants.
 global_asm!(
     ".pushsection .text.thisos_ap_high, \"ax\", @progbits",
     ".globl thisos_ap_high",
@@ -157,18 +151,6 @@ global_asm!(
     "thisos_ap_high:",
     "mov rsp, [rsi + {data} + {stack}]",
     "mov rdi, [rsi + {data} + {index}]",
-    "mov ecx, {ia32_pat}",
-    "mov eax, [rsi + {data} + {pat}]",
-    "mov edx, [rsi + {data} + {pat} + 4]",
-    "wrmsr",
-    "mov ecx, 0xc0000080",
-    "mov eax, [rsi + {data} + {efer}]",
-    "mov edx, [rsi + {data} + {efer} + 4]",
-    "wrmsr",
-    "mov rax, [rsi + {data} + {cr4}]",
-    "mov cr4, rax",
-    "mov rax, [rsi + {data} + {cr0}]",
-    "mov cr0, rax",
     "mov rax, [rsi + {data} + {kernel_cr3}]",
     "mov cr3, rax",
     "xor ebp, ebp",
@@ -178,41 +160,8 @@ global_asm!(
     data = const DATA,
     stack = const offset_of!(Data, stack),
     index = const offset_of!(Data, index),
-    ia32_pat = const IA32_PAT,
-    pat = const offset_of!(Data, pat),
-    efer = const offset_of!(Data, efer),
-    cr4 = const offset_of!(Data, cr4),
-    cr0 = const offset_of!(Data, cr0),
     kernel_cr3 = const offset_of!(Data, kernel_cr3),
     main = sym ap_main,
-);
-
-// The park IDT's stubs, 16 bytes apart as the kernel's are, one for each
-// exception vector. A stub stores the vector + 1 in AP_TRAP and halts with
-// interrupts off, which the gate already turned off. mov eax, imm32 is
-// hand-encoded for the reason trap.rs gives for its push.
-global_asm!(
-    ".pushsection .text.thisos_park, \"ax\", @progbits",
-    ".p2align 4",
-    ".globl thisos_park_stubs",
-    ".hidden thisos_park_stubs",
-    "thisos_park_stubs:",
-    ".set .Lpark_vector, 0",
-    ".rept 32",
-    ".byte 0xb8",
-    ".long .Lpark_vector + 1",
-    "jmp .Lpark_common",
-    ".org thisos_park_stubs + 16 * (.Lpark_vector + 1), 0xcc",
-    ".set .Lpark_vector, .Lpark_vector + 1",
-    ".endr",
-    ".Lpark_common:",
-    "mov qword ptr [rip + {trap}], rax",
-    "2:",
-    "cli",
-    "hlt",
-    "jmp 2b",
-    ".popsection",
-    trap = sym AP_TRAP,
 );
 
 unsafe extern "C" {
@@ -221,21 +170,17 @@ unsafe extern "C" {
     static thisos_ap_64: u8;
     static thisos_ap_trampoline_end: u8;
     static thisos_ap_high: u8;
-    static thisos_park_stubs: [u8; 32 * 16];
 }
 
 /// Each AP's slot, by its index among the running CPUs: 0 until it checks
 /// in, then [`CHECKED_IN`] with its APIC ID.
 static SLOTS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 
-/// The vector + 1 an AP trapped on, which the park stubs store, or 0.
-static AP_TRAP: AtomicU64 = AtomicU64::new(0);
-
-/// The IDT the APs load, whose exception vectors go to the park stubs.
-static PARK_IDT: Once<InterruptDescriptorTable> = Once::new();
+/// An AP's stacks: the one it runs on and its IST stacks.
+type ApStacks = (paging::Stack, [paging::Stack; 4]);
 
 /// The running APs' stacks, kept for good.
-static STACKS: Once<[Option<paging::Stack>; MAX_CPUS]> = Once::new();
+static STACKS: Once<[Option<ApStacks>; MAX_CPUS]> = Once::new();
 
 /// The loader's memory map, and the RSDP's address if it found one.
 static REGIONS: Once<&'static [MemoryRegion]> = Once::new();
@@ -293,7 +238,6 @@ pub fn start(
     let Ok(vector) = u8::try_from(page >> 12) else {
         unreachable!("the trampoline is below 1 MiB");
     };
-    PARK_IDT.init(park_idt());
     let data = |stack: u64, index: usize| Data {
         gdt: GDT,
         gdtr: (to_u64(size_of_val(&GDT)) - 1) | (page + to_u64(DATA + offset_of!(Data, gdt))) << 16,
@@ -301,13 +245,6 @@ pub fn start(
         far64: (page + offset(&raw const thisos_ap_64)) | u64::from(CODE64) << 32,
         low_cr3: level_4,
         kernel_cr3: paging::kernel_level_4(),
-        cr0: Cr0::read_raw(),
-        cr4: Cr4::read_raw(),
-        efer: Efer::read_raw(),
-        // SAFETY: Every CPU the kernel runs on has the PAT, which
-        // pat::write_combine checks before it uses it, and reading it
-        // changes nothing.
-        pat: unsafe { Msr::new(IA32_PAT).read() },
         stack,
         high: VirtAddr::from_ptr(&raw const thisos_ap_high).as_u64(),
         index: to_u64(index),
@@ -320,21 +257,19 @@ pub fn start(
     let mut running = 1;
     for cpu in aps() {
         let ap_stack = stack(STACK_SIZE);
+        let ist = [(); 4].map(|()| stack(trap::IST_STACK_SIZE));
+        // The AP takes traps from ring 3 on the stack it runs on until the
+        // scheduler gives it threads; it reaches no ring 3 meanwhile.
+        percpu::prepare(
+            running,
+            ist.each_ref().map(|s| s.range().end),
+            ap_stack.range().end,
+        );
         SLOTS[running].store(0, Ordering::Relaxed);
         write_data(page, data(ap_stack.range().end, running));
         let started = tsc::read();
         let slot = signal(cpu.apic_id, vector, hz, &SLOTS[running]);
         let micros = tsc::read().wrapping_sub(started) * 1_000_000 / hz;
-        let trapped = AP_TRAP.swap(0, Ordering::Relaxed);
-        if trapped != 0 {
-            let Ok(vector) = u8::try_from(trapped - 1) else {
-                unreachable!("the park stubs cover vectors 0 to 31");
-            };
-            report(CpuStart::Trapped {
-                id: cpu.apic_id,
-                vector,
-            });
-        }
         if slot == 0 {
             // Back to waiting for a startup IPI, so that it can't run the
             // trampoline with the next AP's data.
@@ -345,13 +280,17 @@ pub fn start(
         let Ok(reported) = u32::try_from(slot & (CHECKED_IN - 1)) else {
             unreachable!("an APIC ID is 32 bits");
         };
+        let Ok(reported_cpu) = usize::try_from(slot >> INDEX_SHIFT) else {
+            unreachable!("x86_64's usize is 64 bits");
+        };
         report(CpuStart::Up {
             cpu: running,
             id: cpu.apic_id,
             reported,
+            reported_cpu,
             micros,
         });
-        stacks[running] = Some(ap_stack);
+        stacks[running] = Some((ap_stack, ist));
         running += 1;
     }
     STACKS.init(stacks);
@@ -376,22 +315,24 @@ fn signal(id: u32, vector: u8, hz: u64, slot: &AtomicU64) -> u64 {
 }
 
 /// The AP's code once it runs in the kernel's upper half and on its own
-/// stack, with interrupts off, on the kernel's tables: it loads the GDT and
-/// the park IDT, puts its APIC in x2APIC mode, checks in with its APIC ID
-/// and parks.
+/// stack, with interrupts off, on the kernel's tables: it sets up its own
+/// state as CPU `index`, checks in with the index it reads back through GS
+/// and its APIC ID, and parks.
 extern "sysv64" fn ap_main(index: usize) -> ! {
-    // SAFETY: Nothing on this AP has used the segment registers since the
-    // trampoline, whose GDT the kernel's tables no longer map.
+    // SAFETY: start passes each AP an index of its own and prepared its
+    // block, interrupts are off, and nothing on this AP has used the segment
+    // registers or descriptor tables since the trampoline, whose GDT the
+    // kernel's tables no longer map. The boot CPU ran init_cpu long ago.
     unsafe {
-        trap::load_gdt_on_ap();
+        percpu::init_cpu(index);
     }
-    let Some(idt) = PARK_IDT.get() else {
-        unreachable!("start builds the park IDT before any AP starts");
-    };
-    idt.load();
-    let id = apic::enable_on_ap();
+    let id = apic::id();
+    let read = u64::try_from(percpu::index()).unwrap_or(u64::MAX);
     if let Some(slot) = SLOTS.get(index) {
-        slot.store(CHECKED_IN | u64::from(id), Ordering::Release);
+        slot.store(
+            CHECKED_IN | read << INDEX_SHIFT | u64::from(id),
+            Ordering::Release,
+        );
     }
     X86_64::halt()
 }
@@ -506,45 +447,5 @@ fn wait(hz: u64, micros: u64, done: impl Fn() -> bool) {
     let started = tsc::read();
     while !done() && tsc::read().wrapping_sub(started) < cycles {
         core::hint::spin_loop();
-    }
-}
-
-/// An IDT whose exception vectors go to the park stubs, for the APs.
-fn park_idt() -> InterruptDescriptorTable {
-    let mut idt = InterruptDescriptorTable::new();
-    park(&mut idt.divide_error, 0);
-    park(&mut idt.debug, 1);
-    park(&mut idt.non_maskable_interrupt, 2);
-    park(&mut idt.breakpoint, 3);
-    park(&mut idt.overflow, 4);
-    park(&mut idt.bound_range_exceeded, 5);
-    park(&mut idt.invalid_opcode, 6);
-    park(&mut idt.device_not_available, 7);
-    park(&mut idt.double_fault, 8);
-    park(&mut idt.invalid_tss, 10);
-    park(&mut idt.segment_not_present, 11);
-    park(&mut idt.stack_segment_fault, 12);
-    park(&mut idt.general_protection_fault, 13);
-    park(&mut idt.page_fault, 14);
-    park(&mut idt.x87_floating_point, 16);
-    park(&mut idt.alignment_check, 17);
-    park(&mut idt.machine_check, 18);
-    park(&mut idt.simd_floating_point, 19);
-    park(&mut idt.virtualization, 20);
-    park(&mut idt.cp_protection_exception, 21);
-    park(&mut idt.hv_injection_exception, 28);
-    park(&mut idt.vmm_communication_exception, 29);
-    park(&mut idt.security_exception, 30);
-    idt
-}
-
-/// Points `entry`, the IDT entry for `vector`, at that vector's park stub.
-fn park<F>(entry: &mut Entry<F>, vector: u64) {
-    let stub = VirtAddr::from_ptr(&raw const thisos_park_stubs) + 16 * vector;
-    // SAFETY: stub never returns, so the frame the CPU pushes, with or
-    // without an error code, doesn't matter. The entry takes the current
-    // CS, the kernel's code segment, which the APs load before the IDT.
-    unsafe {
-        entry.set_handler_addr(stub);
     }
 }

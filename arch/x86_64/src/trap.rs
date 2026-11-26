@@ -1,28 +1,26 @@
-//! Traps: the GDT and the TSS, which give the CPU stacks to take some traps
-//! on, the IDT, and the stubs that save the registers in a [`TrapFrame`]
-//! and call the kernel's handler.
+//! Traps: each CPU's GDT and TSS, which give it stacks to take some traps
+//! on, the IDT they share, and the stubs that save the registers in a
+//! [`TrapFrame`] and call the kernel's handler.
 
 use core::arch::{asm, global_asm};
 use core::cell::UnsafeCell;
 use core::fmt;
-use core::mem::offset_of;
 use core::ops::Range;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::Ordering;
 
 use thisos_hal::{Access, BacktraceEnd, Cpu, Trap, TrapHandler};
 use x86_64::VirtAddr;
 use x86_64::instructions::segmentation::{CS, SS, Segment};
 use x86_64::instructions::tables::load_tss;
-use x86_64::registers::control::{Cr0, Cr0Flags, Cr2, Cr4, Cr4Flags};
-use x86_64::registers::model_specific::{Efer, EferFlags, LStar, SFMask, Star};
+use x86_64::registers::control::Cr2;
+use x86_64::registers::model_specific::{LStar, SFMask, Star};
 use x86_64::registers::rflags::{self, RFlags};
 use x86_64::structures::gdt::{Descriptor, GlobalDescriptorTable, SegmentSelector};
 use x86_64::structures::idt::{Entry, EntryOptions, InterruptDescriptorTable};
-use x86_64::structures::tss::TaskStateSegment;
 
 use crate::once::Once;
 use crate::paging::USER_SPACE;
-use crate::{X86_64, apic, backtrace, catch, paging};
+use crate::{X86_64, apic, backtrace, catch, paging, percpu};
 
 // Each stub sits 16 bytes after the one before it, so that the IDT can find
 // stub n at thisos_trap_stubs + 16n. The .org fails to assemble if a stub
@@ -35,6 +33,12 @@ use crate::{X86_64, apic, backtrace, catch, paging};
 // registers it is aligned again for the call, as the C ABI wants. The
 // vector is pushed as hand-encoded push imm32, because Intel syntax reads a
 // bare symbol such as .Lvector as a memory operand.
+//
+// The common path swaps GS's base in from ring 3 and back, by the CS the
+// CPU saved (see percpu). The vectors on IST stacks, #DB, NMI, #DF and #MC,
+// can arrive in ring 0 before the SYSCALL stub's SWAPGS, so their path
+// swaps by IA32_GS_BASE instead, and keeps whether it did in rbx, which
+// trap_entry saves as the C ABI says.
 global_asm!(
     ".pushsection .text.thisos_trap, \"ax\", @progbits",
     ".p2align 4",
@@ -48,11 +52,19 @@ global_asm!(
     ".endif",
     ".byte 0x68",
     ".long .Lvector",
+    ".if .Lvector == 1 || .Lvector == 2 || .Lvector == 8 || .Lvector == 18",
+    "jmp .Ltrap_ist",
+    ".else",
     "jmp .Ltrap_common",
+    ".endif",
     ".org thisos_trap_stubs + 16 * (.Lvector + 1), 0xcc",
     ".set .Lvector, .Lvector + 1",
     ".endr",
     ".Ltrap_common:",
+    "test byte ptr [rsp + 24], 3",
+    "jz 2f",
+    "swapgs",
+    "2:",
     "push rax",
     "push rbx",
     "push rcx",
@@ -92,31 +104,86 @@ global_asm!(
     "pop rbx",
     "pop rax",
     "add rsp, 16",
+    "test byte ptr [rsp + 8], 3",
+    "jz 3f",
+    "swapgs",
+    "3:",
+    "iretq",
+    ".Ltrap_ist:",
+    "push rax",
+    "push rbx",
+    "push rcx",
+    "push rdx",
+    "push rsi",
+    "push rdi",
+    "push rbp",
+    "push r8",
+    "push r9",
+    "push r10",
+    "push r11",
+    "push r12",
+    "push r13",
+    "push r14",
+    "push r15",
+    "mov ecx, {gs_base}",
+    "rdmsr",
+    "xor ebx, ebx",
+    "test edx, edx",
+    "js 4f",
+    "swapgs",
+    "mov ebx, 1",
+    "4:",
+    "mov rdi, rsp",
+    "cld",
+    "clac",
+    "call {entry}",
+    "test ebx, ebx",
+    "jz 5f",
+    "swapgs",
+    "5:",
+    "pop r15",
+    "pop r14",
+    "pop r13",
+    "pop r12",
+    "pop r11",
+    "pop r10",
+    "pop r9",
+    "pop r8",
+    "pop rbp",
+    "pop rdi",
+    "pop rsi",
+    "pop rdx",
+    "pop rcx",
+    "pop rbx",
+    "pop rax",
+    "add rsp, 16",
     "iretq",
     ".popsection",
     entry = sym trap_entry,
+    gs_base = const percpu::IA32_GS_BASE,
 );
 
-// SYSCALL leaves RSP as user code had it, and the kernel runs on one CPU
-// until it has per-CPU state, so the stub parks it in a static and loads
-// the stack top the switch keeps in TSS.RSP0, with no SWAPGS. Then it
-// pushes what an IDT stub's frame holds, with RCX as RIP, R11 as RFLAGS
-// and the syscall's own vector, and calls trap_entry as the IDT stubs do.
-// SFMASK clears IF, DF and AC, so nothing interrupts it before the stack
-// is the kernel's, and it needs no cld or clac. The handler may turn
-// interrupts on, so the stub turns them off before the pops: from pop rsp
-// to sysretq the stack is the user's, and an interrupt there would push
-// its frame onto it in ring 0. trap_entry checks that RIP is no higher
-// than user space's end, since SYSRET needs it canonical.
+// SYSCALL leaves RSP as user code had it, so the stub swaps GS's base in
+// and parks it in the CPU's block, then loads the stack top the switch
+// keeps there, a copy of TSS.RSP0. Then it pushes what an IDT stub's frame
+// holds, with RCX as RIP, R11 as RFLAGS and the syscall's own vector, and
+// calls trap_entry as the IDT stubs do. SFMASK clears IF, DF and AC, so
+// nothing but an NMI, #MC or #DB interrupts it before the stack is the
+// kernel's, and it needs no cld or clac. The handler may turn interrupts
+// on, so the stub turns them off before the pops: from pop rsp to sysretq
+// the stack is the user's, and an interrupt there would push its frame
+// onto it in ring 0. trap_entry checks that RIP is no higher than user
+// space's end, since SYSRET needs it canonical.
 global_asm!(
     ".pushsection .text.thisos_syscall, \"ax\", @progbits",
     ".globl thisos_syscall",
     ".hidden thisos_syscall",
     "thisos_syscall:",
-    "mov qword ptr [rip + {user_rsp}], rsp",
-    "mov rsp, qword ptr [rip + {tss} + {rsp0}]",
+    "swapgs",
+    "mov qword ptr gs:[{user_rsp}], rsp",
+    "mov rsp, qword ptr gs:[{kernel_rsp}]",
     "push {user_data}",
-    "push qword ptr [rip + {user_rsp}]",
+    "push qword ptr gs:[{user_rsp}]",
     "push r11",
     "push {user_code}",
     "push rcx",
@@ -160,11 +227,11 @@ global_asm!(
     "add rsp, 8",
     "pop r11",
     "pop rsp",
+    "swapgs",
     "sysretq",
     ".popsection",
-    user_rsp = sym USER_RSP,
-    tss = sym TSS,
-    rsp0 = const offset_of!(Tss, tss) + RSP0,
+    user_rsp = const percpu::USER_RSP,
+    kernel_rsp = const percpu::KERNEL_RSP,
     user_data = const USER_DATA,
     user_code = const USER_CODE,
     vector = const SYSCALL_VECTOR,
@@ -175,9 +242,6 @@ unsafe extern "C" {
     static thisos_trap_stubs: [u8; 256 * 16];
     static thisos_syscall: u8;
 }
-
-/// The user stack pointer the SYSCALL stub saves until it has pushed it.
-static USER_RSP: AtomicU64 = AtomicU64::new(0);
 
 /// The GDT's selectors, in the order `init` appends the descriptors.
 const KERNEL_CODE: u16 = 0x08;
@@ -412,7 +476,7 @@ extern "C" fn trap_entry(frame: &mut TrapFrame) {
 static HANDLER: Once<TrapHandler<X86_64>> = Once::new();
 
 /// The IST slots, counted from 0 as the x86_64 crate does, each the index
-/// of its stack in `IST_STACKS`.
+/// of its stack in `IST_STACKS` and in what `start_cpus` gives an AP.
 const DOUBLE_FAULT_IST: u16 = 0;
 const NMI_IST: u16 = 1;
 const MACHINE_CHECK_IST: u16 = 2;
@@ -420,18 +484,17 @@ const DEBUG_IST: u16 = 3;
 const IST_SLOTS: [u16; 4] = [DOUBLE_FAULT_IST, NMI_IST, MACHINE_CHECK_IST, DEBUG_IST];
 
 /// The size of each IST stack, the boot stacks' and the guarded ones'.
-const IST_STACK_SIZE: usize = 20 * 1024;
+pub const IST_STACK_SIZE: usize = 20 * 1024;
 
-/// A stack the CPU switches to for one vector until `move_stacks` replaces
-/// it, with nothing unmapped below it. Rust code never reads or writes its
-/// bytes; the CPU does, through the TSS.
+/// A stack the boot CPU switches to for one vector until `move_stacks`
+/// replaces it, with nothing unmapped below it. Rust code never reads or
+/// writes its bytes; the CPU does, through the TSS.
 #[repr(align(16))]
 struct Stack(UnsafeCell<[u8; IST_STACK_SIZE]>);
 
 // SAFETY: Rust code only takes the stack's address, which is the same on
 // every thread. The CPU uses the bytes for the one vector whose IST slot
-// holds them, and the kernel runs on one CPU until it has per-CPU state,
-// so two traps never share one.
+// holds them, in the boot CPU's TSS alone, so two traps never share one.
 unsafe impl Sync for Stack {}
 
 impl Stack {
@@ -444,88 +507,42 @@ impl Stack {
 
 static IST_STACKS: [Stack; 4] = [const { Stack(UnsafeCell::new([0; IST_STACK_SIZE])) }; 4];
 
-/// The TSS, 4 bytes into an 8-aligned block. The x86_64 crate's TSS is
-/// packed, with RSP0 and the IST slots 4 bytes past an 8-byte boundary, so
-/// here each of them is 8-aligned, and one atomic store writes it whole:
-/// an NMI never finds half of a stack address in a slot. The SYSCALL stub
-/// reads RSP0 as the CPU does.
-#[repr(C, align(8))]
-struct Tss {
-    _align: u32,
-    tss: UnsafeCell<TaskStateSegment>,
-}
-
-// SAFETY: Rust code reaches the TSS's fields only through `word`, whose
-// atomics make every read and write whole. The CPU, and the SYSCALL stub,
-// read the TSS when they take a trap, and never write a 64-bit one.
-unsafe impl Sync for Tss {}
-
-/// Where RSP0 and the first IST slot are in the TSS.
-const RSP0: usize = offset_of!(TaskStateSegment, privilege_stack_table);
-const IST: usize = offset_of!(TaskStateSegment, interrupt_stack_table);
-
-impl Tss {
-    /// IST slot `index`, as an atomic.
-    fn slot(&self, index: u16) -> &AtomicU64 {
-        self.word(IST + 8 * usize::from(index))
-    }
-
-    /// The stack pointer slot at `offset` into the TSS, RSP0 or an IST
-    /// slot, as an atomic.
-    #[expect(
-        clippy::cast_ptr_alignment,
-        reason = "Tss's layout puts RSP0 and every IST slot on an 8-byte boundary, which the assert below checks"
-    )]
-    fn word(&self, offset: usize) -> &AtomicU64 {
-        let word = self
-            .tss
-            .get()
-            .cast::<u8>()
-            .wrapping_add(offset)
-            .cast::<u64>();
-        // SAFETY: Its callers pass RSP0's offset or an IST slot's, inside
-        // the static TSS, so word lives as long as the reference returned.
-        // It is 8-aligned, as Tss's layout makes those slots. Rust code
-        // reaches it only through atomics, since Tss hands out no other
-        // reference.
-        unsafe { AtomicU64::from_ptr(word) }
-    }
-}
-
-const _: () =
-    assert!((offset_of!(Tss, tss) + RSP0) % 8 == 0 && (offset_of!(Tss, tss) + IST) % 8 == 0);
-
-static TSS: Tss = Tss {
-    _align: 0,
-    tss: UnsafeCell::new(TaskStateSegment::new()),
-};
-static GDT: Once<GlobalDescriptorTable> = Once::new();
+/// The IDT, which every CPU loads.
 static IDT: Once<InterruptDescriptorTable> = Once::new();
 
-/// Loads the GDT, the TSS and the IDT, with `handler` as the kernel's trap
-/// handler. Panics if the CPU lacks SMEP or SMAP: the stubs run `clac`,
-/// which faults without SMAP, and `paging::take` turns both on.
+/// Sets up the boot CPU's descriptor tables and registers with `handler`
+/// as the kernel's trap handler; see `percpu::init_cpu`, which panics if
+/// the CPU lacks SMEP or SMAP: the stubs run `clac`, which faults without
+/// SMAP.
 ///
 /// # Safety
 ///
-/// Call this once, before anything else uses the segment registers or the
-/// descriptor tables, and before anything traps.
+/// Call this once, on the boot CPU, before anything else uses the segment
+/// registers or the descriptor tables, and before anything traps.
 pub unsafe fn init(handler: TrapHandler<X86_64>) {
-    // CPUID leaf 7 reports SMEP in EBX bit 7 and SMAP in bit 20.
-    let features = core::arch::x86_64::__cpuid_count(7, 0).ebx;
-    let both = (1 << 7) | (1 << 20);
-    assert!(features & both == both, "the CPU lacks SMEP or SMAP");
-
     HANDLER.init(handler);
-    // The boot thread's, which backtrace::init recorded, until the first
-    // switch.
-    set_kernel_stack(backtrace::stack().end);
-
-    for slot in IST_SLOTS {
-        TSS.slot(slot)
-            .store(IST_STACKS[usize::from(slot)].top(), Ordering::Relaxed);
+    // The boot thread's stack, which backtrace::init recorded, until the
+    // first switch.
+    percpu::prepare(
+        0,
+        IST_SLOTS.map(|slot| IST_STACKS[usize::from(slot)].top()),
+        backtrace::stack().end,
+    );
+    // SAFETY: The caller runs this once, first, on the boot CPU, after
+    // prepare for index 0.
+    unsafe {
+        percpu::init_cpu(0);
     }
+}
 
+/// Loads `block`'s GDT, built the first time, with its TSS, the kernel's
+/// segments and the IDT, built by the first CPU here.
+///
+/// # Safety
+///
+/// Only `percpu::init_cpu` calls it, for its own CPU's block, before
+/// anything there uses the segment registers or descriptor tables.
+pub unsafe fn load_tables(block: &'static percpu::Block) {
     // SYSCALL loads SS from the selector after the kernel's code, and
     // SYSRET loads SS and CS from the two after the kernel's data, in that
     // order. There is no 32-bit user code, so no slot for it.
@@ -538,27 +555,46 @@ pub unsafe fn init(handler: TrapHandler<X86_64>) {
         [code.0, data.0, user_data.0, user_code.0],
         [KERNEL_CODE, KERNEL_DATA, USER_DATA, USER_CODE]
     );
-    // SAFETY: TSS is a static, so the descriptor's address stays valid for
-    // as long as the GDT, also a static, is loaded. The safe tss_segment
-    // would need a &'static TaskStateSegment, which the atomic writes
-    // through Tss::slot would alias.
-    let tss_selector = gdt.append(unsafe { Descriptor::tss_segment_unchecked(TSS.tss.get()) });
+    // SAFETY: The TSS is in a static block, so the descriptor's address
+    // stays valid for as long as the GDT, in the same block, is loaded. The
+    // safe tss_segment would need a &'static TaskStateSegment, which the
+    // atomic writes through Tss::slot would alias.
+    let tss_selector = gdt.append(unsafe { Descriptor::tss_segment_unchecked(block.tss.get()) });
     // The CPU sets the TSS descriptor's busy bit when load_tss runs, but the
     // x86_64 crate keeps each entry in an atomic, so that write doesn't
     // break the shared reference's rules.
-    let gdt = GDT.init(gdt);
+    let gdt = block.gdt.init(gdt);
     // SAFETY: The caller runs this before anything uses the segment
     // registers.
     unsafe {
         load_gdt(gdt, code);
     }
     // SAFETY: tss_selector selects the TSS descriptor of the GDT just
-    // loaded, for a TSS that lives for the rest of the kernel's life.
+    // loaded, for a TSS that lives for the rest of the kernel's life, and
+    // used by this CPU alone.
     unsafe {
         load_tss(tss_selector);
     }
+    // After the CS reload: set_handler_addr gives each entry the current CS
+    // as its code selector, and the loader's would index this GDT. Every
+    // GDT has the kernel's code at the same selector, so one IDT serves
+    // every CPU.
+    match IDT.get() {
+        Some(idt) => idt.load(),
+        None => IDT.init(idt()).load(),
+    }
+}
 
-    if let Err(e) = Star::write(user_code, user_data, code, data) {
+/// Points SYSCALL at its stub, with the GDT's selectors and the flags it
+/// clears.
+pub fn load_syscall() {
+    let selectors = Star::write(
+        SegmentSelector(USER_CODE),
+        SegmentSelector(USER_DATA),
+        SegmentSelector(KERNEL_CODE),
+        SegmentSelector(KERNEL_DATA),
+    );
+    if let Err(e) = selectors {
         panic!("the GDT's selectors don't suit SYSCALL: {e:?}");
     }
     LStar::write(VirtAddr::from_ptr(&raw const thisos_syscall));
@@ -574,28 +610,9 @@ pub unsafe fn init(handler: TrapHandler<X86_64>) {
             | RFlags::IOPL_LOW
             | RFlags::IOPL_HIGH,
     );
-    // SAFETY: SYSCALL now enters thisos_syscall, which runs on the stack
-    // TSS.RSP0 holds, and nothing reaches ring 3 to run it before
-    // Cpu::enter_user, after a switch has set RSP0.
-    unsafe {
-        Efer::update(|flags| flags.insert(EferFlags::SYSTEM_CALL_EXTENSIONS));
-    }
-    // The kernel saves no x87, SSE or AVX state, so user code may use none
-    // of them: with EM set x87 instructions trap, and with OSFXSR and
-    // OSXSAVE clear so do SSE and AVX instructions, and XSETBV.
-    // SAFETY: The kernel is built soft-float and runs none of them either.
-    unsafe {
-        Cr0::update(|flags| flags.insert(Cr0Flags::EMULATE_COPROCESSOR));
-    }
-    // SAFETY: As for CR0.
-    unsafe {
-        Cr4::update(|flags| {
-            flags.remove(Cr4Flags::OSFXSR | Cr4Flags::OSXMMEXCPT_ENABLE | Cr4Flags::OSXSAVE);
-        });
-    }
+}
 
-    // After the CS reload: set_handler_addr gives each entry the current CS
-    // as its code selector, and the loader's would index this GDT.
+fn idt() -> InterruptDescriptorTable {
     let mut idt = InterruptDescriptorTable::new();
     install(&mut idt.divide_error, 0);
     // On a stack of its own, as Linux has it: a data breakpoint on a MOV SS
@@ -628,7 +645,7 @@ pub unsafe fn init(handler: TrapHandler<X86_64>) {
     for vector in 32..=u8::MAX {
         install(&mut idt[vector], vector);
     }
-    IDT.init(idt).load();
+    idt
 }
 
 /// Loads `gdt` and the segment registers, with `code` in CS.
@@ -636,7 +653,8 @@ pub unsafe fn init(handler: TrapHandler<X86_64>) {
 /// # Safety
 ///
 /// `code` must select the 64-bit kernel code segment of `gdt`, and nothing
-/// may rely on the segment registers' old values.
+/// may rely on the segment registers' old values, GS's base among them,
+/// which a selector load clears on Intel.
 unsafe fn load_gdt(gdt: &'static GlobalDescriptorTable, code: SegmentSelector) {
     gdt.load();
     // SAFETY: The caller guarantees code, which is what the kernel already
@@ -652,9 +670,8 @@ unsafe fn load_gdt(gdt: &'static GlobalDescriptorTable, code: SegmentSelector) {
     }
     // Old selectors in these index this GDT too, and name whatever its
     // layout puts there.
-    // SAFETY: 64-bit mode ignores DS and ES, and nothing in the kernel
-    // addresses memory through FS or GS, so a null selector in each changes
-    // nothing the kernel relies on.
+    // SAFETY: 64-bit mode ignores DS and ES, the kernel addresses nothing
+    // through FS, and the caller sets GS's base after this.
     unsafe {
         asm!(
             "mov ds, {0:e}",
@@ -664,23 +681,6 @@ unsafe fn load_gdt(gdt: &'static GlobalDescriptorTable, code: SegmentSelector) {
             in(reg) 0u32,
             options(nostack, preserves_flags),
         );
-    }
-}
-
-/// Loads the kernel's GDT and its segments on an AP, but not the TSS,
-/// which is already busy on the BSP.
-///
-/// # Safety
-///
-/// Call it on an AP before anything there uses the segment registers.
-pub unsafe fn load_gdt_on_ap() {
-    let Some(gdt) = GDT.get() else {
-        panic!("an AP started before the GDT was built");
-    };
-    // SAFETY: init asserted that KERNEL_CODE selects the GDT's code
-    // segment; the caller guarantees the rest.
-    unsafe {
-        load_gdt(gdt, SegmentSelector(KERNEL_CODE));
     }
 }
 
@@ -697,30 +697,34 @@ fn install<F>(entry: &mut Entry<F>, vector: u8) -> &mut EntryOptions {
 /// As `install`, with the CPU switching to stack `ist` before the stub runs.
 fn install_on<F>(entry: &mut Entry<F>, vector: u8, ist: u16) {
     let options = install(entry, vector);
-    // SAFETY: ist is one of the slots init fills with a stack of its own in
-    // IST_STACKS, which move_stacks replaces with another of its own, and
-    // init passes each to one vector only, so no two traps share one.
+    // SAFETY: ist is one of the slots percpu::prepare fills with a stack of
+    // its own for every CPU, which move_stacks replaces with another of its
+    // own on the boot CPU, and idt passes each to one vector only, so no
+    // two traps share one. The stub for each of these vectors is one that
+    // swaps GS's base by IA32_GS_BASE.
     unsafe {
         options.set_stack_index(ist);
     }
 }
 
-/// The stacks `move_stacks` put in the IST slots, which keep them for good.
+/// The stacks `move_stacks` put in the boot CPU's IST slots, which keep
+/// them for good.
 static MOVED_STACKS: Once<[paging::Stack; 4]> = Once::new();
 
-/// Moves each IST slot to a stack from `stack`, which it calls with the
-/// stack's size; see `Platform::move_trap_stacks`.
+/// Moves each of the boot CPU's IST slots to a stack from `stack`, which it
+/// calls with the stack's size; see `Platform::move_trap_stacks`.
 pub fn move_stacks(stack: &mut dyn FnMut(usize) -> paging::Stack) {
     assert!(
         MOVED_STACKS.get().is_none(),
         "the trap stacks moved already"
     );
+    let tss = &percpu::this().tss;
     let moved = IST_SLOTS.map(|slot| {
         let moved = stack(IST_STACK_SIZE);
         // The CPU reads the slot on this core, which sees its own stores in
         // order, and the boot stack it held stays valid, so a trap meanwhile
         // takes either stack.
-        TSS.slot(slot).store(moved.range().end, Ordering::Relaxed);
+        tss.slot(slot).store(moved.range().end, Ordering::Relaxed);
         moved
     });
     MOVED_STACKS.init(moved);
@@ -729,17 +733,17 @@ pub fn move_stacks(stack: &mut dyn FnMut(usize) -> paging::Stack) {
 /// Makes `top` the stack a trap from user code starts on, through IDT or
 /// SYSCALL: the top of the stack of the thread about to run.
 pub fn set_kernel_stack(top: u64) {
-    // A trap reads it on this core, which sees its own stores in order.
-    TSS.word(RSP0).store(top, Ordering::Relaxed);
+    percpu::this().set_kernel_stack(top);
 }
 
-/// The stacks the IST slots hold.
+/// The stacks the running CPU's IST slots hold.
 pub fn stacks() -> impl Iterator<Item = Range<u64>> {
     let Ok(size) = u64::try_from(IST_STACK_SIZE) else {
         panic!("{IST_STACK_SIZE:#x} doesn't fit a u64");
     };
+    let tss = &percpu::this().tss;
     IST_SLOTS.into_iter().map(move |slot| {
-        let top = TSS.slot(slot).load(Ordering::Relaxed);
+        let top = tss.slot(slot).load(Ordering::Relaxed);
         top - size..top
     })
 }

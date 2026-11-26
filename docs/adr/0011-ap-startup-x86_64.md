@@ -1,7 +1,7 @@
 # 0011. AP startup on x86_64: own MADT parse and trampoline, on `bootloader` 0.11
 
 - **Status:** Accepted
-- **Date:** 2026-11-26
+- **Date:** 2026-11-26, updated 2026-11-26 for [0012](0012-per-cpu-state.md)
 
 ## Context
 
@@ -12,13 +12,12 @@ The SMP milestone needs the application processors (APs) running before per-CPU 
 - **Loader.** x86_64 stays on `bootloader` 0.11.
 - **Tables.** A forbid-unsafe crate, `lib/acpi`, checks the RSDP, the XSDT and the MADT, each passed in as a byte slice that the arch crate read through the physical-memory mapping, and lists the MADT's Local APIC and Local x2APIC entries. Two entries that may be started with one APIC ID are an error; disabled ones may repeat. Its tests run under Miri on hand-built tables and on the MADTs of QEMU's q35 and the 83DA.
 - **Which CPUs.** Entries with Enabled set. Online-capable ones are logged and left off.
-- **Trampoline.** The four highest free frames below 640 KiB hold the trampoline and the AP's own page tables, for the kernel's life. Those tables copy the kernel's upper half and identity map the low 2 MiB with one page, so the AP can turn paging on from 32-bit mode with a level 4 table below 4 GiB, jump to the upper half, and only then load the kernel's CR3. The kernel's own tables never gain a lower-half entry. The AP takes the BSP's CR0, CR4, EFER and PAT.
+- **Trampoline.** The four highest free frames below 640 KiB hold the trampoline and the AP's own page tables, for the kernel's life. Those tables copy the kernel's upper half and identity map the low 2 MiB with one page, so the AP can turn paging on from 32-bit mode with a level 4 table below 4 GiB, jump to the upper half, and only then load the kernel's CR3. The kernel's own tables never gain a lower-half entry. The trampoline sets only what long mode needs, PAE, LME, NXE and PG; the AP sets the rest of CR0, CR4 and EFER itself ([0012](0012-per-cpu-state.md)). Until that change it copied the BSP's CR0, CR4, EFER and PAT.
 - **Sequence.** One AP at a time, in MADT order: INIT, 10 ms, startup IPI, 200 µs, a second startup IPI only if the AP hasn't checked in, then up to 250 ms. Delays are timed on the TSC. An AP that doesn't check in gets INIT again, so it can't run the trampoline with the next AP's data, and the boot goes on without it, with a warning.
-- **Until per-CPU state.** An AP loads the kernel's GDT without a TSS and an IDT whose exception stubs record the vector and halt, enables its APIC in x2APIC mode, stores its APIC ID in its own atomic slot and halts with interrupts off. It takes no lock and logs nothing; the BSP logs for it.
+- **Until the scheduler.** An AP sets up its own state as [0012](0012-per-cpu-state.md) describes, stores its APIC ID and the index it reads back through GS in its own atomic slot and halts with interrupts off. It takes no lock and logs nothing; the BSP logs for it and checks the index. Before per-CPU state it ran on a park IDT whose exception stubs recorded the vector and halted, with no TSS.
 
 ## Consequences
 
 - `Platform::start_cpus` is in the HAL; aarch64 starts nothing and returns 1.
 - APs cost about 10 ms each at boot, nearly all of it the INIT wait.
-- A trap on a parked AP is reported only while the BSP waits for an AP, and is put down to the AP being started then.
-- Per-CPU state (item 4) replaces the park IDT and gives each AP a TSS, and the scheduler (item 6) gives the parked APs work.
+- Per-CPU state ([0012](0012-per-cpu-state.md)) replaced the park IDT and gave each AP a TSS; the scheduler gives the parked APs work.

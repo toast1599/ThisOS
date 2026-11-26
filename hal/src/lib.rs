@@ -188,6 +188,11 @@ pub enum Probe {
     /// nothing is mapped there, or because the kernel may not run user
     /// code.
     ExecuteUser,
+    /// x86_64 only: with interrupts off, makes user code's GS base the
+    /// active one, as it is on a SYSCALL's first instruction, sends its own
+    /// CPU an NMI and spins, which traps with [`Trap::Other`] on vector 2.
+    /// The catch checks that the NMI's path gave user code's base back.
+    NmiWithUserGs,
 }
 
 /// The ramdisk file that names which test that expects a panic a QEMU test
@@ -326,6 +331,11 @@ pub enum UserProgram {
     /// and `TPIDR_EL0` on aarch64. It exits with status 0, or with the number
     /// of the first check that failed.
     ThreadRegisters,
+    /// Reads where a kernel descriptor table is, which user code may not:
+    /// SGDT on x86_64, where UMIP faults it, and `VBAR_EL1` on aarch64. Exits
+    /// with status 0 if that runs, and on x86_64 with status 2 first if
+    /// CPUID reports no UMIP.
+    DescriptorTable,
 }
 
 /// The most frames [`Cpu::backtrace`] reports.
@@ -453,8 +463,10 @@ pub trait Platform {
     fn start_timer(hz: u32) -> TimerFrequency;
 
     /// Starts every other CPU the firmware lists as ready, one at a time,
-    /// each on a stack from `stack`, which it calls with the size in bytes
-    /// and keeps for good. A started CPU parks with interrupts off. Tells
+    /// each on stacks from `stack`, which it calls with the size in bytes
+    /// and keeps for good: one to run on, and any the CPU takes traps on.
+    /// A started CPU sets up its own state and parks with interrupts off;
+    /// a trap there goes to the trap handler. Tells
     /// `report` what happens as it goes, so that the caller can log each
     /// step before the next wait. Returns how many CPUs run, the caller's
     /// included. Call it once, after [`Platform::start_timer`].
@@ -713,6 +725,8 @@ pub enum CpuStart {
         id: u32,
         /// The ID the CPU itself read.
         reported: u32,
+        /// The index the CPU itself read from its own state.
+        reported_cpu: usize,
         /// How long it took from the first signal, in microseconds.
         micros: u64,
     },
@@ -720,13 +734,6 @@ pub enum CpuStart {
     Silent {
         /// Its ID.
         id: u32,
-    },
-    /// A CPU trapped on `vector` while CPU `id` was starting, and halted.
-    Trapped {
-        /// The ID of the CPU being started.
-        id: u32,
-        /// The trap's vector.
-        vector: u8,
     },
 }
 

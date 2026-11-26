@@ -639,6 +639,13 @@ global_asm!(
     "svc #0",
     "udf #0",
     ".org thisos_user_programs + 14 * {slot}, 0",
+    // DescriptorTable: EL0 may not read VBAR_EL1.
+    "mrs x0, vbar_el1",
+    "mov x0, #0",
+    "mov x8, #{exit}",
+    "svc #0",
+    "udf #0",
+    ".org thisos_user_programs + 15 * {slot}, 0",
     ".popsection",
     exit = const Syscall::Exit.number(),
     write = const Syscall::Write.number(),
@@ -687,7 +694,7 @@ global_asm!(
 );
 
 unsafe extern "C" {
-    static thisos_user_programs: [u8; 14 * SLOT];
+    static thisos_user_programs: [u8; 15 * SLOT];
 }
 
 /// Writes `program` at the start of `frame`, through the physical-memory
@@ -708,6 +715,7 @@ pub fn write_program(phys_offset: u64, frame: &mut Frame, program: UserProgram) 
         UserProgram::LastSyscall => 11,
         UserProgram::MaskInterrupts => 12,
         UserProgram::ThreadRegisters => 13,
+        UserProgram::DescriptorTable => 14,
     };
     let source = (&raw const thisos_user_programs)
         .cast::<u8>()

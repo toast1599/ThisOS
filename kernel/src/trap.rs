@@ -137,4 +137,29 @@ mod tests {
         let start = timer::ticks();
         testing::spin_until("a tick after the overflow", || timer::ticks() > start);
     }
+
+    // An NMI can arrive on a SYSCALL's first instruction, in ring 0 with
+    // user code's GS base, where the saved CS says nothing about which base
+    // is active. Its handler must still find this CPU's index, and its
+    // return must leave user code's base active, which the catch checks.
+    #[cfg(target_arch = "x86_64")]
+    #[test_case]
+    fn an_nmi_on_user_gs_finds_its_cpu() {
+        use core::sync::atomic::{AtomicUsize, Ordering};
+
+        use crate::cpu;
+
+        static SEEN: AtomicUsize = AtomicUsize::new(usize::MAX);
+        testing::expect_trap(
+            |trap| {
+                SEEN.store(cpu::id(), Ordering::Relaxed);
+                trap == Trap::Other {
+                    vector: 2,
+                    error: 0,
+                }
+            },
+            Probe::NmiWithUserGs,
+        );
+        assert_eq!(SEEN.load(Ordering::Relaxed), cpu::id());
+    }
 }

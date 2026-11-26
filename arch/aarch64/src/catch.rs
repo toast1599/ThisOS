@@ -119,6 +119,7 @@ pub fn catch(probe: Probe) {
         Probe::WriteReadOnly => 3,
         Probe::ExecuteNoExecute | Probe::ExecuteUser => 4,
         Probe::SpinUserAccessOpen => 5,
+        Probe::NmiWithUserGs => panic!("aarch64 has no NMI or GS base to probe"),
     };
     let run = || {
         // SAFETY: thisos_catch saves and restores every callee-saved
@@ -153,7 +154,8 @@ pub fn catch(probe: Probe) {
         | Probe::WriteReadOnly
         | Probe::ExecuteNoExecute
         | Probe::ReadUser
-        | Probe::ExecuteUser => run(),
+        | Probe::ExecuteUser
+        | Probe::NmiWithUserGs => run(),
     }
 }
 
@@ -164,7 +166,9 @@ pub fn target(probe: Probe) -> Option<u64> {
         Probe::WriteReadOnly => Some(address(&raw const thisos_probe_read_only)),
         Probe::ExecuteNoExecute => Some(address(&raw const thisos_probe_ret)),
         Probe::ReadUser | Probe::ExecuteUser => Some(USER_SPACE.start),
-        Probe::OverflowStack | Probe::Spin | Probe::SpinUserAccessOpen => None,
+        Probe::OverflowStack | Probe::Spin | Probe::SpinUserAccessOpen | Probe::NmiWithUserGs => {
+            None
+        }
     }
 }
 
