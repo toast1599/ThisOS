@@ -494,31 +494,17 @@ pub trait Platform {
 
     /// Copies `frame`'s bytes from `offset` into `buf`, reaching them
     /// through the kernel's own mapping. The frame may be shared, and
-    /// mapped for user code: the kernel holds no reference into its bytes.
-    /// Panics if interrupts are on, since with them off nothing else runs
-    /// to write the frame during the copy, and unless `buf` fits in the
-    /// frame from `offset`.
+    /// mapped for user code: the kernel holds no reference into its bytes,
+    /// and user code on another CPU, or another copy, may write them
+    /// meanwhile, leaving `buf` some bytes from before the write and some
+    /// from after. Panics unless `buf` fits in the frame from `offset`.
     fn read_frame(frame: &Frame, offset: usize, buf: &mut [u8]);
 
     /// Copies `bytes` into `frame` from `offset`, leaving its other bytes
     /// as they were, as [`read_frame`](Self::read_frame) copies the other
-    /// way. Panics as that does.
+    /// way. Of bytes that user code or another copy writes meanwhile, each
+    /// keeps one of the values written. Panics as `read_frame` does.
     fn write_frame(frame: &Frame, offset: usize, bytes: &[u8]);
-
-    /// Copies the bytes at `addr` in the address space the CPU uses into
-    /// `buf`, reaching their frame through the kernel's own mapping, so the
-    /// kernel never reaches user pages. The bytes must end inside `addr`'s
-    /// page; a caller splits a longer copy. Returns `false`, copying
-    /// nothing, unless the page is mapped for user code. Panics if the
-    /// bytes cross a page, or if interrupts are on: with them off, nothing
-    /// can unmap the page or write it during the copy.
-    fn copy_from_user(addr: u64, buf: &mut [u8]) -> bool;
-
-    /// Copies `buf` to `addr` in the address space the CPU uses, as
-    /// [`copy_from_user`](Self::copy_from_user) copies the other way, and
-    /// panics as it does. Returns `false`, copying nothing, unless the page
-    /// is mapped writable for user code.
-    fn copy_to_user(addr: u64, buf: &[u8]) -> bool;
 
     /// Writes code that only returns at the start of `frame`, for
     /// [`Probe::ExecuteUser`] to find if the CPU ever let it run. For
@@ -664,6 +650,25 @@ pub trait AddressSpace<O>: Send + Sync {
 
     /// Where `addr` is mapped in this space, or `None` if it isn't.
     fn translate(&self, addr: u64) -> Option<Translation>;
+
+    /// Copies the bytes at `addr` in this space into `buf`, reaching their
+    /// frame through the kernel's own mapping, so the kernel never reaches
+    /// user pages. The space need not be the one the CPU uses. The bytes
+    /// must end inside `addr`'s page; a caller splits a longer copy.
+    /// Returns `false`, copying nothing, unless the page is mapped for user
+    /// code. Panics if the bytes cross a page.
+    ///
+    /// The page stays mapped until the copy is done: an
+    /// [`unmap`](Self::unmap) on another CPU waits for it. User code there
+    /// may write the bytes meanwhile, as
+    /// [`Platform::read_frame`] describes.
+    fn copy_from_user(&self, addr: u64, buf: &mut [u8]) -> bool;
+
+    /// Copies `buf` to `addr` in this space, as
+    /// [`copy_from_user`](Self::copy_from_user) copies the other way, and
+    /// panics as it does. Returns `false`, copying nothing, unless the page
+    /// is mapped writable for user code.
+    fn copy_to_user(&self, addr: u64, buf: &[u8]) -> bool;
 
     /// Makes the CPU use this space.
     fn activate(&self);

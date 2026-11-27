@@ -297,14 +297,6 @@ impl Platform for Aarch64 {
         paging::write_frame(boot::phys_offset(), frame, offset, bytes);
     }
 
-    fn copy_from_user(addr: u64, buf: &mut [u8]) -> bool {
-        paging::copy_from_user(boot::phys_offset(), addr, buf)
-    }
-
-    fn copy_to_user(addr: u64, buf: &[u8]) -> bool {
-        paging::copy_to_user(boot::phys_offset(), addr, buf)
-    }
-
     fn write_return(frame: &mut Frame) {
         paging::write_return(boot::phys_offset(), frame);
     }

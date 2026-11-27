@@ -528,8 +528,9 @@ fn at(addr: u64, done: usize) -> Option<u64> {
 /// to `addr`, as the memory-read syscall does.
 fn memory_read(handle_arg: u64, offset: u64, addr: u64, len: u64) -> Result<u64, Error> {
     let (object, offset, len) = memory(handle_arg, Rights::READ, offset, len)?;
+    let space = space();
     let copied = object.read(offset, len, |done, piece| {
-        at(addr, done).is_some_and(|addr| copy_to_user(addr, piece))
+        at(addr, done).is_some_and(|addr| copy_to_user(&space, addr, piece))
     })?;
     if copied {
         Ok(0)
@@ -542,8 +543,9 @@ fn memory_read(handle_arg: u64, offset: u64, addr: u64, len: u64) -> Result<u64,
 /// from `offset`, as the memory-write syscall does.
 fn memory_write(handle_arg: u64, offset: u64, addr: u64, len: u64) -> Result<u64, Error> {
     let (object, offset, len) = memory(handle_arg, Rights::WRITE, offset, len)?;
+    let space = space();
     let copied = object.write(offset, len, |done, piece| {
-        at(addr, done).is_some_and(|addr| copy_from_user(addr, piece))
+        at(addr, done).is_some_and(|addr| copy_from_user(&space, addr, piece))
     })?;
     if copied {
         Ok(0)
@@ -601,12 +603,13 @@ fn send(handle_arg: u64, buf: u64, len: u64, handles: u64, count_arg: u64) -> Re
     let mut bytes = Vec::new();
     bytes.try_reserve_exact(len).map_err(|_| Error::NoMemory)?;
     bytes.resize(len, 0);
-    if !copy_from_user(buf, &mut bytes) {
+    let space = space();
+    if !copy_from_user(&space, buf, &mut bytes) {
         return Err(Error::BadAddress);
     }
     let mut raw = [0; 4 * MAX_MESSAGE_HANDLES];
     let raw = &mut raw[..4 * count];
-    if !copy_from_user(handles, raw) {
+    if !copy_from_user(&space, handles, raw) {
         return Err(Error::BadAddress);
     }
     let mut numbers = [0; MAX_MESSAGE_HANDLES];
@@ -638,6 +641,7 @@ fn receive(handle_arg: u64, buf: u64, len: u64, handles: u64, count: u64) -> Res
     let len = usize::try_from(len).unwrap_or(usize::MAX);
     let count = usize::try_from(count).unwrap_or(usize::MAX);
     let process = process();
+    let space = space();
     let mut needed = 0;
     let received = endpoint.receive(|message| {
         if message.bytes.len() > len || message.handles.len() > count {
@@ -655,7 +659,9 @@ fn receive(handle_arg: u64, buf: u64, len: u64, handles: u64, count: u64) -> Res
                 for (chunk, number) in raw.as_chunks_mut::<4>().0.iter_mut().zip(numbers) {
                     chunk.copy_from_slice(&number.to_le_bytes());
                 }
-                if copy_to_user(buf, &bytes) && copy_to_user(handles, &raw[..4 * numbers.len()]) {
+                if copy_to_user(&space, buf, &bytes)
+                    && copy_to_user(&space, handles, &raw[..4 * numbers.len()])
+                {
                     Ok(value)
                 } else {
                     Err(Error::BadAddress)
@@ -693,7 +699,8 @@ fn wait(items: u64, count_arg: u64, timeout: u64) -> Result<u64, Error> {
     let raw = &mut raw[..WAIT_ITEM_SIZE * count];
     // Written back unchanged, so that items the call can't write its result
     // into fail before it blocks rather than after.
-    if !copy_from_user(items, raw) || !copy_to_user(items, raw) {
+    let space = space();
+    if !copy_from_user(&space, items, raw) || !copy_to_user(&space, items, raw) {
         return Err(Error::BadAddress);
     }
     let mut waits = Vec::new();
@@ -727,7 +734,7 @@ fn wait(items: u64, count_arg: u64, timeout: u64) -> Result<u64, Error> {
     {
         item[8..].copy_from_slice(&signals.bits().to_le_bytes());
     }
-    if !copy_to_user(items, raw) {
+    if !copy_to_user(&space, items, raw) {
         return Err(Error::BadAddress);
     }
     // At most MAX_WAIT_ITEMS.
@@ -744,7 +751,7 @@ fn write(buf: u64, len: u64) -> Result<u64, Error> {
         .ok()
         .and_then(|len| bytes.get_mut(..len))
         .ok_or(Error::TooLong)?;
-    if !copy_from_user(buf, bytes) {
+    if !copy_from_user(&space(), buf, bytes) {
         return Err(Error::BadAddress);
     }
     let text = str::from_utf8(bytes).map_err(|_| Error::NotUtf8)?;
@@ -766,38 +773,39 @@ fn write(buf: u64, len: u64) -> Result<u64, Error> {
     Ok(len)
 }
 
-/// Copies `bytes` to `addr` in user space, as [`Platform::copy_to_user`]
-/// does, a page at a time; see [`by_page`].
-fn copy_to_user(addr: u64, bytes: &[u8]) -> bool {
+/// Copies `bytes` to `addr` in `space`, as
+/// [`thisos_hal::AddressSpace::copy_to_user`] does, a page at a time; see
+/// [`by_page`].
+fn copy_to_user(space: &Space, addr: u64, bytes: &[u8]) -> bool {
     by_page(addr, bytes.len(), |addr, range| {
         bytes
             .get(range)
-            .is_some_and(|chunk| Arch::copy_to_user(addr, chunk))
+            .is_some_and(|chunk| space.copy_to_user(addr, chunk))
     })
 }
 
-/// Copies the bytes at `addr` in user space into `bytes`, as
-/// [`Platform::copy_from_user`] does, a page at a time; see [`by_page`].
-fn copy_from_user(addr: u64, bytes: &mut [u8]) -> bool {
+/// Copies the bytes at `addr` in `space` into `bytes`, as
+/// [`thisos_hal::AddressSpace::copy_from_user`] does, a page at a time;
+/// see [`by_page`].
+fn copy_from_user(space: &Space, addr: u64, bytes: &mut [u8]) -> bool {
     by_page(addr, bytes.len(), |addr, range| {
         bytes
             .get_mut(range)
-            .is_some_and(|chunk| Arch::copy_from_user(addr, chunk))
+            .is_some_and(|chunk| space.copy_from_user(addr, chunk))
     })
 }
 
 /// Splits the `len` bytes at `addr` in user space at page boundaries and
 /// runs `copy` with each piece's address and its range in the `len`
-/// bytes, in order, until it returns false. Runs each with interrupts off,
-/// so that nothing unmaps the page while it is copied. Returns whether
-/// every `copy` returned true.
+/// bytes, in order, until it returns false. Returns whether every `copy`
+/// returned true.
 fn by_page(addr: u64, len: usize, mut copy: impl FnMut(u64, Range<usize>) -> bool) -> bool {
     let mut addr = addr;
     let mut done = 0;
     while done < len {
         let in_page = 4096 - addr % 4096;
         let end = len.min(done.saturating_add(usize::try_from(in_page).unwrap_or(usize::MAX)));
-        if !Arch::without_interrupts(|| copy(addr, done..end)) {
+        if !copy(addr, done..end) {
             return false;
         }
         // The page was user space, so the next one's address fits.
@@ -1022,8 +1030,10 @@ mod tests {
         crate::testing::ExpectPanic {
             name: "thisos_kernel::user::tests::a_user_copy_across_a_page_panics",
             run: || {
-                let mut buf = [0; 2];
-                Arch::without_interrupts(|| Arch::copy_from_user(0x1_0fff, &mut buf));
+                let Some(space) = paging::new_space() else {
+                    panic!("no free frame for a space");
+                };
+                space.copy_from_user(0x1_0fff, &mut [0; 2]);
             },
             message: "copying 2 bytes at 0x10fff crosses a page",
             after: None,
@@ -1044,16 +1054,9 @@ mod tests {
                 panic!("mapping {page:#x} failed: {e}");
             }
         }
-        // A tick would switch this kernel thread back to the kernel's
-        // tables.
-        let bytes = Arch::without_interrupts(|| {
-            space.activate();
-            assert!(!copy_to_user(0x40_0fff, b"ab"));
-            let mut bytes = [0; 2];
-            assert!(copy_from_user(0x40_0fff, &mut bytes));
-            paging::activate();
-            bytes
-        });
+        assert!(!copy_to_user(&space, 0x40_0fff, b"ab"));
+        let mut bytes = [0; 2];
+        assert!(copy_from_user(&space, 0x40_0fff, &mut bytes));
         assert_eq!(&bytes, b"a\0");
     }
 

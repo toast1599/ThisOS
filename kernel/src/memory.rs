@@ -10,7 +10,7 @@ use core::ops::Deref;
 
 use thisos_abi::Error;
 use thisos_frames::Frame;
-use thisos_hal::{Cpu, Platform, Protection};
+use thisos_hal::{Platform, Protection};
 use thisos_locks::Rank;
 use thisos_regions::Uses;
 
@@ -67,7 +67,7 @@ impl MemoryObject {
         let mut buf = [0; 4096];
         for (frame, at, done, piece) in self.pieces(offset, len)? {
             let buf = &mut buf[..piece];
-            Arch::without_interrupts(|| Arch::read_frame(&self.frames[frame], at, buf));
+            Arch::read_frame(&self.frames[frame], at, buf);
             if !out(done, buf) {
                 return Ok(false);
             }
@@ -99,7 +99,7 @@ impl MemoryObject {
             if !fill(done, buf) {
                 return Ok(false);
             }
-            Arch::without_interrupts(|| Arch::write_frame(&self.frames[frame], at, buf));
+            Arch::write_frame(&self.frames[frame], at, buf);
         }
         Ok(true)
     }

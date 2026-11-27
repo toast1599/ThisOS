@@ -40,11 +40,11 @@ const UPPER_HALF: u16 = 256;
 /// boundary, where SYSCALL would save a RIP that SYSRET can't return to.
 pub const USER_SPACE: Range<u64> = 0x1_0000..0x0000_7fff_ffff_f000;
 
-/// The CPU state the tables depend on: CR3, the TLB and the interrupt flag.
+/// The CPU state the tables depend on: CR3 and the TLB.
 /// Host tests swap in `tests::cpu`, a fake per test thread.
 #[cfg(not(test))]
 mod cpu {
-    use x86_64::instructions::{interrupts, tlb};
+    use x86_64::instructions::tlb;
     use x86_64::registers::control::Cr3;
     use x86_64::structures::paging::PhysFrame;
     use x86_64::{PhysAddr, VirtAddr};
@@ -70,10 +70,6 @@ mod cpu {
 
     pub fn flush(page: VirtAddr) {
         tlb::flush(page);
-    }
-
-    pub fn interrupts_enabled() -> bool {
-        interrupts::are_enabled()
     }
 }
 
@@ -907,8 +903,8 @@ impl<O: Deref<Target = [Frame]> + Send + Sync> thisos_hal::AddressSpace<O> for U
             // Tables let everything through; each leaf says what it allows.
             // SAFETY: The mapping now holds the object, which holds the
             // frame, until unmap or destroy clears the page. The kernel
-            // reaches user pages' frames only in copy_from_user, which
-            // holds no reference afterwards.
+            // reaches user pages' frames only in the user copies, which
+            // hold no reference afterwards.
             unsafe {
                 self.tables.map_leaf(
                     page,
@@ -964,6 +960,45 @@ impl<O: Deref<Target = [Frame]> + Send + Sync> thisos_hal::AddressSpace<O> for U
 
     fn translate(&self, addr: u64) -> Option<Translation> {
         self.tables.translate(addr)
+    }
+
+    fn copy_from_user(&self, addr: u64, buf: &mut [u8]) -> bool {
+        assert_in_page(addr, buf.len());
+        // Unmap clears pages only under it, so the page stays mapped, and
+        // its frame the object's, until the copy is done.
+        let _mappings = self.mappings.lock();
+        let Some(translation) = self.tables.translate(addr) else {
+            return false;
+        };
+        if !translation.user || !USER_SPACE.contains(&addr) {
+            return false;
+        }
+        // A physical address, reached through the physical-memory mapping.
+        let source = (self.tables.phys_offset + translation.phys).as_ptr::<u8>();
+        // SAFETY: buf's bytes stay inside the page at addr, which the assert
+        // checks, and so do the words that hold them, since pages are
+        // aligned. The page is mapped for user code, so its frame is RAM
+        // that the physical-memory mapping maps, and it stays mapped while
+        // the lock is held. The kernel holds no reference into user pages.
+        unsafe { load_words(source, buf) };
+        true
+    }
+
+    fn copy_to_user(&self, addr: u64, buf: &[u8]) -> bool {
+        assert_in_page(addr, buf.len());
+        // As in copy_from_user.
+        let _mappings = self.mappings.lock();
+        let Some(translation) = self.tables.translate(addr) else {
+            return false;
+        };
+        if !translation.user || !translation.writable || !USER_SPACE.contains(&addr) {
+            return false;
+        }
+        // A physical address, reached through the physical-memory mapping.
+        let target = (self.tables.phys_offset + translation.phys).as_mut_ptr::<u8>();
+        // SAFETY: As in copy_from_user.
+        unsafe { store_words(buf, target) };
+        true
     }
 
     fn activate(&self) {
@@ -1027,13 +1062,8 @@ pub fn fill_frame(phys_offset: VirtAddr, frame: &mut Frame, offset: usize, bytes
 }
 
 /// The physical-memory mapping's address of `frame`'s bytes from `offset`,
-/// for `len` bytes. Panics with interrupts on, or unless the bytes fit in
-/// the frame.
+/// for `len` bytes. Panics unless the bytes fit in the frame.
 fn frame_bytes(phys_offset: VirtAddr, frame: &Frame, offset: usize, len: usize) -> *mut u8 {
-    assert!(
-        !cpu::interrupts_enabled(),
-        "copying a shared frame with interrupts on"
-    );
     assert!(
         offset.checked_add(len).is_some_and(|end| end <= 4096),
         "{len:#x} bytes at offset {offset:#x} don't fit in a frame"
@@ -1042,79 +1072,124 @@ fn frame_bytes(phys_offset: VirtAddr, frame: &Frame, offset: usize, len: usize) 
     (phys_offset + frame.start() + u64::try_from(offset).unwrap_or(4096)).as_mut_ptr::<u8>()
 }
 
+/// The aligned word at index `i` from the one that holds the byte at
+/// `start`.
+///
+/// # Safety
+///
+/// The word must be RAM that stays allocated while the result lives, and
+/// that no Rust reference but such words reaches.
+#[expect(
+    clippy::cast_ptr_alignment,
+    reason = "start is rounded down to a multiple of 8 before the cast"
+)]
+unsafe fn word<'a>(start: *const u8, i: usize) -> &'a AtomicU64 {
+    let first = start.wrapping_sub(start.addr() % 8).cast::<u64>();
+    // SAFETY: first is 8-aligned, and so is every word after it. The
+    // caller guarantees the rest.
+    unsafe { AtomicU64::from_ptr(first.wrapping_add(i).cast_mut()) }
+}
+
+/// Copies the `buf.len()` bytes at `source` into `buf` with one relaxed
+/// atomic load per aligned word that holds them. Copies of shared frames
+/// and user pages go through here and `store_words`, so every kernel access
+/// to those bytes is a whole aligned word: Rust's model lets atomic
+/// accesses race only when they cover the same bytes, and user code is
+/// outside it.
+///
+/// # Safety
+///
+/// The words that hold the bytes must be RAM that stays allocated through
+/// the call, and that no Rust reference reaches but `word`'s.
+unsafe fn load_words(source: *const u8, buf: &mut [u8]) {
+    let skip = source.addr() % 8;
+    let load = |i| {
+        // SAFETY: The caller guarantees it for every word that holds the
+        // bytes, which are the only ones the calls below ask for.
+        let word = unsafe { word(source, i) };
+        word.load(Ordering::Relaxed).to_ne_bytes()
+    };
+    let head = if skip == 0 {
+        0
+    } else {
+        (8 - skip).min(buf.len())
+    };
+    let (start, rest) = buf.split_at_mut(head);
+    if head > 0 {
+        start.copy_from_slice(&load(0)[skip..skip + head]);
+    }
+    let after_head = usize::from(head > 0);
+    let (words, tail) = rest.as_chunks_mut::<8>();
+    for (i, chunk) in words.iter_mut().enumerate() {
+        *chunk = load(after_head + i);
+    }
+    if !tail.is_empty() {
+        let len = tail.len();
+        tail.copy_from_slice(&load(after_head + words.len())[..len]);
+    }
+}
+
+/// Copies `bytes` to `target` as `load_words` copies the other way: one
+/// relaxed atomic store per aligned word they fill, and, for a word they
+/// fill only part of, a compare-exchange loop that writes the word's other
+/// bytes back as it read them.
+///
+/// # Safety
+///
+/// As for `load_words`, for the words that hold the bytes at `target`.
+unsafe fn store_words(bytes: &[u8], target: *mut u8) {
+    let skip = target.addr() % 8;
+    // SAFETY: As in load_words.
+    let at = |i| unsafe { word(target, i) };
+    let splice = |i, from: usize, part: &[u8]| {
+        // A failed compare-exchange isn't a write, so retries race with
+        // nothing.
+        at(i).update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+            let mut new = old.to_ne_bytes();
+            new[from..from + part.len()].copy_from_slice(part);
+            u64::from_ne_bytes(new)
+        });
+    };
+    let head = if skip == 0 {
+        0
+    } else {
+        (8 - skip).min(bytes.len())
+    };
+    let (start, rest) = bytes.split_at(head);
+    if head > 0 {
+        splice(0, skip, start);
+    }
+    let after_head = usize::from(head > 0);
+    let (words, tail) = rest.as_chunks::<8>();
+    for (i, chunk) in words.iter().enumerate() {
+        at(after_head + i).store(u64::from_ne_bytes(*chunk), Ordering::Relaxed);
+    }
+    if !tail.is_empty() {
+        splice(after_head + words.len(), 0, tail);
+    }
+}
+
 /// Copies `frame`'s bytes from `offset` into `buf`; see
 /// `Platform::read_frame`.
 pub fn read_frame(phys_offset: VirtAddr, frame: &Frame, offset: usize, buf: &mut [u8]) {
     let source = frame_bytes(phys_offset, frame, offset, buf.len());
-    // SAFETY: The bytes are inside the frame, which is RAM the
-    // physical-memory mapping maps. The kernel's only reference into a
-    // frame's bytes is fill_frame's, which needs the frame mutably, and user
-    // code that maps it doesn't run while interrupts are off on the only
-    // CPU, so nothing writes them meanwhile. buf is the caller's own memory,
-    // apart from the frame's.
-    unsafe { ptr::copy_nonoverlapping(source, buf.as_mut_ptr(), buf.len()) };
+    // SAFETY: The bytes are inside the frame, and so are the words that
+    // hold them, since frames are 4 KiB aligned. It is RAM that the
+    // physical-memory mapping maps, and the caller's reference keeps it
+    // allocated. The kernel's only reference into a frame's bytes is
+    // fill_frame's, which needs the frame mutably.
+    unsafe { load_words(source, buf) };
 }
 
 /// Copies `bytes` into `frame` from `offset`; see `Platform::write_frame`.
 pub fn write_frame(phys_offset: VirtAddr, frame: &Frame, offset: usize, bytes: &[u8]) {
     let target = frame_bytes(phys_offset, frame, offset, bytes.len());
-    // SAFETY: As in read_frame: the bytes are inside the frame, no Rust
-    // reference reaches them, and nothing else runs to read or write them
-    // meanwhile.
-    unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), target, bytes.len()) };
-}
-
-/// Copies the bytes at `addr` in the tables CR3 points at into `buf`,
-/// which ends inside `addr`'s page; see `Platform::copy_from_user`.
-pub fn copy_from_user(phys_offset: VirtAddr, addr: u64, buf: &mut [u8]) -> bool {
-    assert!(
-        !cpu::interrupts_enabled(),
-        "copying from user memory with interrupts on"
-    );
-    assert_in_page(addr, buf.len());
-    let Some(translation) = translate_active(phys_offset, addr) else {
-        return false;
-    };
-    if !translation.user || !USER_SPACE.contains(&addr) {
-        return false;
-    }
-    // A physical address, reached through the physical-memory mapping.
-    let source = (phys_offset + translation.phys).as_ptr::<u8>();
-    // SAFETY: buf's bytes stay inside the page at addr, which the assert
-    // checks and which is mapped for user code, so its frame is RAM that
-    // the physical-memory mapping maps. Interrupts are off on the only
-    // CPU, so no other code runs to write the frame or unmap it meanwhile,
-    // and the kernel holds no reference into user pages.
-    unsafe { ptr::copy_nonoverlapping(source, buf.as_mut_ptr(), buf.len()) };
-    true
-}
-
-/// Copies `buf` to `addr` in the tables CR3 points at, ending inside `addr`'s
-/// page; see `Platform::copy_to_user`.
-pub fn copy_to_user(phys_offset: VirtAddr, addr: u64, buf: &[u8]) -> bool {
-    assert!(
-        !cpu::interrupts_enabled(),
-        "copying to user memory with interrupts on"
-    );
-    assert_in_page(addr, buf.len());
-    let Some(translation) = translate_active(phys_offset, addr) else {
-        return false;
-    };
-    if !translation.user || !translation.writable || !USER_SPACE.contains(&addr) {
-        return false;
-    }
-    // A physical address, reached through the physical-memory mapping.
-    let target = (phys_offset + translation.phys).as_mut_ptr::<u8>();
-    // SAFETY: As in copy_from_user: buf's bytes land inside the page at
-    // addr, whose frame is RAM that the physical-memory mapping maps,
-    // nothing else runs meanwhile, and the kernel holds no reference into
-    // user pages, so none aliases the bytes written.
-    unsafe { ptr::copy_nonoverlapping(buf.as_ptr(), target, buf.len()) };
-    true
+    // SAFETY: As in read_frame.
+    unsafe { store_words(bytes, target) };
 }
 
 /// Panics unless the `len` bytes at `addr` end inside `addr`'s page, as
-/// `Platform::copy_from_user` and `copy_to_user` require.
+/// `AddressSpace::copy_from_user` and `copy_to_user` require.
 fn assert_in_page(addr: u64, len: usize) {
     assert!(
         u64::try_from(len).is_ok_and(|len| addr % 4096 + len <= 4096),
@@ -1144,8 +1219,7 @@ mod tests {
     use super::*;
 
     /// The CPU as the tables see it, faked per test thread: CR3 starts at
-    /// 0, which no table is at, the TLB is a list of flushed pages, and
-    /// interrupts are always off.
+    /// 0, which no table is at, and the TLB is a list of flushed pages.
     pub mod cpu {
         use core::cell::{Cell, RefCell};
         use std::vec::Vec;
@@ -1175,10 +1249,6 @@ mod tests {
         /// The pages flushed since the last call.
         pub fn flushed() -> Vec<u64> {
             FLUSHED.take()
-        }
-
-        pub fn interrupts_enabled() -> bool {
-            false
         }
     }
 
@@ -1625,29 +1695,28 @@ mod tests {
             memory.frames.alloc()
         });
         assert!(mapped.is_ok());
-        space.activate();
 
         let mut buf = [0; 3];
-        assert!(copy_from_user(phys_offset, 0x40_0ffd, &mut buf));
+        assert!(space.copy_from_user(0x40_0ffd, &mut buf));
         assert_eq!(&buf, b"abc");
-        assert!(copy_from_user(phys_offset, 0x40_1000, &mut buf));
+        assert!(space.copy_from_user(0x40_1000, &mut buf));
         assert_eq!(&buf, b"def");
         let mut byte = [0];
-        assert!(copy_from_user(phys_offset, 0x40_2000, &mut byte));
+        assert!(space.copy_from_user(0x40_2000, &mut byte));
         assert_eq!(byte, [0xc3]);
         // The page after the mapping isn't mapped.
-        assert!(!copy_from_user(phys_offset, 0x40_3000, &mut [0]));
+        assert!(!space.copy_from_user(0x40_3000, &mut [0]));
         // Kernel pages aren't user pages.
         let start = kernel.kernel_space().start;
-        assert!(!copy_from_user(phys_offset, start, &mut [0]));
+        assert!(!space.copy_from_user(start, &mut [0]));
 
-        assert!(copy_to_user(phys_offset, 0x40_0ffe, b"wx"));
-        assert!(copy_to_user(phys_offset, 0x40_1000, b"yz"));
-        assert!(copy_from_user(phys_offset, 0x40_0ffd, &mut buf));
+        assert!(space.copy_to_user(0x40_0ffe, b"wx"));
+        assert!(space.copy_to_user(0x40_1000, b"yz"));
+        assert!(space.copy_from_user(0x40_0ffd, &mut buf));
         assert_eq!(&buf, b"awx");
-        assert!(copy_from_user(phys_offset, 0x40_1000, &mut buf));
+        assert!(space.copy_from_user(0x40_1000, &mut buf));
         assert_eq!(&buf, b"yzf");
-        assert!(!copy_to_user(phys_offset, start, b"k"));
+        assert!(!space.copy_to_user(start, b"k"));
     }
 
     // The kernel splits copies at page boundaries; a copy that crossed one
@@ -1655,15 +1724,17 @@ mod tests {
     #[test]
     #[should_panic(expected = "copying 2 bytes at 0x400fff crosses a page")]
     fn a_user_copy_from_across_a_page_panics() {
-        let memory = Memory::new();
-        copy_from_user(memory.phys_offset, 0x40_0fff, &mut [0; 2]);
+        let mut memory = Memory::new();
+        let kernel = kernel(&mut memory);
+        new_space(&kernel, &mut memory).copy_from_user(0x40_0fff, &mut [0; 2]);
     }
 
     #[test]
     #[should_panic(expected = "copying 2 bytes at 0x400fff crosses a page")]
     fn a_user_copy_to_across_a_page_panics() {
-        let memory = Memory::new();
-        copy_to_user(memory.phys_offset, 0x40_0fff, b"ab");
+        let mut memory = Memory::new();
+        let kernel = kernel(&mut memory);
+        new_space(&kernel, &mut memory).copy_to_user(0x40_0fff, b"ab");
     }
 
     // A memory object's frames are shared, so the kernel reads and writes
@@ -1684,13 +1755,12 @@ mod tests {
             &mut || memory.frames.alloc(),
         );
         assert!(mapped.is_ok());
-        space.activate();
 
         write_frame(phys_offset, &object[0], 4094, b"ab");
         let mut buf = [0; 3];
-        assert!(copy_from_user(phys_offset, 0x40_0ffd, &mut buf));
+        assert!(space.copy_from_user(0x40_0ffd, &mut buf));
         assert_eq!(&buf, b"\0ab");
-        assert!(copy_to_user(phys_offset, 0x40_0000, b"xy"));
+        assert!(space.copy_to_user(0x40_0000, b"xy"));
         let mut buf = [0; 3];
         read_frame(phys_offset, &object[0], 0, &mut buf);
         assert_eq!(&buf, b"xy\0");
@@ -1703,6 +1773,118 @@ mod tests {
         let mut memory = Memory::new();
         let frame = memory.frame();
         write_frame(memory.phys_offset, &frame, 4095, b"ab");
+    }
+
+    /// Stands in for user code on another CPU: writes each of `values`, in
+    /// turn, into the first `WORDS` words of `frame` with relaxed atomic
+    /// stores. User code writes in any size and is outside Rust's model;
+    /// this writes whole words, since the model, which Miri checks, bans
+    /// racing atomics of different sizes.
+    fn user_writes(phys_offset: VirtAddr, frame: &Frame, values: Range<u8>) {
+        for value in values {
+            for i in 0..WORDS {
+                let word = (phys_offset + frame.start() + 8 * i).as_mut_ptr::<u64>();
+                // SAFETY: The word is in the frame, inside the test's
+                // buffer, which outlives the thread, and the copies reach it
+                // only through atomics of the same size.
+                let word = unsafe { AtomicU64::from_ptr(word) };
+                word.store(u64::from_ne_bytes([value; 8]), Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// How many words of the frame `user_writes` writes.
+    const WORDS: u64 = 4;
+
+    // User code on another CPU may write a shared frame while the kernel
+    // copies it, which with plain copies would be a data race.
+    #[test]
+    fn frame_copies_race_user_writes_without_a_data_race() {
+        let mut memory = Memory::new();
+        let phys_offset = memory.phys_offset;
+        let object = memory.object(1);
+        let frame = &object[0];
+        let mut buf = [0; 23];
+        thread::scope(|s| {
+            s.spawn(|| user_writes(phys_offset, frame, 1..4));
+            // Both copies have a part word at each end.
+            read_frame(phys_offset, frame, 3, &mut buf);
+            write_frame(phys_offset, frame, 5, &[0xee; 21]);
+        });
+        assert!(buf.iter().all(|&byte| byte < 4), "read {buf:?}");
+        let mut buf = [0; 32];
+        read_frame(phys_offset, frame, 0, &mut buf);
+        assert!(buf[..5].iter().all(|&byte| byte == 3), "{buf:?}");
+        assert!(
+            buf[5..26].iter().all(|&byte| byte == 3 || byte == 0xee),
+            "{buf:?}"
+        );
+        assert!(buf[26..].iter().all(|&byte| byte == 3), "{buf:?}");
+        memory.free_object(object);
+    }
+
+    // Two CPUs may copy into one frame at once from different offsets. A
+    // part word written byte by byte would race with a whole word copied on
+    // the other, which Rust's model bans as a mixed-size race.
+    #[test]
+    fn frame_copies_race_each_other_without_a_data_race() {
+        let mut memory = Memory::new();
+        let phys_offset = memory.phys_offset;
+        let object = memory.object(1);
+        let frame = &object[0];
+        thread::scope(|s| {
+            s.spawn(|| write_frame(phys_offset, frame, 1, &[0xaa; 14]));
+            write_frame(phys_offset, frame, 4, &[0xbb; 8]);
+            read_frame(phys_offset, frame, 0, &mut [0; 16]);
+        });
+        let mut buf = [0; 16];
+        read_frame(phys_offset, frame, 0, &mut buf);
+        // A part word's other bytes keep what the other copy wrote.
+        assert_eq!(buf[0], 0, "{buf:?}");
+        assert_eq!(buf[1..4], [0xaa; 3], "{buf:?}");
+        assert!(
+            buf[4..12].iter().all(|&byte| byte == 0xaa || byte == 0xbb),
+            "{buf:?}"
+        );
+        assert_eq!(buf[12..15], [0xaa; 3], "{buf:?}");
+        assert_eq!(buf[15], 0, "{buf:?}");
+        memory.free_object(object);
+    }
+
+    // User code on another CPU may write the page a user copy reads or
+    // writes.
+    #[test]
+    fn user_copies_race_user_writes_without_a_data_race() {
+        let mut memory = Memory::new();
+        let kernel = kernel(&mut memory);
+        let space = new_space(&kernel, &mut memory);
+        let phys_offset = memory.phys_offset;
+        let object = memory.object(1);
+        let mapped = space.map(
+            0x40_0000,
+            object.clone(),
+            0,
+            1,
+            Protection::ReadWrite,
+            &mut || memory.frames.alloc(),
+        );
+        assert!(mapped.is_ok());
+        let frame = &object[0];
+        let mut buf = [0; 23];
+        thread::scope(|s| {
+            s.spawn(|| user_writes(phys_offset, frame, 1..4));
+            assert!(space.copy_from_user(0x40_0003, &mut buf));
+            assert!(space.copy_to_user(0x40_0005, &[0xee; 21]));
+        });
+        assert!(buf.iter().all(|&byte| byte < 4), "read {buf:?}");
+        let mut buf = [0; 32];
+        assert!(space.copy_from_user(0x40_0000, &mut buf));
+        assert!(buf[..5].iter().all(|&byte| byte == 3), "{buf:?}");
+        assert!(
+            buf[5..26].iter().all(|&byte| byte == 3 || byte == 0xee),
+            "{buf:?}"
+        );
+        assert!(buf[26..].iter().all(|&byte| byte == 3), "{buf:?}");
     }
 
     #[test]
@@ -1728,15 +1910,14 @@ mod tests {
             memory.frames.alloc()
         });
         assert!(mapped.is_ok());
-        space.activate();
 
         // The read-only page refuses a write and keeps its bytes.
-        assert!(!copy_to_user(phys_offset, 0x40_1000, b"ab"));
+        assert!(!space.copy_to_user(0x40_1000, b"ab"));
         let mut buf = [0; 2];
-        assert!(copy_from_user(phys_offset, 0x40_1000, &mut buf));
+        assert!(space.copy_from_user(0x40_1000, &mut buf));
         assert_eq!(&buf, b"ro");
-        assert!(copy_to_user(phys_offset, 0x40_0ffe, b"ab"));
-        assert!(copy_from_user(phys_offset, 0x40_0ffe, &mut buf));
+        assert!(space.copy_to_user(0x40_0ffe, b"ab"));
+        assert!(space.copy_from_user(0x40_0ffe, &mut buf));
         assert_eq!(&buf, b"ab");
     }
 
