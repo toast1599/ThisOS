@@ -29,7 +29,7 @@ pub fn ticks() -> u64 {
 }
 
 /// Counts a tick. The kernel's trap handler calls this on every timer
-/// interrupt.
+/// interrupt of the boot CPU.
 pub fn tick() {
     TICKS.fetch_add(1, Ordering::Relaxed);
     #[cfg(test)]

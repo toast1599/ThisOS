@@ -39,8 +39,8 @@ use bootloader_api::info::{FrameBuffer, PixelFormat};
 use once::Once;
 use thisos_frames::Frame;
 use thisos_hal::{
-    BacktraceEnd, BootInfo, Cpu, CpuStart, Framebuffer, HeapStats, Platform, Probe, Serial, Stack,
-    TestEnd, TimerFrequencies, TimerFrequency, Translation, TrapHandler, UserProgram,
+    BacktraceEnd, BootInfo, Cpu, CpuStart, Framebuffer, HeapStats, Ipi, Platform, Probe, Serial,
+    Stack, TestEnd, TimerFrequencies, TimerFrequency, Translation, TrapHandler, UserProgram,
 };
 use uart_16550::backend::PioBackend;
 use uart_16550::{BaudRate, Config, Uart16550Tty};
@@ -192,8 +192,20 @@ impl Platform for X86_64 {
     fn start_cpus(
         stack: &mut dyn FnMut(usize) -> Stack<Self>,
         report: &mut dyn FnMut(CpuStart),
+        entry: fn() -> !,
     ) -> usize {
-        smp::start(stack, report)
+        smp::start(stack, report, entry)
+    }
+
+    fn cpus_listed() -> usize {
+        smp::listed()
+    }
+
+    fn send_ipi(cpu: usize, ipi: Ipi) {
+        assert_ne!(cpu, percpu::index(), "{ipi:?} for the CPU sending it");
+        match ipi {
+            Ipi::Wake => apic::send_wake(smp::apic_id(cpu)),
+        }
     }
 
     fn timer_frequencies() -> TimerFrequencies {

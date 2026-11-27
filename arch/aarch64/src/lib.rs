@@ -61,7 +61,7 @@ use aarch64_cpu::registers::{DAIF, ReadWriteable, Readable, Writeable};
 use thisos_frames::Frame;
 #[cfg(not(test))]
 use thisos_hal::{
-    BacktraceEnd, Cpu, CpuStart, Framebuffer, HeapStats, Platform, Probe, Stack, TestEnd,
+    BacktraceEnd, Cpu, CpuStart, Framebuffer, HeapStats, Ipi, Platform, Probe, Stack, TestEnd,
     TimerFrequencies, TimerFrequency, Translation, UserProgram,
 };
 
@@ -263,8 +263,17 @@ impl Platform for Aarch64 {
     fn start_cpus(
         _stack: &mut dyn FnMut(usize) -> Stack<Self>,
         _report: &mut dyn FnMut(CpuStart),
+        _entry: fn() -> !,
     ) -> usize {
         1
+    }
+
+    fn cpus_listed() -> usize {
+        1
+    }
+
+    fn send_ipi(cpu: usize, ipi: Ipi) {
+        unreachable!("{ipi:?} for CPU {cpu}, but aarch64 runs on one CPU");
     }
 
     // CNTFRQ_EL0 is all there is: QEMU's virt machine has no second clock

@@ -8,7 +8,7 @@
 //! for the one it spins on.
 
 use core::fmt::Write as _;
-use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
 use thisos_console::Color;
 use thisos_hal::{Framebuffer, Platform};
@@ -25,6 +25,9 @@ pub const CELL: usize = 32;
 
 static SCREEN: spin::Once<Framebuffer<Pixels>> = spin::Once::new();
 
+/// The rows of the console's grid the cells take.
+static ROWS: AtomicUsize = AtomicUsize::new(0);
+
 /// The ticks each CPU has drawn its cell on.
 static TICKS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 
@@ -37,11 +40,13 @@ static SHOWN: [[AtomicU8; CELL]; MAX_CPUS] =
 const YELLOW: u8 = 0x80;
 
 /// Keeps `fb` for the cells, and returns how many rows of the console's
-/// grid they take at the top. Only `logger::init` calls this, once, before
-/// the console clears the screen.
+/// grid they take at the top: enough for every CPU the firmware lists,
+/// before they start. Only `logger::init` calls this, once, before the
+/// console clears the screen.
 pub fn init(fb: Framebuffer<Pixels>) -> usize {
     let (cols, _) = thisos_console::grid(&fb);
-    let rows = cpu::count().div_ceil(per_row(cols));
+    let rows = Arch::cpus_listed().min(MAX_CPUS).div_ceil(per_row(cols));
+    ROWS.store(rows, Ordering::Relaxed);
     SCREEN.call_once(|| fb);
     thisos_locks::on_long_spin(redraw);
     rows
@@ -94,6 +99,10 @@ fn draw(cpu: usize, (line, spinning): &(Line<CELL>, bool)) {
     let (cols, _) = thisos_console::grid(fb);
     let per_row = per_row(cols);
     let (left, row) = ((cpu % per_row) * CELL, cpu / per_row);
+    // A CPU past those listed would draw over the log.
+    if row >= ROWS.load(Ordering::Relaxed) {
+        return;
+    }
     let (color, mark) = if *spinning {
         (Color::Yellow, YELLOW)
     } else {

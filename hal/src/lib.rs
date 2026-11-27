@@ -465,15 +465,28 @@ pub trait Platform {
     /// Starts every other CPU the firmware lists as ready, one at a time,
     /// each on stacks from `stack`, which it calls with the size in bytes
     /// and keeps for good: one to run on, and any the CPU takes traps on.
-    /// A started CPU sets up its own state and parks with interrupts off;
-    /// a trap there goes to the trap handler. Tells
-    /// `report` what happens as it goes, so that the caller can log each
-    /// step before the next wait. Returns how many CPUs run, the caller's
-    /// included. Call it once, after [`Platform::start_timer`].
+    /// A started CPU sets up its own state, starts its timer at the rate
+    /// [`Platform::start_timer`] set, checks in and calls `entry` on the
+    /// stack it runs on, with interrupts off, while the caller goes on to
+    /// the next; a trap there goes to the trap handler. Tells `report` what
+    /// happens as it goes, so that the caller can log each step before the
+    /// next wait. Returns how many CPUs run, the caller's included. Call it
+    /// once, after [`Platform::start_timer`].
     fn start_cpus(
         stack: &mut dyn FnMut(usize) -> Stack<Self>,
         report: &mut dyn FnMut(CpuStart),
+        entry: fn() -> !,
     ) -> usize;
+
+    /// How many CPUs the firmware lists as ready, the caller's included:
+    /// how many [`Platform::start_cpus`] tries to run. Panics if the tables
+    /// that list them are malformed.
+    fn cpus_listed() -> usize;
+
+    /// Interrupts CPU `cpu`, which traps with the trap `ipi` names once
+    /// its interrupts are on. Panics if `cpu` is the caller's own or isn't
+    /// running.
+    fn send_ipi(cpu: usize, ipi: Ipi);
 
     /// The timer's frequency from each source the architecture has: the
     /// one the CPU reports, and one measured again against another clock,
@@ -722,7 +735,7 @@ pub enum CpuStart {
         /// How long each may take, in milliseconds.
         timeout_ms: u32,
     },
-    /// CPU number `cpu` checked in and parked.
+    /// CPU number `cpu` checked in, and runs `entry`.
     Up {
         /// Its index among the running CPUs.
         cpu: usize,
@@ -740,6 +753,13 @@ pub enum CpuStart {
         /// Its ID.
         id: u32,
     },
+}
+
+/// What [`Platform::send_ipi`] asks of a CPU.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ipi {
+    /// Trap with [`Trap::Wake`].
+    Wake,
 }
 
 /// How fast the timer counts, as [`Platform::start_timer`] found it.
@@ -838,6 +858,8 @@ pub enum Trap {
     DoubleFault,
     /// A tick of the timer [`Platform::start_timer`] started.
     Timer,
+    /// Another CPU's [`Ipi::Wake`].
+    Wake,
     /// A syscall from user code. [`TrapFrame::syscall`] reads its number
     /// and arguments, and [`TrapFrame::set_syscall_result`] sets what it
     /// returns.
@@ -872,6 +894,7 @@ impl fmt::Display for Trap {
             }
             Trap::DoubleFault => write!(f, "double fault"),
             Trap::Timer => write!(f, "timer interrupt"),
+            Trap::Wake => write!(f, "wake interrupt"),
             Trap::Syscall => write!(f, "syscall"),
             Trap::Spurious => write!(f, "spurious interrupt"),
             Trap::Stray { vector } => write!(f, "stray interrupt on vector {vector:#x}"),

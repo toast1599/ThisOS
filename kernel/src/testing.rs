@@ -271,6 +271,16 @@ pub fn spin_until(what: &str, done: impl Fn() -> bool) {
     panic!("{what} didn't happen within {MAX_SPINS} spins");
 }
 
+/// Whether more than one CPU runs, for tests of what happens across CPUs,
+/// which check nothing on one CPU and log that they don't.
+pub fn several_cpus() -> bool {
+    let several = crate::cpu::count() > 1;
+    if !several {
+        log::info!("one CPU runs, so there is nothing across CPUs to check");
+    }
+    several
+}
+
 /// Takes every free byte of the kernel heap, in buffers that halve from
 /// 1 MiB down to one byte, and returns them; dropping them gives the heap
 /// back. The largest goes first, so each size after it fits at most a few

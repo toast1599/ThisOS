@@ -11,6 +11,7 @@ use thisos_abi::{Error, Signals};
 
 use crate::channel::Endpoint;
 use crate::process::{Object, Process};
+use crate::user::Big;
 use crate::{thread, timer};
 
 /// An object that has signals.
@@ -68,13 +69,14 @@ pub fn deadline(timeout: u64) -> Option<u64> {
 /// Blocks until one of the objects in `items` has one of the signals
 /// paired with it, or until [`timer::ticks`] reaches `deadline`, then
 /// writes each object's signals at the same place in `observed` and
-/// returns how many items have a wanted one. Fails with
-/// [`Error::NoMemory`] if a waiter list can't grow, or
+/// returns how many items have a wanted one. Gives up `big` while it
+/// blocks. Fails with [`Error::NoMemory`] if a waiter list can't grow, or
 /// [`Error::TimedOut`] once the deadline has passed with none.
 pub fn wait(
     items: &[(Waitable, Signals)],
     observed: &mut [Signals],
     deadline: Option<u64>,
+    big: &mut Big,
 ) -> Result<usize, Error> {
     assert_eq!(items.len(), observed.len(), "one observed per item");
     let id = thread::id();
@@ -93,10 +95,10 @@ pub fn wait(
             }
         }
         if !ready && !expired() {
-            match deadline {
+            big.unlocked(|| match deadline {
                 Some(deadline) => thread::park_until(deadline),
                 None => thread::park(),
-            };
+            });
         }
         let mut count = 0;
         for ((object, wanted), observed) in items.iter().zip(observed.iter_mut()) {
@@ -155,7 +157,7 @@ mod tests {
         thread::spawn(move || {
             STARTED.store(true, Ordering::Relaxed);
             let mut observed = [Signals::NONE; 2];
-            let result = wait(&items, &mut observed, None);
+            let result = wait(&items, &mut observed, None, &mut Big::none());
             *RESULT.lock() = Some((result, observed));
             DONE.store(true, Ordering::Release);
         });
@@ -185,16 +187,19 @@ mod tests {
         let mut observed = [Signals::NONE];
         let start = timer::ticks();
         assert_eq!(
-            wait(&items, &mut observed, deadline(0)),
+            wait(&items, &mut observed, deadline(0), &mut Big::none()),
             Err(Error::TimedOut)
         );
         let deadline = deadline(30_000_000);
-        assert_eq!(wait(&items, &mut observed, deadline), Err(Error::TimedOut));
+        assert_eq!(
+            wait(&items, &mut observed, deadline, &mut Big::none()),
+            Err(Error::TimedOut)
+        );
         // 30 ms is three ticks, and one more covers the tick under way.
         assert!(timer::ticks() >= start + 4, "the wait ended early");
         let mut none = [];
         assert_eq!(
-            wait(&[], &mut none, Some(timer::ticks() + 1)),
+            wait(&[], &mut none, Some(timer::ticks() + 1), &mut Big::none()),
             Err(Error::TimedOut)
         );
     }
@@ -208,6 +213,6 @@ mod tests {
             (Waitable::Channel(Arc::new(a)), Signals::WRITABLE),
         ];
         let mut observed = [Signals::NONE; 2];
-        assert_eq!(wait(&items, &mut observed, None), Ok(2));
+        assert_eq!(wait(&items, &mut observed, None, &mut Big::none()), Ok(2));
     }
 }

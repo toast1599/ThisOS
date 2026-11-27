@@ -11,6 +11,7 @@
 use core::arch::asm;
 use core::cell::UnsafeCell;
 use core::mem::offset_of;
+use core::ops::Range;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use thisos_locks::MAX_CPUS;
@@ -175,15 +176,17 @@ pub unsafe fn set_gs(index: usize) {
     KernelGsBase::write(VirtAddr::zero());
 }
 
-/// Gives CPU `index` its trap stacks, `ist` by IST slot, and `kernel` as
-/// the stack a trap from user code starts on, before that CPU runs
-/// [`init_cpu`].
-pub fn prepare(index: usize, ist: [u64; 4], kernel: u64) {
+/// Gives CPU `index` its trap stacks, `ist` by IST slot, and `stack` as
+/// the stack it runs on, which backtraces stay inside and whose top a trap
+/// from user code starts at, before that CPU runs [`init_cpu`].
+pub fn prepare(index: usize, ist: [u64; 4], stack: Range<u64>) {
     let block = &BLOCKS[index];
     for (slot, top) in (0..).zip(ist) {
         block.tss.slot(slot).store(top, Ordering::Relaxed);
     }
-    block.set_kernel_stack(kernel);
+    block.set_kernel_stack(stack.end);
+    block.stack_start.store(stack.start, Ordering::Relaxed);
+    block.stack_end.store(stack.end, Ordering::Relaxed);
 }
 
 /// Sets up the CPU it runs on as CPU `index`: its descriptor tables and

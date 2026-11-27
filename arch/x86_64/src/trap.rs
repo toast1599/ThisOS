@@ -436,6 +436,7 @@ extern "C" fn trap_entry(frame: &mut TrapFrame) {
             error: frame.error,
         },
         apic::TIMER_VECTOR => Trap::Timer,
+        apic::WAKE_VECTOR => Trap::Wake,
         apic::SPURIOUS_VECTOR => Trap::Spurious,
         vector => Trap::Stray {
             vector: u32::from(vector.to_le_bytes()[0]),
@@ -448,7 +449,7 @@ extern "C" fn trap_entry(frame: &mut TrapFrame) {
     // Before the handler, which may switch to another thread that runs for
     // many ticks before this one leaves it. Interrupts stay off in the
     // handler, so the next tick waits for iretq or for another thread.
-    if frame.vector == apic::TIMER_VECTOR {
+    if matches!(frame.vector, apic::TIMER_VECTOR | apic::WAKE_VECTOR) {
         apic::eoi();
     }
     handler(trap, frame);
@@ -526,7 +527,7 @@ pub unsafe fn init(handler: TrapHandler<X86_64>) {
     percpu::prepare(
         0,
         IST_SLOTS.map(|slot| IST_STACKS[usize::from(slot)].top()),
-        backtrace::stack().end,
+        backtrace::stack(),
     );
     // SAFETY: The caller runs this once, first, on the boot CPU, after
     // prepare for index 0.

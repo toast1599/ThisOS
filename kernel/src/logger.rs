@@ -16,6 +16,7 @@ use thisos_locks::Rank;
 use thisos_logring::{HEADER, Line, Piece, Ring};
 
 use crate::Lock;
+use crate::user::Big;
 use crate::{Arch, cpu, status, thread};
 
 type Serial = <Arch as Platform>::Serial;
@@ -185,9 +186,13 @@ fn drain() {
 
 /// Logs the lines of a user write, one Info record each with the target
 /// `user`, all together once there is room for all of them, and waits for
-/// that room. Fails with [`Error::NoMemory`], logging nothing, when the
-/// heap has no room to note that the thread waits.
-pub fn write_user<D: fmt::Display>(lines: impl Iterator<Item = D> + Clone) -> Result<(), Error> {
+/// that room, giving up `big` meanwhile. Fails with [`Error::NoMemory`],
+/// logging nothing, when the heap has no room to note that the thread
+/// waits.
+pub fn write_user<D: fmt::Display>(
+    lines: impl Iterator<Item = D> + Clone,
+    big: &mut Big,
+) -> Result<(), Error> {
     if !DRAINING.load(Ordering::Acquire) {
         for line in lines {
             log::info!(target: "user", "{line}");
@@ -225,7 +230,7 @@ pub fn write_user<D: fmt::Display>(lines: impl Iterator<Item = D> + Clone) -> Re
         }
         // The drainer may have made room before the id went on the list.
         if Arch::without_interrupts(|| RING.lock().room()) < size {
-            thread::park();
+            big.unlocked(thread::park);
         }
         WAITERS.lock().retain(|&(waiter, _)| waiter != id);
     }
@@ -568,7 +573,7 @@ pub(crate) mod tests {
         });
         thread::spawn(|| {
             ID.store(thread::id(), Ordering::Relaxed);
-            assert!(super::write_user(core::iter::once(TEXT)).is_ok());
+            assert!(super::write_user(core::iter::once(TEXT), &mut super::Big::none()).is_ok());
             DONE.store(true, Ordering::Release);
         });
         spin_until("the write to wait", || {

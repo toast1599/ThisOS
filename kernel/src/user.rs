@@ -34,10 +34,10 @@ const RAMDISK_RIGHTS: Rights = Rights::READ
     .union(Rights::TRANSFER);
 
 /// The records the last write syscall logged, joined by newlines, for
-/// tests. Taken with interrupts off.
+/// tests. Taken with interrupts off, inside the syscall's big lock.
 #[cfg(test)]
 static WRITTEN: Lock<Written> = Lock::new(
-    Rank::TEST_OUTER,
+    Rank::TEST_LATE,
     Written {
         bytes: [0; WRITTEN_SIZE],
         len: 0,
@@ -293,10 +293,48 @@ pub fn trap(trap: Trap, frame: &mut <Arch as Platform>::TrapFrame) {
     // and a tick may preempt them. The SYSCALL stub turns interrupts off
     // again before it returns to user code.
     Arch::enable_interrupts();
+    let mut big = Big::lock();
     let (number, args) = frame.syscall();
-    match syscall(number, args) {
+    match syscall(number, args, &mut big) {
         Ok(value) => frame.set_syscall_result(0, value),
         Err(Failure { error, value }) => frame.set_syscall_result(error.code(), value),
+    }
+}
+
+/// The big kernel lock, which every syscall holds through its body, one
+/// syscall at a time across CPUs, over whatever the object locks don't
+/// cover. A tick that preempts the holder doesn't release it, since the
+/// holder may hold object locks that another CPU's holder of the big lock
+/// would spin for.
+static BIG: Lock<()> = Lock::new(Rank::BIG, ());
+
+/// The big lock as a syscall holds it, which [`Big::unlocked`] gives up
+/// while the syscall parks.
+pub struct Big(Option<thisos_locks::Guard<'static, (), Arch>>);
+
+impl Big {
+    /// Takes the lock, with interrupts on and no lock held.
+    fn lock() -> Self {
+        Self(Some(BIG.lock()))
+    }
+
+    /// Holds nothing, for kernel code that calls what a syscall calls.
+    #[cfg(test)]
+    pub fn none() -> Self {
+        Self(None)
+    }
+
+    /// Runs `f`, which parks, without the lock, and takes it again after if
+    /// it was held.
+    pub fn unlocked<T>(&mut self, f: impl FnOnce() -> T) -> T {
+        let held = self.0.take().is_some();
+        let value = f();
+        // With interrupts on, as the syscall has them: a holder that a tick
+        // preempted on this CPU has to run to let go of it.
+        if held {
+            *self = Self::lock();
+        }
+        value
     }
 }
 
@@ -313,14 +351,17 @@ impl From<Error> for Failure {
     }
 }
 
-/// Runs the syscall `number` with `args`, and returns its value.
-fn syscall(number: u64, args: [u64; 6]) -> Result<u64, Failure> {
+/// Runs the syscall `number` with `args`, holding `big`, and returns its
+/// value.
+fn syscall(number: u64, args: [u64; 6], big: &mut Big) -> Result<u64, Failure> {
     let result = match Syscall::try_from(number)? {
         Syscall::Exit => {
             end(End::Exited(args[0]));
+            // The thread never returns to drop it.
+            big.0 = None;
             thread::exit()
         }
-        Syscall::Write => write(args[0], args[1]),
+        Syscall::Write => write(args[0], args[1], big),
         Syscall::Close => process().close(handle(args[0])?).map(|()| 0),
         Syscall::Duplicate => process()
             .duplicate(handle(args[0])?, rights(args[1])?)
@@ -334,7 +375,7 @@ fn syscall(number: u64, args: [u64; 6]) -> Result<u64, Failure> {
         Syscall::ChannelCreate => channel_create(),
         Syscall::Send => send(args[0], args[1], args[2], args[3], args[4]),
         Syscall::Receive => return receive(args[0], args[1], args[2], args[3], args[4]),
-        Syscall::Wait => wait(args[0], args[1], args[2]),
+        Syscall::Wait => wait(args[0], args[1], args[2], big),
         Syscall::ProcessCreate => process_create(),
         Syscall::MapInto => target(args[0], Rights::WRITE)?
             .map_into(|space| map(space, args[1], args[2], args[3], args[4], args[5])),
@@ -689,7 +730,7 @@ fn sizes<T>(message: &Message<T>) -> u64 {
 
 /// Waits on the `count` items at `items` for at most `timeout`
 /// nanoseconds, as the wait syscall does.
-fn wait(items: u64, count_arg: u64, timeout: u64) -> Result<u64, Error> {
+fn wait(items: u64, count_arg: u64, timeout: u64, big: &mut Big) -> Result<u64, Error> {
     let count = count(count_arg, MAX_WAIT_ITEMS)?;
     // Nothing could end it, and no syscall ends another process.
     if count == 0 && timeout == u64::MAX {
@@ -725,7 +766,7 @@ fn wait(items: u64, count_arg: u64, timeout: u64) -> Result<u64, Error> {
     }
     let mut observed = [Signals::NONE; MAX_WAIT_ITEMS];
     let observed = &mut observed[..count];
-    let ready = wait::wait(&waits, observed, wait::deadline(timeout))?;
+    let ready = wait::wait(&waits, observed, wait::deadline(timeout), big)?;
     for (item, signals) in raw
         .as_chunks_mut::<WAIT_ITEM_SIZE>()
         .0
@@ -745,7 +786,7 @@ fn wait(items: u64, count_arg: u64, timeout: u64) -> Result<u64, Error> {
 /// syscall does, one record per line, and returns `len`. Copies the text
 /// into a buffer on the stack first, and waits while the log has no room
 /// for all of it.
-fn write(buf: u64, len: u64) -> Result<u64, Error> {
+fn write(buf: u64, len: u64, big: &mut Big) -> Result<u64, Error> {
     let mut bytes = [0; MAX_WRITE];
     let bytes = usize::try_from(len)
         .ok()
@@ -756,7 +797,7 @@ fn write(buf: u64, len: u64) -> Result<u64, Error> {
     }
     let text = str::from_utf8(bytes).map_err(|_| Error::NotUtf8)?;
     let text = text.strip_suffix('\n').unwrap_or(text);
-    logger::write_user(text.split('\n').map(Escaped))?;
+    logger::write_user(text.split('\n').map(Escaped), big)?;
     #[cfg(test)]
     Arch::without_interrupts(|| {
         use fmt::Write as _;
@@ -844,7 +885,8 @@ mod tests {
     use thisos_hal::{Access, Cpu, UserProgram};
 
     use super::*;
-    use crate::testing::spin_until;
+    use crate::cpu;
+    use crate::testing::{self, spin_until};
 
     /// The records of the last write syscall, joined by newlines, which it
     /// then forgets.
@@ -883,6 +925,17 @@ mod tests {
     ) -> (End, u64) {
         let before = frames::free_frames();
         let tables = paging::stack_table_frames();
+        let (process, code) = start_at(program, place, setup);
+        (finish(&process, before, tables, code), code)
+    }
+
+    /// Starts `program` as [`run_at`] does, and returns its process and
+    /// where its code is.
+    fn start_at(
+        program: UserProgram,
+        place: impl FnOnce(Range<u64>) -> (u64, u64),
+        setup: impl FnOnce(u64, &Arc<Process>) -> (Vec<u8>, u64),
+    ) -> (Arc<Process>, u64) {
         let Some(space) = paging::new_space() else {
             panic!("no free frame for a space");
         };
@@ -908,7 +961,7 @@ mod tests {
         // goes with them.
         drop(space);
         process.start_with(code, stack + 4096, arg);
-        (finish(&process, before, tables, code), code)
+        (process, code)
     }
 
     /// Runs the program `name` from the ramdisk as the kernel runs init,
@@ -970,14 +1023,7 @@ mod tests {
     /// this thread's slice each time, and checks that this thread, a kernel
     /// thread, runs on the kernel's tables when it wakes.
     fn finish(process: &Arc<Process>, before: usize, tables: usize, code: u64) -> End {
-        // 9 s, under the watchdog's 10.
-        let items = [(Waitable::Process(Arc::clone(process)), Signals::ENDED)];
-        match wait::wait(&items, &mut [Signals::NONE], wait::deadline(9_000_000_000)) {
-            Ok(_) => {}
-            Err(Error::TimedOut) => panic!("the user process didn't end within 9 s"),
-            Err(e) => panic!("waiting for the user process to end failed: {e:?}"),
-        }
-        drop(items);
+        wait_for_end(process);
         assert_eq!(Arch::translate_active(code), None, "user code's page");
         thread::wait_for_exits();
         let tables = paging::stack_table_frames() - tables;
@@ -988,6 +1034,18 @@ mod tests {
         // Handles to itself are closed, and its thread is gone.
         assert_eq!(Arc::strong_count(process), 1);
         end
+    }
+
+    /// Blocks until `process` has ended, for up to 9 s, under the
+    /// watchdog's 10.
+    fn wait_for_end(process: &Arc<Process>) {
+        let items = [(Waitable::Process(Arc::clone(process)), Signals::ENDED)];
+        let deadline = wait::deadline(9_000_000_000);
+        match wait::wait(&items, &mut [Signals::NONE], deadline, &mut Big::none()) {
+            Ok(_) => {}
+            Err(Error::TimedOut) => panic!("the user process didn't end within 9 s"),
+            Err(e) => panic!("waiting for the user process to end failed: {e:?}"),
+        }
     }
 
     /// A handle to `process` itself, with [`PROCESS_RIGHTS`], as the
@@ -1113,7 +1171,8 @@ mod tests {
                 let items = [(Waitable::Channel(Arc::new(pong)), Signals::READABLE)];
                 // Once ping has sent, it waits for the answer, and pong
                 // closes with the message still queued.
-                let first = wait::wait(&items, &mut [Signals::NONE], wait::deadline(5_000_000_000));
+                let deadline = wait::deadline(5_000_000_000);
+                let first = wait::wait(&items, &mut [Signals::NONE], deadline, &mut Big::none());
                 assert_eq!(first, Ok(1), "waiting for ping's first message");
             },
         );
@@ -1143,6 +1202,40 @@ mod tests {
     fn wait_syscall_checks_its_items_and_observes_signals() {
         let (end, _) = run(UserProgram::Wait, self_handle);
         assert_eq!(end, End::Exited(0));
+    }
+
+    // Programs whose syscalls cover handles, memory objects, channels and
+    // waits run at once, as many of each as there are CPUs, spread over
+    // them, and each passes its checks.
+    #[test_case]
+    fn syscalls_on_every_cpu_at_once_pass_their_checks() {
+        if !testing::several_cpus() {
+            return;
+        }
+        let before = frames::free_frames();
+        let tables = paging::stack_table_frames();
+        let programs = [
+            UserProgram::Handles,
+            UserProgram::Memory,
+            UserProgram::Channel,
+            UserProgram::Wait,
+        ];
+        let started: Vec<_> = (0..cpu::count())
+            .flat_map(|_| programs)
+            .map(|program| {
+                let place = |user: Range<u64>| (user.start, user.start + 4096);
+                let setup =
+                    |stack, process: &Arc<Process>| (Vec::new(), self_handle(stack, process));
+                (program, start_at(program, place, setup).0)
+            })
+            .collect();
+        for (program, process) in &started {
+            wait_for_end(process);
+            assert_eq!(process.end(), Some(End::Exited(0)), "{program:?}");
+        }
+        thread::wait_for_exits();
+        let tables = paging::stack_table_frames() - tables;
+        assert_eq!(frames::free_frames(), before - tables, "frames leaked");
     }
 
     // A user thread never returns from its entry, so what started it must

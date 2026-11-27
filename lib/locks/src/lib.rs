@@ -79,6 +79,9 @@ impl Rank {
     pub const TEST_INNER: Self = Self::new(2, "TEST_INNER");
     /// The test harness's record of the test running.
     pub const TEST_RUN: Self = Self::new(3, "TEST_RUN");
+    /// The big kernel lock, which a syscall holds, below every other
+    /// kernel lock: a thread retakes it after a park holding nothing else.
+    pub const BIG: Self = Self::new(5, "BIG");
     /// The ramdisk and its memory-object copy.
     pub const RAMDISK: Self = Self::new(10, "RAMDISK");
     /// A process's life: its space, start and end, and who waits for it.
@@ -119,6 +122,7 @@ impl Rank {
         Self::TEST_OUTER,
         Self::TEST_INNER,
         Self::TEST_RUN,
+        Self::BIG,
         Self::RAMDISK,
         Self::LIFE,
         Self::CHANNEL,

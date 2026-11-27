@@ -6,7 +6,7 @@ use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use thisos_hal::{CpuStart, Platform};
 use thisos_locks::MAX_CPUS;
 
-use crate::{Arch, paging};
+use crate::{Arch, paging, thread};
 
 const _: () = assert!(
     MAX_CPUS <= 1 << 8,
@@ -88,9 +88,9 @@ static LISTED: AtomicUsize = AtomicUsize::new(0);
 #[cfg(test)]
 static MISNUMBERED: AtomicUsize = AtomicUsize::new(0);
 
-/// Starts the other CPUs, which park, and logs each step as it happens.
-/// `kernel::init` calls this once, after the timer and the logger's
-/// drainer.
+/// Starts the other CPUs, which run threads from then on, and logs each
+/// step as it happens. `kernel::init` calls this once, after the timer and
+/// the logger's drainer.
 pub fn start() {
     let mut listed = 0;
     let running = Arch::start_cpus(
@@ -126,13 +126,17 @@ pub fn start() {
                     #[cfg(test)]
                     MISNUMBERED.fetch_add(1, Ordering::Relaxed);
                 }
-                log::info!("cpu {cpu}: id {id} up and parked after {micros} us");
+                log::info!("cpu {cpu}: id {id} up after {micros} us");
             }
             CpuStart::Silent { id } => {
                 log::warn!("cpu: id {id} didn't check in, so it was stopped");
             }
         },
+        thread::run_ap,
     );
+    // So that nothing after init finds an AP's scheduler missing, or its
+    // allocations still under way.
+    thread::wait_for_cpus(running);
     RUNNING.store(running, Ordering::Relaxed);
     if listed > 0 {
         log::info!("cpu: {running} of {} running", listed + 1);

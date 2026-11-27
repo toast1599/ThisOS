@@ -15,6 +15,9 @@ use crate::{pit, tsc};
 /// The timer's vector, the first after the legacy PICs' 0x20-0x2f.
 pub const TIMER_VECTOR: u64 = 0x30;
 
+/// The vector of `Ipi::Wake`, the timer's next.
+pub const WAKE_VECTOR: u64 = 0x31;
+
 /// The spurious interrupt's vector, whose low four bits older APICs fix
 /// at 1.
 pub const SPURIOUS_VECTOR: u64 = 0xff;
@@ -40,6 +43,7 @@ const PERIODIC: u64 = 1 << 17;
 const DIVIDE_BY_1: u64 = 0b1011;
 
 // The interrupt command register's delivery modes, with the level asserted.
+const FIXED: u64 = 0x4000;
 const INIT: u64 = 0x4500;
 const STARTUP: u64 = 0x4600;
 
@@ -247,6 +251,21 @@ fn x2apic_id(apic: X2Apic) -> u32 {
 /// masked.
 pub fn enable_on_ap() {
     X2Apic::enable();
+}
+
+/// Starts an AP's timer at the count [`start`] found on the boot CPU,
+/// whose timer runs off the same clock. Panics before [`start`].
+pub fn start_on_ap() {
+    let (Some(&apic), Some(&initial)) = (APIC.get(), INITIAL.get()) else {
+        panic!("the boot CPU's timer isn't started");
+    };
+    apic.run(initial);
+}
+
+/// Sends the CPU with APIC ID `id` the wake interrupt. Panics before
+/// [`start`].
+pub fn send_wake(id: u32) {
+    send(id, FIXED | WAKE_VECTOR);
 }
 
 /// Sends INIT to the CPU with APIC ID `id`, which resets it to wait for

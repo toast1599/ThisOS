@@ -1,21 +1,32 @@
-//! Kernel threads and the round-robin scheduler. Every timer tick hands the
-//! CPU to the next ready thread, and the idle thread runs only when no
-//! thread is ready. The reaper, a thread like any other, frees the threads
-//! that exit. The boot thread runs on the loader's stack; every other
-//! thread has a stack from `paging::map_stack`. A user thread is a kernel
-//! thread that shares an address space and belongs to a process, and has
-//! left for user code in it; every switch loads the next thread's space, or
-//! the kernel's tables.
+//! Kernel threads and the scheduler. Each CPU has a scheduler of its own,
+//! under a lock of its own: the thread it runs, a round-robin ready queue,
+//! its blocked threads, an idle thread that runs only when no thread is
+//! ready, and a reaper, a thread like any other, that frees the threads
+//! that exit there. A thread runs on one CPU for life: [`spawn`] keeps it on
+//! the CPU that calls it, and [`new_user`] puts it on the CPU with the
+//! fewest threads. Nothing moves a thread, so a thread can't change CPUs
+//! partway through changing its CPU's list of held locks, and a process,
+//! which has one thread, uses its space on one CPU at a time. A thread's id
+//! holds its CPU's index in its low bits, so [`unpark`] takes only that
+//! CPU's lock, and no code holds two schedulers' locks.
+//!
+//! The boot thread runs on the loader's stack, and each AP's idle thread on
+//! the stack the AP started on; every other thread has a stack from
+//! `paging::map_stack`. A user thread is a kernel thread that shares an
+//! address space and belongs to a process, and has left for user code in
+//! it; every switch loads the next thread's space, or the kernel's tables.
 //!
 //! A thread blocks with [`park`] or [`park_until`] until [`unpark`] names
-//! it or its deadline passes. Each tick readies the blocked threads whose
-//! deadline has passed before it switches.
+//! it or its deadline passes. Each CPU's tick readies the blocked threads
+//! whose deadline has passed before it switches, and an unpark that
+//! readies a thread on another CPU that runs its idle thread wakes it with
+//! an IPI.
 //!
-//! The scheduler's lock is only ever held with interrupts off, so the
-//! timer's handler never finds it held, and nothing allocates or frees
-//! while holding it: a tick can preempt a thread that holds the heap's lock,
-//! and the heap would then spin with interrupts off for good. Making a
-//! thread reserves room in the queues for it, so moving one never
+//! A scheduler's lock is only ever held with interrupts off, so the timer's
+//! handler never finds its own CPU's held, and nothing allocates or frees
+//! while holding it: a tick can preempt a thread that holds the heap's
+//! lock, and the heap would then spin with interrupts off for good. Making a
+//! thread reserves room in its CPU's queues for it, so moving one never
 //! allocates. A switch also swaps the CPU's list of held locks
 //! (`thisos_locks::switch_held`), so each thread's list goes with it.
 
@@ -23,12 +34,13 @@ use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::hint::spin_loop;
 use core::mem;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use thisos_abi::Error;
-use thisos_hal::{AddressSpace as _, Cpu, Platform};
-use thisos_locks::{Rank, Saved};
+use thisos_hal::{AddressSpace as _, Cpu, Ipi, Platform};
+use thisos_locks::{MAX_CPUS, Rank, Saved};
 
 use crate::Lock;
 use crate::cpu::{self, State};
@@ -37,13 +49,31 @@ use crate::{Arch, paging, timer};
 
 type Context = <Arch as Platform>::Context;
 
-/// The size of every thread's stack but the boot thread's. aarch64's trap
-/// entries tell an overflow by bit 16 of the stack pointer, which needs
-/// 64 KiB stacks aligned to 128 KiB, as `map_stack` aligns them.
+/// The size of every thread's stack but the boot thread's and the APs'
+/// idle threads'. aarch64's trap entries tell an overflow by bit 16 of the
+/// stack pointer, which needs 64 KiB stacks aligned to 128 KiB, as
+/// `map_stack` aligns them.
 pub const STACK_SIZE: usize = 64 << 10;
 
+/// The low bits of a thread's id, which hold its CPU's index.
+const CPU_BITS: u32 = 6;
+
+const _: () = assert!(
+    MAX_CPUS == 1 << CPU_BITS,
+    "a thread id's CPU bits cover every CPU"
+);
+
+/// The CPU the thread `id` names runs on.
+fn cpu_of(id: u64) -> usize {
+    let Ok(cpu) = usize::try_from(id % (1 << CPU_BITS)) else {
+        unreachable!("the CPU bits fit a usize");
+    };
+    cpu
+}
+
 struct Thread {
-    /// Names it to [`unpark`]. Never reused, so a stale id unparks nothing.
+    /// Names it to [`unpark`]: a count of its CPU's threads, then the CPU.
+    /// Never reused, so a stale id unparks nothing.
     id: u64,
     /// Where it stopped, while it isn't running, which holds its stack.
     context: Option<Context>,
@@ -66,15 +96,20 @@ struct Thread {
 }
 
 impl Thread {
+    /// A thread of CPU `cpu`.
     fn new(
+        cpu: usize,
         context: Option<Context>,
         entry: Option<Entry>,
         space: Option<Arc<paging::Space>>,
         process: Option<Arc<Process>>,
     ) -> Self {
-        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        static NEXT: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+        let Ok(index) = u64::try_from(cpu) else {
+            unreachable!("a CPU index fits a u64");
+        };
         Self {
-            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            id: NEXT[cpu].fetch_add(1, Ordering::Relaxed) << CPU_BITS | index,
             context,
             entry,
             space,
@@ -111,6 +146,7 @@ enum Place {
     Idle,
 }
 
+/// One CPU's scheduler.
 struct Scheduler {
     running: Option<Box<Thread>>,
     ready: VecDeque<Box<Thread>>,
@@ -139,96 +175,162 @@ struct Scheduler {
     reaper: u64,
 }
 
-static SCHEDULER: Lock<Option<Scheduler>> = Lock::new(Rank::SCHEDULER, None);
-
-/// Runs `f` on the scheduler with interrupts off. `f` must not allocate or
-/// free.
-fn with<T>(f: impl FnOnce(&mut Scheduler) -> T) -> T {
-    Arch::without_interrupts(|| {
-        let mut scheduler = SCHEDULER.lock();
-        let Some(scheduler) = scheduler.as_mut() else {
-            panic!("thread::init didn't run");
+impl Scheduler {
+    /// A scheduler running `running`, with `idle` as its idle thread unless
+    /// that is the one running, and `reaper` ready.
+    fn new(running: Box<Thread>, idle: Option<Box<Thread>>, reaper: Box<Thread>) -> Self {
+        // The boot thread counts, an AP's idle thread doesn't.
+        let threads = if idle.is_some() { 2 } else { 1 };
+        let mut scheduler = Self {
+            running: Some(running),
+            ready: VecDeque::with_capacity(threads),
+            blocked: Vec::with_capacity(threads),
+            idle,
+            dead: Vec::with_capacity(threads),
+            leaving: None,
+            threads,
+            reaper: reaper.id,
         };
-        f(scheduler)
-    })
+        scheduler.ready.push_back(reaper);
+        scheduler
+    }
 }
 
-/// Makes the running code the boot thread, and makes the idle thread and
-/// the reaper. `kernel::init` calls this once, after `heap::init` and
-/// before the timer starts.
-pub fn init() {
-    let stack = || {
-        let Some(stack) = paging::map_stack(STACK_SIZE) else {
-            panic!("no frames for the idle thread's and the reaper's stacks");
-        };
-        stack
+static SCHEDULERS: [Lock<Option<Scheduler>>; MAX_CPUS] =
+    [const { Lock::new(Rank::SCHEDULER, None) }; MAX_CPUS];
+
+/// Runs `f` on CPU `cpu`'s scheduler with interrupts off, or returns
+/// `None` if that CPU has none. `f` must not allocate or free.
+fn try_on<T>(cpu: usize, f: impl FnOnce(&mut Scheduler) -> T) -> Option<T> {
+    Arch::without_interrupts(|| SCHEDULERS.get(cpu)?.lock().as_mut().map(f))
+}
+
+/// [`try_on`], for a CPU that has a scheduler.
+fn on<T>(cpu: usize, f: impl FnOnce(&mut Scheduler) -> T) -> T {
+    let Some(value) = try_on(cpu, f) else {
+        panic!("CPU {cpu} has no scheduler");
     };
-    let idle = Box::new(Thread::new(
-        Some(Arch::new_context(stack(), idle)),
-        None,
-        None,
-        None,
-    ));
-    let reaper = Box::new(Thread::new(
-        Some(Arch::new_context(stack(), start)),
+    value
+}
+
+/// [`on`] this CPU.
+fn with<T>(f: impl FnOnce(&mut Scheduler) -> T) -> T {
+    on(cpu::id(), f)
+}
+
+/// A stack for a thread the kernel makes for itself, `what`.
+fn own_stack(what: &str) -> paging::Stack {
+    let Some(stack) = paging::map_stack(STACK_SIZE) else {
+        panic!("no frames for {what}'s stack on CPU {}", cpu::id());
+    };
+    stack
+}
+
+/// This CPU's reaper.
+fn new_reaper() -> Box<Thread> {
+    Box::new(Thread::new(
+        cpu::id(),
+        Some(Arch::new_context(own_stack("the reaper"), start)),
         Some(Entry::Kernel(Box::new(reaper))),
         None,
         None,
+    ))
+}
+
+/// Makes the running code the boot thread, and makes the boot CPU's idle
+/// thread and reaper. `kernel::init` calls this once, after `heap::init`
+/// and before the timer starts.
+pub fn init() {
+    let idle = Box::new(Thread::new(
+        0,
+        Some(Arch::new_context(own_stack("the idle thread"), idle)),
+        None,
+        None,
+        None,
     ));
-    let boot = Box::new(Thread::new(None, None, None, None));
+    let reaper = new_reaper();
+    let boot = Box::new(Thread::new(0, None, None, None, None));
     thisos_locks::running::<Arch>(boot.id);
-    let mut scheduler = Scheduler {
-        running: Some(boot),
-        ready: VecDeque::with_capacity(2),
-        blocked: Vec::with_capacity(2),
-        idle: Some(idle),
-        dead: Vec::with_capacity(2),
-        leaving: None,
-        threads: 2,
-        reaper: reaper.id,
-    };
-    scheduler.ready.push_back(reaper);
-    Arch::without_interrupts(|| *SCHEDULER.lock() = Some(scheduler));
+    let scheduler = Scheduler::new(boot, Some(idle), reaper);
+    Arch::without_interrupts(|| *SCHEDULERS[0].lock() = Some(scheduler));
     log::info!(
         "threads: boot, idle and reaper, {} KiB stacks with guard pages",
         STACK_SIZE >> 10
     );
 }
 
-/// Starts a thread that runs `run`, then exits. Panics if kernel space or
-/// the frames run out.
-pub fn spawn(run: impl FnOnce() + Send + 'static) {
-    spawn_in(None, None, run);
+/// Makes the running code this AP's idle thread, makes its reaper, and
+/// runs the idle thread. An AP runs this once it has checked in, with
+/// interrupts off.
+pub fn run_ap() -> ! {
+    let idle = Box::new(Thread::new(cpu::id(), None, None, None, None));
+    let reaper = new_reaper();
+    thisos_locks::running::<Arch>(idle.id);
+    let scheduler = Scheduler::new(idle, None, reaper);
+    Arch::without_interrupts(|| *SCHEDULERS[cpu::id()].lock() = Some(scheduler));
+    run_idle()
 }
 
-/// Starts a kernel thread that runs `run` in `space` and `process`, which
-/// only tests give. Panics if kernel space or the frames run out.
+/// Waits until CPUs 1 to `count` - 1 have their schedulers, which each
+/// makes in [`run_ap`] after the boot CPU has seen it check in.
+pub fn wait_for_cpus(count: usize) {
+    while (1..count).any(|cpu| try_on(cpu, |_| ()).is_none()) {
+        spin_loop();
+    }
+}
+
+/// Starts a thread on this CPU that runs `run`, then exits. Panics if
+/// kernel space or the frames run out.
+pub fn spawn(run: impl FnOnce() + Send + 'static) {
+    spawn_in(cpu::id(), None, None, run);
+}
+
+/// [`spawn`], on CPU `cpu`.
+#[cfg(test)]
+pub fn spawn_on(cpu: usize, run: impl FnOnce() + Send + 'static) {
+    spawn_in(cpu, None, None, run);
+}
+
+/// Starts a kernel thread on CPU `cpu` that runs `run` in `space` and
+/// `process`, which only tests give. Panics if kernel space or the frames
+/// run out.
 fn spawn_in(
+    cpu: usize,
     space: Option<Arc<paging::Space>>,
     process: Option<Arc<Process>>,
     run: impl FnOnce() + Send + 'static,
 ) {
-    match new_thread(space, process, Entry::Kernel(Box::new(run))) {
+    match new_thread(cpu, space, process, Entry::Kernel(Box::new(run))) {
         Ok(thread) => thread.start(0),
         Err(e) => panic!("starting a kernel thread failed: {e:?}"),
     }
 }
 
 /// A thread of `process` that will run user code at `ip` in `space`, with
-/// stack pointer `sp`, once [`Unstarted::start`] gives its argument. It ends
-/// through `user::trap`. Fails with [`Error::NoMemory`] if kernel space, the
-/// frames or the heap run short.
+/// stack pointer `sp`, once [`Unstarted::start`] gives its argument, on the
+/// CPU with the fewest threads. It ends through `user::trap`. Fails with
+/// [`Error::NoMemory`] if kernel space, the frames or the heap run short.
 pub fn new_user(
     process: Arc<Process>,
     space: Arc<paging::Space>,
     ip: u64,
     sp: u64,
 ) -> Result<Unstarted, Error> {
-    new_thread(Some(space), Some(process), Entry::User { ip, sp, arg: 0 })
+    let entry = Entry::User { ip, sp, arg: 0 };
+    new_thread(least_loaded(), Some(space), Some(process), entry)
 }
 
-/// A thread that is made but not ready: it holds its stack and room in the
-/// scheduler's queues, which dropping it gives back.
+/// The CPU with the fewest threads, the lowest of those that tie. Another
+/// CPU's count may change meanwhile, which only makes the choice older.
+fn least_loaded() -> usize {
+    (0..cpu::count())
+        .filter_map(|cpu| try_on(cpu, |scheduler| (scheduler.threads, cpu)))
+        .min()
+        .map_or(0, |(_, cpu)| cpu)
+}
+
+/// A thread that is made but not ready: it holds its stack and room in its
+/// CPU's queues, which dropping it gives back.
 pub struct Unstarted(Option<Box<Thread>>);
 
 impl Unstarted {
@@ -241,8 +343,19 @@ impl Unstarted {
         if let Some(Entry::User { arg: user_arg, .. }) = &mut thread.entry {
             *user_arg = arg;
         }
+        let cpu = cpu_of(thread.id);
         // new_thread reserved the room, so this doesn't allocate.
-        with(|scheduler| scheduler.ready.push_back(thread));
+        let idle = on(cpu, |scheduler| {
+            scheduler.ready.push_back(thread);
+            scheduler.idle.is_none()
+        });
+        wake_if_idle(cpu, idle);
+    }
+
+    /// The CPU the thread will run on.
+    #[cfg(test)]
+    fn cpu(&self) -> Option<usize> {
+        self.0.as_ref().map(|thread| cpu_of(thread.id))
     }
 }
 
@@ -250,33 +363,43 @@ impl Drop for Unstarted {
     fn drop(&mut self) {
         if let Some(mut thread) = self.0.take() {
             free_stack(&mut thread);
-            with(|scheduler| scheduler.threads -= 1);
+            on(cpu_of(thread.id), |scheduler| scheduler.threads -= 1);
         }
     }
 }
 
-/// Makes a thread that runs `entry`, with its stack and room in the queues.
+/// Wakes `cpu` if it is another CPU and `idle` says it was running its
+/// idle thread when a thread became ready there.
+fn wake_if_idle(cpu: usize, idle: bool) {
+    if idle && cpu != cpu::id() {
+        Arch::send_ipi(cpu, Ipi::Wake);
+    }
+}
+
+/// Makes a thread of CPU `cpu` that runs `entry`, with its stack and room
+/// in that CPU's queues.
 fn new_thread(
+    cpu: usize,
     space: Option<Arc<paging::Space>>,
     process: Option<Arc<Process>>,
     entry: Entry,
 ) -> Result<Unstarted, Error> {
-    let thread = Thread::new(None, Some(entry), space, process);
+    let thread = Thread::new(cpu, None, Some(entry), space, process);
     let mut thread = Box::try_new(thread).map_err(|_| Error::NoMemory)?;
     let stack = paging::map_stack(STACK_SIZE).ok_or(Error::NoMemory)?;
     thread.context = Some(Arch::new_context(stack, start));
-    if let Err(e) = reserve() {
+    if let Err(e) = reserve(cpu) {
         free_stack(&mut thread);
         return Err(e);
     }
     Ok(Unstarted(Some(thread)))
 }
 
-/// Counts one more thread, after giving `ready`, `blocked` and `dead` room
-/// for it.
-fn reserve() -> Result<(), Error> {
+/// Counts one more thread on CPU `cpu`, after giving its `ready`, `blocked`
+/// and `dead` room for it.
+fn reserve(cpu: usize) -> Result<(), Error> {
     loop {
-        let short = with(|scheduler| {
+        let short = on(cpu, |scheduler| {
             let need = scheduler.threads + 1;
             if scheduler.ready.capacity() < need
                 || scheduler.blocked.capacity() < need
@@ -288,15 +411,16 @@ fn reserve() -> Result<(), Error> {
             None
         });
         match short {
-            Some(need) => grow(need)?,
+            Some(need) => grow(cpu, need)?,
             None => return Ok(()),
         }
     }
 }
 
-/// Gives `ready`, `blocked` and `dead` room for `need` threads each.
-/// Another thread may grow them meanwhile, so the caller checks again.
-fn grow(need: usize) -> Result<(), Error> {
+/// Gives CPU `cpu`'s `ready`, `blocked` and `dead` room for `need` threads
+/// each. Another thread may grow them meanwhile, so the caller checks
+/// again.
+fn grow(cpu: usize, need: usize) -> Result<(), Error> {
     let mut ready = VecDeque::new();
     let mut blocked = Vec::new();
     let mut dead = Vec::new();
@@ -306,7 +430,7 @@ fn grow(need: usize) -> Result<(), Error> {
     {
         return Err(Error::NoMemory);
     }
-    with(|scheduler| {
+    on(cpu, |scheduler| {
         if scheduler.ready.capacity() < need {
             ready.append(&mut scheduler.ready);
             mem::swap(&mut scheduler.ready, &mut ready);
@@ -404,25 +528,34 @@ pub fn sleep(ticks: u64) {
 /// Readies the thread `id` names if it is parked, or makes its next park
 /// return at once if it isn't. Does nothing if no live thread has that id.
 pub fn unpark(id: u64) {
-    with(|scheduler| scheduler.unpark(id));
+    let cpu = cpu_of(id);
+    if let Some(idle) = try_on(cpu, |scheduler| scheduler.unpark(id)) {
+        wake_if_idle(cpu, idle);
+    }
 }
 
 impl Scheduler {
-    fn unpark(&mut self, id: u64) {
+    /// [`unpark`] on this scheduler. Returns whether it readied a thread
+    /// while the idle thread runs.
+    fn unpark(&mut self, id: u64) -> bool {
         if let Ok(i) = self.blocked.binary_search_by_key(&id, |thread| thread.id) {
             let mut thread = self.blocked.remove(i);
             thread.wake = Some(Wake::Unparked);
             self.ready.push_back(thread);
-            return;
+            return self.idle.is_none();
         }
+        // The leaving thread too, which another CPU can unpark between its
+        // switch and the next thread's arrival.
         let thread = self
             .running
             .iter_mut()
             .chain(self.ready.iter_mut())
+            .chain(self.leaving.iter_mut().map(|(thread, _)| thread))
             .find(|thread| thread.id == id);
         if let Some(thread) = thread {
             thread.wake = Some(Wake::Unparked);
         }
+        false
     }
 }
 
@@ -449,6 +582,16 @@ pub fn tick() {
         }
     });
     switch(Place::Ready);
+}
+
+/// Switches to a ready thread if this CPU runs its idle thread. The
+/// kernel's trap handler calls this on [`Ipi::Wake`], with interrupts off.
+pub fn wake() {
+    #[cfg(test)]
+    tests::WAKES[cpu::id()].fetch_add(1, Ordering::Relaxed);
+    if with(|scheduler| scheduler.idle.is_none()) {
+        switch(Place::Ready);
+    }
 }
 
 /// Ends the running thread. The reaper frees it, since nothing can free a
@@ -521,6 +664,8 @@ fn arrived(from: Context) {
         thread.context = Some(from);
         match place {
             Place::Ready => scheduler.ready.push_back(thread),
+            // Unparked while it left.
+            Place::Blocked if thread.wake.is_some() => scheduler.ready.push_back(thread),
             Place::Blocked => {
                 let (Ok(i) | Err(i)) = scheduler
                     .blocked
@@ -529,21 +674,22 @@ fn arrived(from: Context) {
             }
             Place::Dead => {
                 scheduler.dead.push(thread);
-                scheduler.unpark(scheduler.reaper);
+                let reaper = scheduler.reaper;
+                scheduler.unpark(reaper);
             }
             Place::Idle => scheduler.idle = Some(thread),
         }
     });
 }
 
-/// Frees every thread that exited: unmaps its stack and frees its frames,
-/// closes its process's handles and lets go of its address space, then
-/// drops it. A process has one thread, so that thread's end is the
-/// process's: it lets go of its space too, which the last holder destroys,
-/// then its waiters see it ended. Interrupts are on, since the page
-/// tables', the frames' and the heap's locks may be held by a thread a
-/// tick preempted. Only the reaper calls this: a tick that preempts it
-/// while it holds one of those locks puts it back in the ready queue,
+/// Frees every thread that exited on this CPU: unmaps its stack and frees
+/// its frames, closes its process's handles and lets go of its address
+/// space, then drops it. A process has one thread, so that thread's end is
+/// the process's: it lets go of its space too, which the last holder
+/// destroys, then its waiters see it ended. Interrupts are on, since the
+/// page tables', the frames' and the heap's locks may be held by a thread a
+/// tick preempted. Only the CPU's reaper calls this: a tick that preempts
+/// it while it holds one of those locks puts it back in the ready queue,
 /// where the idle thread would wait for every other thread to block.
 fn reap() {
     while let Some(mut thread) = with(|scheduler| {
@@ -557,6 +703,8 @@ fn reap() {
             process.close_handles();
             process.reaped();
         }
+        #[cfg(test)]
+        tests::REAPED[cpu::id()].fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -576,8 +724,8 @@ fn start(from: Context) -> ! {
     exit()
 }
 
-/// What the reaper runs. A death that comes after its last look at the
-/// dead threads leaves it a wake, so its park returns at once.
+/// What a reaper runs. A death that comes after its last look at the dead
+/// threads leaves it a wake, so its park returns at once.
 fn reaper() {
     loop {
         reap();
@@ -585,11 +733,16 @@ fn reaper() {
     }
 }
 
-/// The idle thread's entry. It sleeps until the next interrupt, whose tick
-/// switches to a ready thread if there is one. It takes no lock, since no
-/// tick puts it back in the ready queue to release one.
+/// The boot CPU's idle thread's entry.
 fn idle(from: Context) -> ! {
     arrived(from);
+    run_idle()
+}
+
+/// What an idle thread runs. It sleeps until the next interrupt, whose
+/// tick or wake switches to a ready thread if there is one. It takes no
+/// lock, since no tick puts it back in the ready queue to release one.
+fn run_idle() -> ! {
     Arch::enable_interrupts();
     loop {
         cpu::set_state(State::Idle);
@@ -597,32 +750,33 @@ fn idle(from: Context) -> ! {
     }
 }
 
-/// The threads not freed yet, the boot thread and the reaper included, and
-/// how many of them are dead.
-#[cfg(test)]
-fn counts() -> (usize, usize) {
-    with(|scheduler| (scheduler.threads, scheduler.dead.len()))
-}
-
 /// Whether the thread `id` names is parked.
 #[cfg(test)]
 pub fn is_blocked(id: u64) -> bool {
-    with(|scheduler| {
+    try_on(cpu_of(id), |scheduler| {
         scheduler
             .blocked
             .binary_search_by_key(&id, |thread| thread.id)
             .is_ok()
     })
+    .unwrap_or(false)
 }
 
-/// Waits until the reaper has freed every thread but the boot thread, the
-/// logger's drainer and itself, and parked again, so that the next test
-/// starts with those three alone. The reaper takes a thread off the dead
-/// ones before it frees it, so only its park says that it is done.
+/// Waits until each CPU's reaper has freed every thread there but the boot
+/// thread and the logger's drainer on the boot CPU, and itself, and parked
+/// again, so that the next test starts with those alone. A reaper takes a
+/// thread off the dead ones before it frees it, so only its park says that
+/// it is done.
 #[cfg(test)]
 pub fn wait_for_exits() {
-    crate::testing::spin_until("the reaper to free every thread", || {
-        counts() == (3, 0) && is_blocked(with(|scheduler| scheduler.reaper))
+    crate::testing::spin_until("the reapers to free every thread", || {
+        (0..cpu::count()).all(|cpu| {
+            let kept = if cpu == 0 { 3 } else { 1 };
+            let (threads, dead, reaper) = on(cpu, |scheduler| {
+                (scheduler.threads, scheduler.dead.len(), scheduler.reaper)
+            });
+            (threads, dead) == (kept, 0) && is_blocked(reaper)
+        })
     });
 }
 
@@ -640,6 +794,11 @@ mod tests {
 
     static OUTER: Lock<()> = Lock::new(Rank::TEST_OUTER, ());
     static INNER: Lock<()> = Lock::new(Rank::TEST_INNER, ());
+
+    /// The wake interrupts each CPU has taken.
+    pub(super) static WAKES: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
+    /// The threads each CPU's reaper has freed.
+    pub(super) static REAPED: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
 
     #[test_case]
     const AN_ORDER_INVERSION_PANICS: ExpectPanic = ExpectPanic {
@@ -718,7 +877,7 @@ mod tests {
                     spin_loop();
                 }
             });
-            spawn_in(None, Some(Arc::clone(&process)), || {
+            spawn_in(cpu::id(), None, Some(Arc::clone(&process)), || {
                 STACK.store(Arch::guard_page() + 4096, Ordering::Relaxed);
             });
             // The thread holds the process, and so does the process's
@@ -904,5 +1063,87 @@ mod tests {
         });
         spin_until("the thread's overflow", || DONE.load(Ordering::Relaxed));
         wait_for_exits();
+    }
+
+    // The boot CPU has the boot thread, the logger's drainer and its reaper,
+    // and each AP only its reaper, so user threads made one after another
+    // go to the APs in turn.
+    #[test_case]
+    fn user_threads_go_to_the_cpus_with_the_fewest_threads() {
+        if !testing::several_cpus() {
+            return;
+        }
+        let Some(space) = paging::new_space() else {
+            panic!("no free frame for a space");
+        };
+        let space = Arc::new(space);
+        let Ok(process) = Process::new(Arc::clone(&space)) else {
+            panic!("no memory for a process");
+        };
+        let threads: Vec<_> = (1..cpu::count())
+            .map(
+                |_| match new_user(Arc::clone(&process), Arc::clone(&space), 0, 0) {
+                    Ok(thread) => thread,
+                    Err(e) => panic!("making a user thread failed: {e:?}"),
+                },
+            )
+            .collect();
+        let cpus: Vec<_> = threads.iter().filter_map(Unstarted::cpu).collect();
+        assert_eq!(cpus, (1..cpu::count()).collect::<Vec<_>>());
+    }
+
+    // CPU 1 runs only its reaper, which is parked, so it idles until the
+    // unpark. A tick there may run the thread before the IPI arrives, but
+    // the IPI has to arrive all the same.
+    #[test_case]
+    fn an_unpark_wakes_an_idle_cpu_with_an_ipi() {
+        static ID: AtomicU64 = AtomicU64::new(u64::MAX);
+        static WAKE: Lock<Option<Wake>> = Lock::new(Rank::TEST_OUTER, None);
+        if !testing::several_cpus() {
+            return;
+        }
+        *WAKE.lock() = None;
+        spawn_on(1, || {
+            ID.store(super::id(), Ordering::Relaxed);
+            let wake = park();
+            *WAKE.lock() = Some(wake);
+        });
+        spin_until("the thread on CPU 1 to park and CPU 1 to idle", || {
+            is_blocked(ID.load(Ordering::Relaxed)) && cpu::state(1) == State::Idle
+        });
+        let wakes = WAKES[1].load(Ordering::Relaxed);
+        unpark(ID.load(Ordering::Relaxed));
+        spin_until("the thread on CPU 1 to wake", || WAKE.lock().is_some());
+        assert_eq!(*WAKE.lock(), Some(Wake::Unparked));
+        spin_until("CPU 1 to take a wake interrupt", || {
+            WAKES[1].load(Ordering::Relaxed) > wakes
+        });
+        wait_for_exits();
+    }
+
+    // The first run grows CPU 1's queues, which may grow the heap, so only
+    // the second counts frames.
+    #[test_case]
+    fn a_thread_that_dies_on_an_ap_is_freed_there() {
+        static STACK: AtomicU64 = AtomicU64::new(0);
+        if !testing::several_cpus() {
+            return;
+        }
+        for run in 1..=2 {
+            let free = frames::free_frames();
+            let tables = paging::stack_table_frames();
+            let reaped = REAPED[1].load(Ordering::Relaxed);
+            spawn_on(1, || {
+                STACK.store(Arch::guard_page() + 4096, Ordering::Relaxed);
+            });
+            wait_for_exits();
+            assert_eq!(REAPED[1].load(Ordering::Relaxed), reaped + 1, "run {run}");
+            let stack = STACK.load(Ordering::Relaxed);
+            assert_eq!(paging::translate(stack), None, "its stack at {stack:#x}");
+            if run == 2 {
+                let tables = paging::stack_table_frames() - tables;
+                assert_eq!(frames::free_frames(), free - tables);
+            }
+        }
     }
 }

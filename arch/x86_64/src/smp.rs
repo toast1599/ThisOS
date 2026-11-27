@@ -2,23 +2,23 @@
 //! lists them. Each starts in real mode at a trampoline in a frame below
 //! 1 MiB, which takes it through protected mode into long mode on low page
 //! tables that hold the kernel's upper half, and on into the kernel, where
-//! it sets up its own state. Until the scheduler gives it work, an AP takes
-//! no lock and logs nothing: it stores its index and APIC ID in its slot,
-//! where the BSP finds them, and parks.
+//! it sets up its own state and starts its timer. It stores its index and
+//! APIC ID in its slot, where the BSP finds them, and calls the kernel's
+//! entry, still with interrupts off.
 
 use core::arch::global_asm;
 use core::mem::offset_of;
 use core::ptr;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use bootloader_api::info::{MemoryRegion, MemoryRegionKind};
 use thisos_acpi::{HEADER_SIZE, Madt, RSDP_SIZE, State, Xsdt};
-use thisos_hal::{Cpu as _, CpuStart};
+use thisos_hal::CpuStart;
 use thisos_locks::MAX_CPUS;
 use x86_64::VirtAddr;
 
 use crate::once::Once;
-use crate::{X86_64, apic, paging, percpu, phys_offset, trap, tsc};
+use crate::{apic, paging, percpu, phys_offset, trap, tsc};
 
 /// Each AP's stack, the size of a kernel thread's.
 const STACK_SIZE: usize = 64 * 1024;
@@ -176,6 +176,12 @@ unsafe extern "C" {
 /// in, then [`CHECKED_IN`] with its APIC ID.
 static SLOTS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 
+/// Each running CPU's APIC ID, by its index, for IPIs.
+static APIC_IDS: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
+
+/// What each AP calls once it checks in.
+static ENTRY: Once<fn() -> !> = Once::new();
+
 /// An AP's stacks: the one it runs on and its IST stacks.
 type ApStacks = (paging::Stack, [paging::Stack; 4]);
 
@@ -199,11 +205,13 @@ pub fn record(regions: &'static [MemoryRegion], rsdp: Option<u64>) {
 pub fn start(
     stack: &mut dyn FnMut(usize) -> paging::Stack,
     report: &mut dyn FnMut(CpuStart),
+    entry: fn() -> !,
 ) -> usize {
     let Some(madt) = madt() else {
         return 1;
     };
     let bsp = apic::id();
+    APIC_IDS[0].store(bsp, Ordering::Relaxed);
     for cpu in madt.cpus().filter(|c| c.state == State::OnlineCapable) {
         report(CpuStart::Skipped { id: cpu.apic_id });
     }
@@ -249,6 +257,7 @@ pub fn start(
         high: VirtAddr::from_ptr(&raw const thisos_ap_high).as_u64(),
         index: to_u64(index),
     };
+    ENTRY.init(entry);
     report(CpuStart::Starting {
         listed,
         timeout_ms: TIMEOUT_MS,
@@ -263,9 +272,12 @@ pub fn start(
         percpu::prepare(
             running,
             ist.each_ref().map(|s| s.range().end),
-            ap_stack.range().end,
+            ap_stack.range(),
         );
         SLOTS[running].store(0, Ordering::Relaxed);
+        // Before the startup IPI, which apic::send fences after it, so a
+        // CPU that learns of the AP from the AP itself finds its ID.
+        APIC_IDS[running].store(cpu.apic_id, Ordering::Relaxed);
         write_data(page, data(ap_stack.range().end, running));
         let started = tsc::read();
         let slot = signal(cpu.apic_id, vector, hz, &SLOTS[running]);
@@ -316,8 +328,8 @@ fn signal(id: u32, vector: u8, hz: u64, slot: &AtomicU64) -> u64 {
 
 /// The AP's code once it runs in the kernel's upper half and on its own
 /// stack, with interrupts off, on the kernel's tables: it sets up its own
-/// state as CPU `index`, checks in with the index it reads back through GS
-/// and its APIC ID, and parks.
+/// state as CPU `index`, starts its timer, checks in with the index it
+/// reads back through GS and its APIC ID, and calls the kernel's entry.
 extern "sysv64" fn ap_main(index: usize) -> ! {
     // SAFETY: start passes each AP an index of its own and prepared its
     // block, interrupts are off, and nothing on this AP has used the segment
@@ -328,13 +340,34 @@ extern "sysv64" fn ap_main(index: usize) -> ! {
     }
     let id = apic::id();
     let read = u64::try_from(percpu::index()).unwrap_or(u64::MAX);
+    apic::start_on_ap();
+    let Some(&entry) = ENTRY.get() else {
+        unreachable!("start stores the entry before it starts an AP");
+    };
     if let Some(slot) = SLOTS.get(index) {
         slot.store(
             CHECKED_IN | read << INDEX_SHIFT | u64::from(id),
             Ordering::Release,
         );
     }
-    X86_64::halt()
+    entry()
+}
+
+/// How many CPUs the MADT lists as enabled, the boot CPU among them, or 1
+/// without an MADT; see `Platform::cpus_listed`.
+pub fn listed() -> usize {
+    madt().map_or(1, |madt| {
+        madt.cpus()
+            .filter(|cpu| cpu.state == State::Enabled)
+            .count()
+            .max(1)
+    })
+}
+
+/// The APIC ID of the running CPU numbered `cpu`. Panics if `cpu` is out
+/// of range.
+pub fn apic_id(cpu: usize) -> u32 {
+    APIC_IDS[cpu].load(Ordering::Relaxed)
 }
 
 /// The MADT, or `None` if the loader found no RSDP or the XSDT lists no
