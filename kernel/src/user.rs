@@ -140,17 +140,18 @@ pub fn start_init() {
 /// one handle is the receiving end of a channel whose other end is closed,
 /// where one message waits, with a handle to the process itself with
 /// [`PROCESS_RIGHTS`] and one to `ramdisk` with [`RAMDISK_RIGHTS`]. The
-/// message is sent once the program runs, since it holds the process.
+/// message is queued before the thread starts, so the program's first
+/// receive needn't wait, even when its thread runs on another CPU at once.
 fn start_with_ramdisk(file: &[u8], ramdisk: Arc<MemoryObject>) -> Result<Arc<Process>, LoadError> {
     let (ours, theirs) = channel::create().map_err(LoadError::Start)?;
     let mut handles = Vec::new();
     handles
         .try_reserve_exact(2)
         .map_err(|_| LoadError::NoMemory)?;
-    let process = start_program(file, theirs)?;
+    let program = load(file)?;
+    let process = Process::new(program.space).map_err(LoadError::Start)?;
     handles.push((Object::Process(Arc::clone(&process)), PROCESS_RIGHTS));
     handles.push((Object::Memory(ramdisk), RAMDISK_RIGHTS));
-    // Fails with PeerClosed only if the program ended without its message.
     ours.send(|| {
         Ok(Message {
             bytes: Vec::new(),
@@ -158,10 +159,11 @@ fn start_with_ramdisk(file: &[u8], ramdisk: Arc<MemoryObject>) -> Result<Arc<Pro
         })
     })
     .map_err(LoadError::Start)?;
+    start_thread(&process, program.entry, program.stack_top, theirs)?;
     Ok(process)
 }
 
-/// Why [`start_program`] failed.
+/// Why a program didn't load or start.
 enum LoadError {
     /// The file isn't an executable the kernel loads.
     Elf(thisos_elf::Error),
@@ -193,16 +195,28 @@ struct Program {
 
 /// Loads the executable in `file` and starts it in a process of its own,
 /// whose one handle is `endpoint`, with [`ENDPOINT_RIGHTS`].
+#[cfg(test)]
 fn start_program(file: &[u8], endpoint: Endpoint) -> Result<Arc<Process>, LoadError> {
     let program = load(file)?;
     let process = Process::new(program.space).map_err(LoadError::Start)?;
+    start_thread(&process, program.entry, program.stack_top, endpoint)?;
+    Ok(process)
+}
+
+/// Starts `process`'s thread at `entry` with its stack at `stack_top`, and
+/// its one handle `endpoint`, with [`ENDPOINT_RIGHTS`].
+fn start_thread(
+    process: &Arc<Process>,
+    entry: u64,
+    stack_top: u64,
+    endpoint: Endpoint,
+) -> Result<(), LoadError> {
     let endpoint = Arc::try_new(endpoint).map_err(|_| LoadError::NoMemory)?;
     process
-        .start(program.entry, program.stack_top, || {
+        .start(entry, stack_top, || {
             Ok((Object::Channel(endpoint), ENDPOINT_RIGHTS))
         })
-        .map_err(LoadError::Start)?;
-    Ok(process)
+        .map_err(LoadError::Start)
 }
 
 /// Loads the executable in `file` into a new address space, with a zeroed
