@@ -13,7 +13,7 @@ use thisos_hal::{Cpu, PANIC_TEST_FILE, Platform, Probe, TestEnd, Trap, TrapFrame
 use thisos_locks::Rank;
 
 use crate::Lock;
-use crate::{Arch, logger, panic, timer, user};
+use crate::{Arch, cpu, logger, panic, timer, user};
 
 /// The tests and the index of the one running, or of none once all passed,
 /// for the panic handler's summary. `None` until the tests start.
@@ -39,8 +39,10 @@ static STARTED: AtomicUsize = AtomicUsize::new(0);
 /// How long a test may run, in seconds, before the watchdog stops it.
 const LIMIT: u64 = 10;
 
-/// What ends the probe the running test runs, set while it runs.
-static EXPECTED: Lock<Option<Expectation>> = Lock::new(Rank::TEST_EXPECTED, None);
+/// What ends the probe the running test runs, and the CPU it runs on, set
+/// while it runs. The other CPUs' traps leave it alone: they take timer
+/// interrupts meanwhile, and run no probe of their own to abandon.
+static EXPECTED: Lock<Option<(usize, Expectation)>> = Lock::new(Rank::TEST_EXPECTED, None);
 
 /// Whether the trap handler that stopped the last [`expect_timeout`]
 /// probe found user access blocked.
@@ -326,20 +328,24 @@ pub fn user_access_blocked_at_timeout() -> bool {
 }
 
 fn catch(expectation: Expectation, probe: Probe) {
-    *EXPECTED.lock() = Some(expectation);
+    *EXPECTED.lock() = Some((cpu::id(), expectation));
     Arch::catch(probe);
     *EXPECTED.lock() = None;
 }
 
-/// Abandons the running probe when `trap` is what its test expects, and
-/// returns whether it did. The kernel's trap handler calls this first.
-/// Through `try_lock`, because a timer interrupt can come while `catch`
-/// holds the lock; no probe runs then. Unlisted, since a handler's try
-/// must not panic over the interrupted code's held list.
+/// Abandons the running probe when `trap` is what its test expects, on the
+/// probe's CPU, and returns whether it did. The kernel's trap handler calls
+/// this first. Through `try_lock`, because a timer interrupt can come while
+/// `catch` holds the lock; no probe runs then. Unlisted, since a handler's
+/// try must not panic over the interrupted code's held list.
 pub(crate) fn caught(trap: Trap, frame: &mut <Arch as Platform>::TrapFrame) -> bool {
-    let Some(expected) = EXPECTED.try_lock_unlisted().and_then(|expected| *expected) else {
+    let Some((probing, expected)) = EXPECTED.try_lock_unlisted().and_then(|expected| *expected)
+    else {
         return false;
     };
+    if probing != cpu::id() {
+        return false;
+    }
     let matches = match expected {
         Expectation::Trap(accepts) => accepts(trap),
         Expectation::Timeout(at) => {
