@@ -113,7 +113,7 @@ pub fn catch(probe: Probe) {
         "a catch is running already"
     );
     let number: u64 = match probe {
-        Probe::ReadGuardPage | Probe::ReadUser => 0,
+        Probe::ReadGuardPage | Probe::ReadKernel(_) | Probe::ReadUser => 0,
         Probe::OverflowStack => 1,
         Probe::Spin => 2,
         Probe::WriteReadOnly => 3,
@@ -127,13 +127,15 @@ pub fn catch(probe: Probe) {
         // instruction after the call with the stack pointer it was called
         // with. The probes touch only x9, x10, x30, the stack below the
         // saved registers and their own targets: the guard page, which
-        // take_page_tables leaves unmapped, so the read only traps; stack
-        // that no frame above uses; the read-only byte, written back with
-        // the value it holds; the ret, which only returns; and the user
-        // probe page, which the read can't change, and which the call can't
-        // run, since every user page is PXN. The spin with PAN clear reaches
-        // no memory, and the landing sets PAN again. The C ABI clobbers
-        // cover x9, x10, x30 and the flags.
+        // take_page_tables leaves unmapped, so the read only traps; the
+        // kernel byte the read probe names, which a read can't change, and
+        // which only faults once unmapped; stack that no frame above uses;
+        // the read-only byte, written back with the value it holds; the ret,
+        // which only returns; and the user probe page, which the read can't
+        // change, and which the call can't run, since every user page is
+        // PXN. The spin with PAN clear reaches no memory, and the landing
+        // sets PAN again. The C ABI clobbers cover x9, x10, x30 and the
+        // flags.
         unsafe {
             asm!(
                 "bl thisos_catch",
@@ -149,6 +151,7 @@ pub fn catch(probe: Probe) {
         // would give up the handler along with the probe.
         Probe::OverflowStack => Aarch64::without_interrupts(run),
         Probe::ReadGuardPage
+        | Probe::ReadKernel(_)
         | Probe::Spin
         | Probe::SpinUserAccessOpen
         | Probe::WriteReadOnly
@@ -163,6 +166,7 @@ pub fn catch(probe: Probe) {
 pub fn target(probe: Probe) -> Option<u64> {
     match probe {
         Probe::ReadGuardPage => Some(Aarch64::guard_page()),
+        Probe::ReadKernel(addr) => Some(addr),
         Probe::WriteReadOnly => Some(address(&raw const thisos_probe_read_only)),
         Probe::ExecuteNoExecute => Some(address(&raw const thisos_probe_ret)),
         Probe::ReadUser | Probe::ExecuteUser => Some(USER_SPACE.start),

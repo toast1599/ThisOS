@@ -35,6 +35,9 @@ pub const ADDRESS: u64 = 0x000f_ffff_ffff_f000;
 /// The first level 4 entry of the upper half.
 const UPPER_HALF: u16 = 256;
 
+/// The most stack pages one shootdown covers.
+const SHOOTDOWN_PAGES: usize = 16;
+
 /// Where user mappings may go: the lower half above its first 64 KiB and
 /// below its last page, so that no user instruction ends at the canonical
 /// boundary, where SYSCALL would save a RIP that SYSRET can't return to.
@@ -44,6 +47,8 @@ pub const USER_SPACE: Range<u64> = 0x1_0000..0x0000_7fff_ffff_f000;
 /// Host tests swap in `tests::cpu`, a fake per test thread.
 #[cfg(not(test))]
 mod cpu {
+    use core::ops::Range;
+
     use x86_64::instructions::tlb;
     use x86_64::registers::control::Cr3;
     use x86_64::structures::paging::PhysFrame;
@@ -70,6 +75,14 @@ mod cpu {
 
     pub fn flush(page: VirtAddr) {
         tlb::flush(page);
+    }
+
+    /// Drops kernel pages `pages` from every running CPU's TLB.
+    pub fn flush_kernel(pages: Range<u64>) {
+        for page in pages.clone().step_by(4096) {
+            tlb::flush(VirtAddr::new(page));
+        }
+        crate::shootdown::run(pages);
     }
 }
 
@@ -188,8 +201,8 @@ impl PageTables {
 
     /// Maps `page` to `frame` with leaf bits `flags`, and links any new
     /// table on the way with `table_flags`, from `alloc`. Flushes the page
-    /// from the TLB if `flush`. The tables hold the frame until
-    /// `unmap_page` reclaims it.
+    /// from the TLB if `flush`. The tables hold the frame until the
+    /// kernel's `unmap` or `unmap_stack` reclaims it.
     fn map_page(
         &self,
         page: Page<Size4KiB>,
@@ -201,7 +214,7 @@ impl PageTables {
     ) -> Result<(), MapError> {
         // SAFETY: The frame is the caller's to give, and on success the
         // entry holds it: into_start below gives up the Frame, and only
-        // unmap_page or release makes it again.
+        // unmap, unmap_stack or release makes it again.
         match unsafe { self.map_leaf(page, frame.start(), flags, table_flags, flush, alloc) } {
             Ok(()) => {
                 let _ = frame.into_start();
@@ -263,22 +276,6 @@ impl PageTables {
             cpu::flush(page.start_address());
         }
         Ok(())
-    }
-
-    /// Unmaps `page` and returns its frame, or `None` if it isn't mapped as
-    /// a 4 KiB page. Flushes the page from the TLB if `flush`.
-    ///
-    /// # Safety
-    ///
-    /// The page's frame must have come from `map_page`, nothing may reach
-    /// other memory through the page once it is gone, and `flush` must be
-    /// set if the TLB may hold the page.
-    unsafe fn unmap_page(&self, page: Page<Size4KiB>, flush: bool) -> Option<Frame> {
-        // SAFETY: As for this call.
-        let phys = unsafe { self.clear_leaf(page, flush) }?;
-        // SAFETY: map_page stored into_start of the frame there, and the
-        // entry, now clear, was its only holder.
-        Some(unsafe { Frame::reclaim(phys) })
     }
 
     /// Unmaps `page` and returns the address of the frame it mapped, or
@@ -706,12 +703,17 @@ impl thisos_hal::PageTables for KernelPageTables {
         }
         // SAFETY: Only map maps in kernel space, through map_page, and
         // kernel space's addresses are handed out once, so code still using
-        // the page faults. Every space shares the upper half, so the TLB
-        // may hold the page whichever is active.
-        unsafe {
+        // the page faults. Every space shares the upper half, so any CPU's
+        // TLB may hold the page whichever space is active, and flush_kernel
+        // drops it from all of them before the frame goes back.
+        let phys = unsafe {
             self.tables
-                .unmap_page(Page::containing_address(VirtAddr::new(page)), true)
-        }
+                .clear_leaf(Page::containing_address(VirtAddr::new(page)), false)
+        }?;
+        cpu::flush_kernel(page..page + 4096);
+        // SAFETY: map_page stored into_start of the frame there, and the
+        // entry, now clear and gone from every TLB, was its only holder.
+        Some(unsafe { Frame::reclaim(phys) })
     }
 
     fn map_stack(
@@ -761,21 +763,39 @@ impl thisos_hal::PageTables for KernelPageTables {
     }
 
     fn unmap_stack(&mut self, stack: Stack, free: &mut dyn FnMut(Frame)) {
-        for page in stack.range.step_by(4096) {
+        // A shootdown per batch, not per page: a 64 KiB stack takes one.
+        let mut cleared = [0; SHOOTDOWN_PAGES];
+        let mut count = 0;
+        let mut first = stack.range.start;
+        for page in stack.range.clone().step_by(4096) {
             // SAFETY: Only map_stack maps in the stacks' window, through
             // map_page, and never at an address it mapped before, so code
             // still using the page faults. The Stack was the page's one
             // holder, and the context that ran on it is gone. Every space
-            // shares the upper half, so the TLB may hold the page whichever
-            // is active.
-            let frame = unsafe {
+            // shares the upper half, so any CPU's TLB may hold the page
+            // whichever space is active, and flush_kernel drops it from all
+            // of them before the frame goes back.
+            let phys = unsafe {
                 self.tables
-                    .unmap_page(Page::containing_address(VirtAddr::new(page)), true)
+                    .clear_leaf(Page::containing_address(VirtAddr::new(page)), false)
             };
-            let Some(frame) = frame else {
+            let Some(phys) = phys else {
                 panic!("stack page {page:#x} wasn't mapped");
             };
-            free(frame);
+            cleared[count] = phys;
+            count += 1;
+            let next = page + 4096;
+            if count == SHOOTDOWN_PAGES || next == stack.range.end {
+                cpu::flush_kernel(first..next);
+                for &phys in &cleared[..count] {
+                    // SAFETY: map_page stored into_start of the frame
+                    // there, and the entry, now clear and gone from every
+                    // TLB, was its only holder.
+                    free(unsafe { Frame::reclaim(phys) });
+                }
+                count = 0;
+                first = next;
+            }
         }
     }
 
@@ -1222,6 +1242,7 @@ mod tests {
     /// 0, which no table is at, and the TLB is a list of flushed pages.
     pub mod cpu {
         use core::cell::{Cell, RefCell};
+        use core::ops::Range;
         use std::vec::Vec;
 
         use x86_64::VirtAddr;
@@ -1244,6 +1265,11 @@ mod tests {
 
         pub fn flush(page: VirtAddr) {
             FLUSHED.with_borrow_mut(|flushed| flushed.push(page.as_u64()));
+        }
+
+        /// As `flush` for each page: a test thread is the only CPU.
+        pub fn flush_kernel(pages: Range<u64>) {
+            FLUSHED.with_borrow_mut(|flushed| flushed.extend(pages.step_by(4096)));
         }
 
         /// The pages flushed since the last call.

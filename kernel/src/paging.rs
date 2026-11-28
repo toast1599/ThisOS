@@ -661,6 +661,52 @@ mod tests {
         assert!(unmap(page).is_none(), "{page:#x} unmapped twice");
     }
 
+    // CPU 1's probe reads the page until it faults, so its TLB holds the
+    // page when CPU 0 unmaps it, and only a shootdown drops it there; without
+    // one the probe reads on and the test times out.
+    #[test_case]
+    fn an_unmapped_kernel_page_leaves_other_cpus_tlbs() {
+        use core::sync::atomic::AtomicBool;
+
+        use crate::{thread, timer};
+
+        static PAGE: AtomicU64 = AtomicU64::new(0);
+        static READING: AtomicBool = AtomicBool::new(false);
+        static FAULTED: AtomicBool = AtomicBool::new(false);
+        if !testing::several_cpus() {
+            return;
+        }
+        // Below the pages the two tests above map.
+        let page = kernel_space().end - 3 * 4096;
+        if let Err(e) = map(page, frame(), false) {
+            panic!("mapping {page:#x} failed: {:?}", e.kind);
+        }
+        PAGE.store(page, Ordering::Relaxed);
+        thread::spawn_on(1, move || {
+            READING.store(true, Ordering::Release);
+            testing::expect_trap(
+                |trap| {
+                    trap == Trap::PageFault {
+                        address: PAGE.load(Ordering::Relaxed),
+                        access: Access::Read,
+                    }
+                },
+                Probe::ReadKernel(page),
+            );
+            FAULTED.store(true, Ordering::Release);
+        });
+        testing::spin_until("CPU 1 reading", || READING.load(Ordering::Acquire));
+        // CPU 1 runs the probe through at least one whole tick meanwhile.
+        let start = timer::ticks();
+        testing::spin_until("two ticks", || timer::ticks() >= start + 2);
+        let Some(frame) = unmap(page) else {
+            panic!("{page:#x} wasn't mapped");
+        };
+        frames::free(frame);
+        testing::spin_until("CPU 1's fault", || FAULTED.load(Ordering::Acquire));
+        thread::wait_for_exits();
+    }
+
     /// Maps a frame at `probe`'s user target in a new space, with
     /// `protection`, after `fill` has written it, and runs `probe` there,
     /// expecting a trap for which `expected` is true.

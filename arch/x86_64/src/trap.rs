@@ -20,7 +20,7 @@ use x86_64::structures::idt::{Entry, EntryOptions, InterruptDescriptorTable};
 
 use crate::once::Once;
 use crate::paging::USER_SPACE;
-use crate::{X86_64, apic, backtrace, catch, paging, percpu};
+use crate::{X86_64, apic, backtrace, catch, paging, percpu, shootdown};
 
 // Each stub sits 16 bytes after the one before it, so that the IDT can find
 // stub n at thisos_trap_stubs + 16n. The .org fails to assemble if a stub
@@ -411,10 +411,18 @@ extern "C" fn trap_entry(frame: &mut TrapFrame) {
             panic!("a syscall entered with {leaked:?} set");
         }
     }
+    // The kernel's handler never sees a shootdown, which takes no lock and
+    // switches nothing.
+    if frame.vector == apic::SHOOTDOWN_VECTOR {
+        shootdown::answer();
+        apic::eoi();
+        return;
+    }
     let trap = match frame.vector {
         SYSCALL_VECTOR => Trap::Syscall,
         3 => Trap::Breakpoint,
         DOUBLE_FAULT => Trap::DoubleFault,
+        NMI if percpu::this().stop_sent.load(Ordering::Acquire) => Trap::Stop,
         14 => {
             let (write, fetch) = (1 << 1, 1 << 4);
             let access = if frame.error & fetch != 0 {

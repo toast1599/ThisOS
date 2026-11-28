@@ -23,6 +23,7 @@ mod pat;
 mod percpu;
 mod pic;
 mod pit;
+mod shootdown;
 mod smp;
 mod trap;
 mod tsc;
@@ -201,10 +202,20 @@ impl Platform for X86_64 {
         smp::listed()
     }
 
+    fn cpus_running() -> usize {
+        smp::running()
+    }
+
     fn send_ipi(cpu: usize, ipi: Ipi) {
         assert_ne!(cpu, percpu::index(), "{ipi:?} for the CPU sending it");
         match ipi {
             Ipi::Wake => apic::send_wake(smp::apic_id(cpu)),
+            Ipi::Stop => {
+                // Release, and apic::send fences before the NMI, so the NMI
+                // finds the flag.
+                percpu::of(cpu).stop_sent.store(true, Ordering::Release);
+                apic::send_nmi(smp::apic_id(cpu));
+            }
         }
     }
 

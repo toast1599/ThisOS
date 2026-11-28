@@ -272,6 +272,10 @@ impl Platform for Aarch64 {
         1
     }
 
+    fn cpus_running() -> usize {
+        1
+    }
+
     fn send_ipi(cpu: usize, ipi: Ipi) {
         unreachable!("{ipi:?} for CPU {cpu}, but aarch64 runs on one CPU");
     }

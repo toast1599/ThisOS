@@ -12,7 +12,7 @@ use core::arch::asm;
 use core::cell::UnsafeCell;
 use core::mem::offset_of;
 use core::ops::Range;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use thisos_locks::MAX_CPUS;
 use x86_64::VirtAddr;
@@ -40,6 +40,9 @@ pub struct Block {
     /// The stack pointer `thisos_catch` saved the registers at while a
     /// catch runs, and 0 otherwise.
     pub saved_rsp: AtomicU64,
+    /// Whether another CPU sent this one `Ipi::Stop`, so that its next NMI
+    /// is that.
+    pub stop_sent: AtomicBool,
     pub tss: Tss,
     pub gdt: Once<GlobalDescriptorTable>,
 }
@@ -61,6 +64,7 @@ impl Block {
             stack_start: AtomicU64::new(0),
             stack_end: AtomicU64::new(0),
             saved_rsp: AtomicU64::new(0),
+            stop_sent: AtomicBool::new(false),
             tss: Tss {
                 _align: 0,
                 tss: UnsafeCell::new(TaskStateSegment::new()),
@@ -158,6 +162,11 @@ pub fn index() -> usize {
 /// The running CPU's block.
 pub fn this() -> &'static Block {
     &BLOCKS[index()]
+}
+
+/// CPU `index`'s block. Panics if `index` is `MAX_CPUS` or more.
+pub fn of(index: usize) -> &'static Block {
+    &BLOCKS[index]
 }
 
 /// Points GS's base at CPU `index`'s block, and user code's at 0.

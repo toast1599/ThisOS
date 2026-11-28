@@ -45,7 +45,7 @@ use thisos_locks::{MAX_CPUS, Rank, Saved};
 use crate::Lock;
 use crate::cpu::{self, State};
 use crate::process::Process;
-use crate::{Arch, paging, timer};
+use crate::{Arch, paging, panic, timer};
 
 type Context = <Arch as Platform>::Context;
 
@@ -263,6 +263,7 @@ pub fn init() {
 /// runs the idle thread. An AP runs this once it has checked in, with
 /// interrupts off.
 pub fn run_ap() -> ! {
+    panic::stop_if_reporting();
     let idle = Box::new(Thread::new(cpu::id(), None, None, None, None));
     let reaper = new_reaper();
     thisos_locks::running::<Arch>(idle.id);

@@ -24,8 +24,9 @@ pub fn init() {
 /// The kernel's trap handler, which every entry point passes to `entry!`.
 /// A trap user code raised goes to `user::trap`. Otherwise a breakpoint and
 /// a spurious interrupt return, a timer interrupt counts a tick on the boot
-/// CPU and switches to the next ready thread, and a wake interrupt switches
-/// to one if the CPU was idle; any other trap is a kernel bug, and panics.
+/// CPU and switches to the next ready thread, a wake interrupt switches to
+/// one if the CPU was idle, and a stop interrupt from a panic halts the
+/// CPU; any other trap is a kernel bug, and panics.
 pub fn trap(trap: Trap, frame: &mut <Arch as Platform>::TrapFrame) {
     // Restored on the way out, so a tick shows what it interrupted. A
     // thread a tick switches away from restores its own when it resumes.
@@ -36,6 +37,9 @@ pub fn trap(trap: Trap, frame: &mut <Arch as Platform>::TrapFrame) {
 }
 
 fn handle(trap: Trap, frame: &mut <Arch as Platform>::TrapFrame, interrupted: State) {
+    if trap == Trap::Stop {
+        panic::stopped(frame);
+    }
     if frame.raised_by_user() {
         return user::trap(trap, frame);
     }

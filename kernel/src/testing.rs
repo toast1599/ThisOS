@@ -383,6 +383,8 @@ fn overdue() -> Option<&'static dyn Test> {
 }
 
 fn finish(pass: bool) -> ! {
+    // The reports below need the other CPUs off the sinks.
+    let pass = !panic::stop_others() && pass;
     if let Some(run) = RUN.try_lock_unlisted().map(|run| *run) {
         if let Some(test) = run
             .and_then(|run| run.tests.get(run.current))

@@ -158,6 +158,10 @@ pub enum Probe {
     /// Reads the first byte of [`Platform::guard_page`] again and again,
     /// which traps with [`Trap::PageFault`].
     ReadGuardPage,
+    /// Reads the byte at the kernel address it holds again and again, which
+    /// traps with [`Trap::PageFault`] on read there once the page is
+    /// unmapped and gone from this CPU's TLB.
+    ReadKernel(u64),
     /// Pushes onto the kernel stack until it runs into the guard page, where
     /// the page fault's handler has no stack to run on, so it traps with
     /// [`Trap::DoubleFault`]. It runs with interrupts off, so that no
@@ -427,7 +431,8 @@ pub trait Platform {
     fn guard_page() -> u64;
 
     /// The address whose page fault ends `probe`: the guard page for
-    /// [`Probe::ReadGuardPage`], and the probe's own byte for
+    /// [`Probe::ReadGuardPage`], its own address for [`Probe::ReadKernel`],
+    /// and the probe's own byte for
     /// [`Probe::WriteReadOnly`] and [`Probe::ExecuteNoExecute`], and a page
     /// in [`AddressSpace::user_space`] for [`Probe::ReadUser`] and
     /// [`Probe::ExecuteUser`]. `None` for a probe that ends some other way.
@@ -483,9 +488,15 @@ pub trait Platform {
     /// that list them are malformed.
     fn cpus_listed() -> usize;
 
+    /// How many CPUs have started, the caller's included, numbered from 0
+    /// up: during [`Platform::start_cpus`], each that has checked in so
+    /// far, with its trap handler installed, so that [`Ipi::Stop`] reaches
+    /// it, and after, as many as it returned.
+    fn cpus_running() -> usize;
+
     /// Interrupts CPU `cpu`, which traps with the trap `ipi` names once
-    /// its interrupts are on. Panics if `cpu` is the caller's own or isn't
-    /// running.
+    /// its interrupts are on, or at once for [`Ipi::Stop`]. Panics if `cpu`
+    /// is the caller's own or isn't running.
     fn send_ipi(cpu: usize, ipi: Ipi);
 
     /// The timer's frequency from each source the architecture has: the
@@ -568,7 +579,11 @@ pub trait PageTables: Send {
     /// Unmaps the page at `page` in [`PageTables::kernel_space`], and
     /// returns the frame it mapped, or `None` if nothing was mapped there.
     /// Kernel-space addresses are never mapped again after this, so code
-    /// that still uses the page faults and reaches no other memory.
+    /// that still uses the page faults and reaches no other memory. The
+    /// page is gone from every running CPU's TLB before this returns the
+    /// frame; an architecture whose TLB invalidations don't reach other
+    /// CPUs interrupts them and waits for each, so a CPU spinning with
+    /// interrupts off for a lock the caller holds makes it panic.
     fn unmap(&mut self, page: u64) -> Option<Frame>;
 
     /// Maps a stack of `size` bytes, rounded up to whole pages, writable
@@ -589,8 +604,9 @@ pub trait PageTables: Send {
         free: &mut dyn FnMut(Frame),
     ) -> Option<Self::Stack>;
 
-    /// Unmaps `stack` and hands each of its frames to `free`. The tables
-    /// its pages needed stay.
+    /// Unmaps `stack` and hands each of its frames to `free`, once its
+    /// pages are gone from every running CPU's TLB, as
+    /// [`PageTables::unmap`] does. The tables its pages needed stay.
     fn unmap_stack(&mut self, stack: Self::Stack, free: &mut dyn FnMut(Frame));
 
     /// Maps `frame` at the page after the heap's last one, writable and
@@ -760,6 +776,8 @@ pub enum CpuStart {
 pub enum Ipi {
     /// Trap with [`Trap::Wake`].
     Wake,
+    /// Trap with [`Trap::Stop`], even with interrupts off.
+    Stop,
 }
 
 /// How fast the timer counts, as [`Platform::start_timer`] found it.
@@ -860,6 +878,9 @@ pub enum Trap {
     Timer,
     /// Another CPU's [`Ipi::Wake`].
     Wake,
+    /// Another CPU's [`Ipi::Stop`], which can interrupt any code, a trap
+    /// handler's included. The handler must not return.
+    Stop,
     /// A syscall from user code. [`TrapFrame::syscall`] reads its number
     /// and arguments, and [`TrapFrame::set_syscall_result`] sets what it
     /// returns.
@@ -895,6 +916,7 @@ impl fmt::Display for Trap {
             Trap::DoubleFault => write!(f, "double fault"),
             Trap::Timer => write!(f, "timer interrupt"),
             Trap::Wake => write!(f, "wake interrupt"),
+            Trap::Stop => write!(f, "stop interrupt"),
             Trap::Syscall => write!(f, "syscall"),
             Trap::Spurious => write!(f, "spurious interrupt"),
             Trap::Stray { vector } => write!(f, "stray interrupt on vector {vector:#x}"),

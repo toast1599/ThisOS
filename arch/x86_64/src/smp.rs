@@ -9,7 +9,7 @@
 use core::arch::global_asm;
 use core::mem::offset_of;
 use core::ptr;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use bootloader_api::info::{MemoryRegion, MemoryRegionKind};
 use thisos_acpi::{HEADER_SIZE, Madt, RSDP_SIZE, State, Xsdt};
@@ -175,6 +175,11 @@ unsafe extern "C" {
 /// Each AP's slot, by its index among the running CPUs: 0 until it checks
 /// in, then [`CHECKED_IN`] with its APIC ID.
 static SLOTS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+
+/// How many CPUs have checked in, the boot CPU included. Each AP counts
+/// itself, so that one counts from the moment it checks in, even if the
+/// boot CPU stops right then; see `Platform::cpus_running`.
+static RUNNING: AtomicUsize = AtomicUsize::new(1);
 
 /// Each running CPU's APIC ID, by its index, for IPIs.
 static APIC_IDS: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
@@ -344,6 +349,9 @@ extern "sysv64" fn ap_main(index: usize) -> ! {
     let Some(&entry) = ENTRY.get() else {
         unreachable!("start stores the entry before it starts an AP");
     };
+    // SeqCst, pairing with a panic's claim before it reads the count: the
+    // panic either counts this CPU or finds the claim in the kernel's entry.
+    RUNNING.fetch_max(index + 1, Ordering::SeqCst);
     if let Some(slot) = SLOTS.get(index) {
         slot.store(
             CHECKED_IN | read << INDEX_SHIFT | u64::from(id),
@@ -362,6 +370,12 @@ pub fn listed() -> usize {
             .count()
             .max(1)
     })
+}
+
+/// How many CPUs have checked in, the boot CPU included. Each has loaded
+/// its IDT.
+pub fn running() -> usize {
+    RUNNING.load(Ordering::SeqCst)
 }
 
 /// The APIC ID of the running CPU numbered `cpu`. Panics if `cpu` is out

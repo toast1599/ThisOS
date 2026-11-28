@@ -88,23 +88,26 @@ static DRAINER: AtomicU64 = AtomicU64::new(0);
 
 // The lock is held only with interrupts off, so an interrupt handler that
 // logs never finds it held by the code it interrupted. An exception, NMI or
-// machine check inside the logger can still find it held, which is what
-// report_sinks is for.
+// machine check inside the logger can still find it held, and so can a
+// panic after it stopped a CPU that held it, which is what report_sinks is
+// for.
 fn with_sinks<R>(f: impl FnOnce(&mut Sinks) -> R) -> R {
     Arch::without_interrupts(|| f(&mut LOGGER.sinks.lock()))
 }
 
-/// Runs `f` on the logger's sinks, or on the panic sinks when the logger
-/// has none yet or its lock is held: then the panic came before
-/// `logger::init`, or from inside the logger, where the console may be half
-/// updated. Once a panic has used the panic sinks, every later report of
-/// that panic finds the logger's lock still held and uses them too. Its
-/// locks stay off the held list, so the report never panics over a full
-/// one, and the panic sinks' is a plain spin lock, since only this takes
-/// it.
+/// Runs `f` on the logger's sinks, or on the panic sinks when the logger has
+/// none yet or its lock is held: then the panic came before `logger::init`, or
+/// a writer stopped part way, in a panic from inside the logger or on a CPU the
+/// panic stopped, and the console may be half updated. Only the reporter runs
+/// it, once `panic` has stopped the other CPUs; one that didn't stop in time
+/// may still release the lock, so once a report has used the panic sinks, every
+/// later one uses them too. Its locks stay off the held list, so the report
+/// never panics over a full one, and the panic sinks' is a plain spin lock,
+/// since only this takes it.
 fn report_sinks<R>(f: impl FnOnce(&mut Sinks) -> R) -> Option<R> {
     Arch::without_interrupts(|| {
         if READY.load(Ordering::Acquire)
+            && !PANIC_SINKS_READY.load(Ordering::Relaxed)
             && let Some(mut sinks) = LOGGER.sinks.try_lock_unlisted()
         {
             return Some(f(&mut sinks));

@@ -18,6 +18,9 @@ pub const TIMER_VECTOR: u64 = 0x30;
 /// The vector of `Ipi::Wake`, the timer's next.
 pub const WAKE_VECTOR: u64 = 0x31;
 
+/// The vector of a TLB shootdown, the wake's next.
+pub const SHOOTDOWN_VECTOR: u64 = 0x32;
+
 /// The spurious interrupt's vector, whose low four bits older APICs fix
 /// at 1.
 pub const SPURIOUS_VECTOR: u64 = 0xff;
@@ -44,6 +47,7 @@ const DIVIDE_BY_1: u64 = 0b1011;
 
 // The interrupt command register's delivery modes, with the level asserted.
 const FIXED: u64 = 0x4000;
+const NMI: u64 = 0x4400;
 const INIT: u64 = 0x4500;
 const STARTUP: u64 = 0x4600;
 
@@ -225,7 +229,8 @@ pub fn frequencies() -> TimerFrequencies {
     }
 }
 
-/// Tells the APIC that the timer interrupt's handler is done.
+/// Tells the APIC that the handler of a timer, wake or shootdown interrupt
+/// is done.
 pub fn eoi() {
     if let Some(apic) = APIC.get() {
         apic.write(EOI, 0);
@@ -266,6 +271,21 @@ pub fn start_on_ap() {
 /// [`start`].
 pub fn send_wake(id: u32) {
     send(id, FIXED | WAKE_VECTOR);
+}
+
+/// Sends the CPU with APIC ID `id` a TLB shootdown interrupt. Panics
+/// before [`start`].
+#[cfg_attr(
+    test,
+    expect(dead_code, reason = "host tests flush through paging's fake CPU")
+)]
+pub fn send_shootdown(id: u32) {
+    send(id, FIXED | SHOOTDOWN_VECTOR);
+}
+
+/// Sends the CPU with APIC ID `id` an NMI. Panics before [`start`].
+pub fn send_nmi(id: u32) {
+    send(id, NMI);
 }
 
 /// Sends INIT to the CPU with APIC ID `id`, which resets it to wait for
